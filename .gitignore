@@ -9,6 +9,7 @@ venv/
 
 build/
 dist/
+.tmp_wheels/
 *.egg-info/
 
 .pytest_cache/

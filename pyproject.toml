@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=69", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,15 +8,17 @@ version = "0.1.0"
 description = "Config-driven concept probing, scoring, steering, and evaluation for open-weights LLMs."
 readme = "README.md"
 requires-python = ">=3.9"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
   { name = "concept-probe contributors" }
 ]
+keywords = ["llm", "interpretability", "probing", "steering", "transformers"]
+urls = { Homepage = "https://github.com/mneuronico/concept-probe", Repository = "https://github.com/mneuronico/concept-probe", Issues = "https://github.com/mneuronico/concept-probe/issues" }
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
   "Intended Audience :: Science/Research",
-  "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",
@@ -45,6 +47,10 @@ quantization = [
 coherence = [
   "groq>=0.11",
 ]
+dev = [
+  "build>=1.2",
+  "pytest>=8.0",
+]
 full = [
   "scipy>=1.11",
   "statsmodels>=0.14",
@@ -62,3 +68,6 @@ include = ["concept_probe*"]
 
 [tool.setuptools.package-data]
 concept_probe = ["defaults.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

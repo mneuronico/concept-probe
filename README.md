@@ -24,6 +24,12 @@ It is meant to be a general tool repo, not a paper reproduction repo.
 
 ## Installation
 
+Install from GitHub:
+
+```bash
+pip install git+https://github.com/mneuronico/concept-probe.git
+```
+
 Local editable install:
 
 ```bash
@@ -42,10 +48,12 @@ Optional extras:
 pip install -e .[plots,stats]
 pip install -e .[coherence]
 pip install -e .[full]
+pip install -e .[dev,stats,plots]
 ```
 
 Notes:
 
+- The library expects a local PyTorch environment and a Hugging Face-compatible causal LM.
 - `scipy` is used for sweep p-values.
 - `matplotlib` is used for plots.
 - `statsmodels` and `scikit-learn` are used by reporting utilities.
@@ -128,8 +136,24 @@ from concept_probe import (
 )
 ```
 
-## Important notes before publishing
+## Development
+
+Run the lightweight test suite:
+
+```bash
+python -m pytest -q
+```
+
+Compile the example entrypoints:
+
+```bash
+python -m py_compile examples/quickstart.py examples/train_from_json.py
+```
+
+GitHub Actions CI runs the same lightweight checks and also builds source and wheel distributions.
+
+## Release notes
 
 - The default config in `concept_probe/defaults.json` is usable, but opinionated.
 - Behavioral eval helpers depend on optional packages and, for coherence rating, an external API key.
-- This repo currently ships without tests or CI.
+- Example scripts are intended as starting points and will download model weights when you run them.
