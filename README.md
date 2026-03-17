@@ -2,8 +2,6 @@
 
 `concept-probe` is a small, config-driven Python library for training, evaluating, scoring, and steering concept probes in open-weights language models.
 
-It is meant to be a general tool repo, not a paper reproduction repo.
-
 ## What it includes
 
 - Contrastive probe training from positive vs negative system prompts
