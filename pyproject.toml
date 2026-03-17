@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "concept-probe"
+version = "0.1.0"
+description = "Config-driven concept probing, scoring, steering, and evaluation for open-weights LLMs."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [
+  { name = "concept-probe contributors" }
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "numpy>=1.24",
+  "torch>=2.1",
+  "transformers>=4.45",
+]
+
+[project.optional-dependencies]
+stats = [
+  "scipy>=1.11",
+  "statsmodels>=0.14",
+  "scikit-learn>=1.4",
+]
+plots = [
+  "matplotlib>=3.8",
+]
+quantization = [
+  "bitsandbytes>=0.43; platform_system != 'Windows'",
+]
+coherence = [
+  "groq>=0.11",
+]
+full = [
+  "scipy>=1.11",
+  "statsmodels>=0.14",
+  "scikit-learn>=1.4",
+  "matplotlib>=3.8",
+  "groq>=0.11",
+  "bitsandbytes>=0.43; platform_system != 'Windows'",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["concept_probe*"]
+
+[tool.setuptools.package-data]
+concept_probe = ["defaults.json"]

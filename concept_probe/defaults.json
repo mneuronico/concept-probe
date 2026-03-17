@@ -1,0 +1,114 @@
+{
+  "model": {
+    "model_id": "meta-llama/Llama-3.2-3B-Instruct",
+    "use_4bit": true,
+    "dtype": "bfloat16",
+    "device_map": "auto",
+    "hf_token_env": "HF_TOKEN"
+  },
+  "concept": {
+    "name": "concept",
+    "pos_label": "positive",
+    "neg_label": "negative",
+    "pos_system": "You are a helpful assistant. Answer clearly and concisely.",
+    "neg_system": "You are a helpful assistant. Answer clearly and concisely."
+  },
+  "prompts": {
+    "train_questions": [
+      "What is photosynthesis, in simple terms?",
+      "Explain why the sky looks blue.",
+      "Give me two tips to improve my sleep.",
+      "What is the difference between correlation and causation?",
+      "How does a vaccine work?",
+      "Explain what a neural network is to a beginner.",
+      "What is a practical way to learn a new language?",
+      "What causes seasons on Earth?",
+      "How do airplanes fly?",
+      "What is entropy in physics, intuitively?",
+      "Explain the scientific method.",
+      "What is a good way to manage time when busy?",
+      "How does PCR work, at a high level?",
+      "What is the placebo effect?",
+      "Explain why exercise improves mood.",
+      "What is the difference between DNA and RNA?",
+      "What is a black hole, conceptually?",
+      "What is reinforcement learning?",
+      "How does caffeine affect the brain?",
+      "What is climate vs weather?"
+    ],
+    "train_questions_pos": [],
+    "train_questions_neg": [],
+    "eval_questions": [
+      "Write a short paragraph about the ocean.",
+      "What should I do if I feel overwhelmed at work?",
+      "Explain why people form habits.",
+      "Give a metaphor for how memory works.",
+      "What is one small thing I can do today to improve my day?"
+    ],
+    "neutral_system": "You are a helpful assistant. Answer clearly and concisely."
+  },
+  "readout": {
+    "train_mode": "assistant_all_mean",
+    "train_last_k": 12,
+    "read_mode": "sequence_all_mean",
+    "read_last_k": 12
+  },
+  "training": {
+    "train_prompt_mode": "shared",
+    "train_greedy": true,
+    "train_max_new_tokens": 64,
+    "train_temperature": 0.7,
+    "train_top_p": 0.9,
+    "do_layer_sweep": true,
+    "sweep_select": "effect_size",
+    "best_layer_search": null,
+    "layer_idx": null,
+    "layer_frac": 0.75
+  },
+  "evaluation": {
+    "do_eval": true,
+    "eval_greedy": true,
+    "eval_max_new_tokens": 64,
+    "eval_temperature": 0.7,
+    "eval_top_p": 0.9,
+    "eval_mode": "auto",
+    "eval_system": "You are a helpful assistant. Answer clearly and concisely.",
+    "layer_selection": {
+      "mode": "best",
+      "layers": [],
+      "window_radius": 2
+    },
+    "score_aggregate": "mean"
+  },
+  "steering": {
+    "do_steering": true,
+    "steer_system": "You are a helpful assistant. Answer clearly and concisely.",
+    "steer_sampling": true,
+    "steer_temperature": 0.7,
+    "steer_top_p": 0.9,
+    "steer_max_new_tokens": 64,
+    "steer_layers": "window",
+    "steer_window_radius": 2,
+    "steer_distribute": true
+  },
+  "plots": {
+    "enabled": true,
+    "sweep_plot": true,
+    "score_hist": true,
+    "heatmap_html": true
+  },
+  "output": {
+    "root_dir": "outputs",
+    "save_reps_to_npz": true,
+    "save_token_scores_npz": true,
+    "save_generation_logits": false,
+    "generation_logits_top_k": null,
+    "generation_logits_dtype": "float16",
+    "log_jsonl": true,
+    "pretty_json_log": true,
+    "console": true
+  },
+  "random": {
+    "seed": 0
+  }
+}
