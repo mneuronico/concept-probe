@@ -180,6 +180,43 @@ def _decode_tokens(tokenizer, token_ids: Iterable[int]) -> List[str]:
     return [tokenizer.decode([int(t)], skip_special_tokens=False) for t in token_ids]
 
 
+def _has_chat_template(tokenizer) -> bool:
+    return bool(getattr(tokenizer, "chat_template", None))
+
+
+_CHAT_TEMPLATE_FALLBACK_WARNED: set = set()
+
+
+def _encode_for_read(
+    tokenizer,
+    prompt: "PromptLike",
+    default_system: str,
+    *,
+    warn: Optional[Callable[[str], None]] = None,
+    warn_prefix: str = "read",
+) -> torch.Tensor:
+    """Encode a 'read' input (no generation). Uses the chat template when the
+    tokenizer has one; otherwise falls back to raw tokenization (system text
+    is dropped — base models have no chat structure to wrap it in).
+    """
+    if _has_chat_template(tokenizer):
+        messages, _ = _normalize_messages(
+            prompt, default_system, warn=warn, warn_prefix=warn_prefix
+        )
+        return apply_chat(tokenizer, messages, add_generation_prompt=False)
+
+    text = prompt if isinstance(prompt, str) else _prompt_to_text(prompt)
+    fallback_key = id(tokenizer)
+    if warn is not None and fallback_key not in _CHAT_TEMPLATE_FALLBACK_WARNED:
+        warn(
+            f"{warn_prefix}: tokenizer has no chat_template; "
+            f"falling back to raw tokenization (system text ignored)."
+        )
+        _CHAT_TEMPLATE_FALLBACK_WARNED.add(fallback_key)
+    enc = tokenizer(text, return_tensors="pt", add_special_tokens=True)
+    return enc["input_ids"]
+
+
 def _prompt_slug(text: str, max_words: int = 8, max_len: int = 48) -> str:
     words = text.strip().split()
     snippet = " ".join(words[:max_words])
@@ -529,7 +566,8 @@ class ConceptProbe:
         num_layers = self.model_bundle.num_layers
 
         self._status(f"Training concept '{self.concept.name}' with model {self.model_bundle.model_id}")
-        self._status(f"[Phase 1/4] Generating training completions ({train_prompt_mode})")
+        phase1_action = "Reading training texts" if train_prompt_mode == "texts" else "Generating training completions"
+        self._status(f"[Phase 1/4] {phase1_action} ({train_prompt_mode})")
         train_pos_ids, train_neg_ids = [], []
         train_pos_plens, train_neg_plens = [], []
 
@@ -661,8 +699,77 @@ class ConceptProbe:
                 )
                 if total_neg and ((i + 1) % progress_every_neg == 0 or (i + 1) == total_neg):
                     self._status(f"Generated neg training completions {i + 1}/{total_neg}")
+        elif train_prompt_mode == "texts":
+            if train_prompts:
+                self._warn("train_prompt_mode=texts; ignoring prompts.train_questions.")
+            if train_prompts_pos or train_prompts_neg:
+                self._warn(
+                    "train_prompt_mode=texts; ignoring prompts.train_questions_pos/train_questions_neg."
+                )
+            train_pos_texts = list(self.concept.train_pos_texts)
+            train_neg_texts = list(self.concept.train_neg_texts)
+            if not train_pos_texts or not train_neg_texts:
+                raise ValueError(
+                    "train_prompt_mode=texts requires concept.train_pos_texts and concept.train_neg_texts."
+                )
+            train_text_system = train_cfg.get("train_text_system")
+            if train_text_system is None:
+                train_text_system = prompts_cfg.get("neutral_system", "")
+
+            total_pos = len(train_pos_texts)
+            progress_every_pos = max(1, total_pos // 5) if total_pos else 1
+            for i, s in enumerate(train_pos_texts):
+                input_ids = _encode_for_read(
+                    tokenizer,
+                    s,
+                    train_text_system,
+                    warn=self._warn,
+                    warn_prefix=f"train_pos_texts[{i}]",
+                )
+                ids_1d = input_ids[0].detach().cpu()
+                train_pos_ids.append(ids_1d)
+                train_pos_plens.append(int(ids_1d.shape[-1]))
+                self.logger.log(
+                    "train_read_pos",
+                    {
+                        "i": i,
+                        "label": self.concept.pos_label,
+                        "system": train_text_system,
+                        "text": tokenizer.decode(ids_1d, skip_special_tokens=False),
+                    },
+                )
+                if total_pos and ((i + 1) % progress_every_pos == 0 or (i + 1) == total_pos):
+                    self._status(f"Read pos training texts {i + 1}/{total_pos}")
+
+            total_neg = len(train_neg_texts)
+            progress_every_neg = max(1, total_neg // 5) if total_neg else 1
+            for i, s in enumerate(train_neg_texts):
+                input_ids = _encode_for_read(
+                    tokenizer,
+                    s,
+                    train_text_system,
+                    warn=self._warn,
+                    warn_prefix=f"train_neg_texts[{i}]",
+                )
+                ids_1d = input_ids[0].detach().cpu()
+                train_neg_ids.append(ids_1d)
+                train_neg_plens.append(int(ids_1d.shape[-1]))
+                self.logger.log(
+                    "train_read_neg",
+                    {
+                        "i": i,
+                        "label": self.concept.neg_label,
+                        "system": train_text_system,
+                        "text": tokenizer.decode(ids_1d, skip_special_tokens=False),
+                    },
+                )
+                if total_neg and ((i + 1) % progress_every_neg == 0 or (i + 1) == total_neg):
+                    self._status(f"Read neg training texts {i + 1}/{total_neg}")
         else:
             raise ValueError(f"Unknown train_prompt_mode: {train_prompt_mode}")
+
+        train_readout_mode = readout["read_mode"] if train_prompt_mode == "texts" else readout["train_mode"]
+        train_readout_last_k = readout["read_last_k"] if train_prompt_mode == "texts" else readout["train_last_k"]
 
         self._status("[Phase 2/4] Forward passes for training reps")
         reps_pos = np.stack(
@@ -670,8 +777,8 @@ class ConceptProbe:
                 reps_from_hs_layers(
                     forward_hidden_states_all_layers(model, train_pos_ids[i].unsqueeze(0)),
                     prompt_len=train_pos_plens[i],
-                    mode=readout["train_mode"],
-                    last_k=readout["train_last_k"],
+                    mode=train_readout_mode,
+                    last_k=train_readout_last_k,
                 )
                 for i in range(len(train_pos_ids))
             ],
@@ -683,8 +790,8 @@ class ConceptProbe:
                 reps_from_hs_layers(
                     forward_hidden_states_all_layers(model, train_neg_ids[i].unsqueeze(0)),
                     prompt_len=train_neg_plens[i],
-                    mode=readout["train_mode"],
-                    last_k=readout["train_last_k"],
+                    mode=train_readout_mode,
+                    last_k=train_readout_last_k,
                 )
                 for i in range(len(train_neg_ids))
             ],
@@ -730,13 +837,13 @@ class ConceptProbe:
                     total_eval_pos = len(eval_pos_texts)
                     progress_every_pos = max(1, total_eval_pos // 5) if total_eval_pos else 1
                     for i, s in enumerate(eval_pos_texts):
-                        messages, _ = _normalize_messages(
+                        input_ids = _encode_for_read(
+                            tokenizer,
                             s,
                             eval_system,
                             warn=self._warn,
                             warn_prefix=f"eval_pos_texts[{i}]",
                         )
-                        input_ids = apply_chat(tokenizer, messages, add_generation_prompt=False)
                         eval_pos_reps_list.append(
                             reps_from_hs_layers(
                                 forward_hidden_states_all_layers(model, input_ids),
@@ -753,13 +860,13 @@ class ConceptProbe:
                     total_eval_neg = len(eval_neg_texts)
                     progress_every_neg = max(1, total_eval_neg // 5) if total_eval_neg else 1
                     for i, s in enumerate(eval_neg_texts):
-                        messages, _ = _normalize_messages(
+                        input_ids = _encode_for_read(
+                            tokenizer,
                             s,
                             eval_system,
                             warn=self._warn,
                             warn_prefix=f"eval_neg_texts[{i}]",
                         )
-                        input_ids = apply_chat(tokenizer, messages, add_generation_prompt=False)
                         eval_neg_reps_list.append(
                             reps_from_hs_layers(
                                 forward_hidden_states_all_layers(model, input_ids),
@@ -1102,13 +1209,23 @@ class ConceptProbe:
         self._status(f"Scoring {total_texts} texts -> {out_dir}")
 
         for i, text in enumerate(texts):
-            messages, used_prompt_system = _normalize_messages(
-                text,
-                sys_prompt,
-                warn=self._warn,
-                warn_prefix=f"score_texts.texts[{i}]",
-            )
-            input_ids = apply_chat(tokenizer, messages, add_generation_prompt=False)
+            if _has_chat_template(tokenizer):
+                messages, used_prompt_system = _normalize_messages(
+                    text,
+                    sys_prompt,
+                    warn=self._warn,
+                    warn_prefix=f"score_texts.texts[{i}]",
+                )
+                input_ids = apply_chat(tokenizer, messages, add_generation_prompt=False)
+            else:
+                input_ids = _encode_for_read(
+                    tokenizer,
+                    text,
+                    sys_prompt,
+                    warn=self._warn,
+                    warn_prefix=f"score_texts.texts[{i}]",
+                )
+                used_prompt_system = False
             hs_layers = forward_hidden_states_all_layers(model, input_ids)
             scores_per_layer, scores_agg = token_scores_from_hs_layers(
                 hs_layers, scoring_vectors, layers, aggregate=aggregate

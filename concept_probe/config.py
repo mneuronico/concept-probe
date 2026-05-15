@@ -37,6 +37,8 @@ class ConceptSpec:
     neg_system: str
     eval_pos_texts: List[PromptLike] = field(default_factory=list)
     eval_neg_texts: List[PromptLike] = field(default_factory=list)
+    train_pos_texts: List[PromptLike] = field(default_factory=list)
+    train_neg_texts: List[PromptLike] = field(default_factory=list)
 
     @classmethod
     def from_config(cls, config: Dict[str, Any], overrides: Optional[Dict[str, Any]] = None) -> "ConceptSpec":
@@ -51,6 +53,8 @@ class ConceptSpec:
             neg_system=str(base.get("neg_system", "")),
             eval_pos_texts=list(base.get("eval_pos_texts", [])),
             eval_neg_texts=list(base.get("eval_neg_texts", [])),
+            train_pos_texts=list(base.get("train_pos_texts", [])),
+            train_neg_texts=list(base.get("train_neg_texts", [])),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -62,4 +66,6 @@ class ConceptSpec:
             "neg_system": self.neg_system,
             "eval_pos_texts": list(self.eval_pos_texts),
             "eval_neg_texts": list(self.eval_neg_texts),
+            "train_pos_texts": list(self.train_pos_texts),
+            "train_neg_texts": list(self.train_neg_texts),
         }

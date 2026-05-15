@@ -5,6 +5,7 @@
 ## What it includes
 
 - Contrastive probe training from positive vs negative system prompts
+- Probe training from labelled example texts (no system prompts required)
 - Layer sweeps with effect sizes and optional p-values
 - Token-level and sequence-level scoring
 - Generation-time steering with learned concept vectors
@@ -93,6 +94,42 @@ probe.score_prompts(
 ```
 
 Outputs are written under `outputs/<concept_name>/<timestamp>/`.
+
+## Training from labelled texts
+
+If you already have labelled example sentences for each pole, set
+`training.train_prompt_mode = "texts"` and provide them on the concept
+itself via `train_pos_texts` / `train_neg_texts`. No `pos_system` /
+`neg_system` is needed; pooling falls back to `readout.read_mode`
+(default `sequence_all_mean`), the same path the read-side eval uses.
+
+```python
+from concept_probe import ConceptSpec, ProbeWorkspace
+
+concept = ConceptSpec(
+    name="raya_animal_vs_geom",
+    pos_label="animal",
+    neg_label="geometry",
+    pos_system="",
+    neg_system="",
+    train_pos_texts=[
+        "La raya nadaba sobre el lecho arenoso.",
+        # ... 20+ examples
+    ],
+    train_neg_texts=[
+        "Trazó una raya recta con la regla.",
+        # ... 20+ examples
+    ],
+    eval_pos_texts=[...],   # held-out animal examples
+    eval_neg_texts=[...],   # held-out geometry examples
+)
+
+workspace = ProbeWorkspace(
+    model_id="meta-llama/Llama-3.2-3B-Instruct",
+    config_overrides={"training": {"train_prompt_mode": "texts"}},
+)
+probe = workspace.train_concept(concept)
+```
 
 ## JSON-driven workflow
 
