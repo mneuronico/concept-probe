@@ -379,6 +379,18 @@ def _slice_generation_step_logits(
     return full_logits[start:end]
 
 
+def _get_final_norm_module(model):
+    base = getattr(model, "model", model)
+    for attr in ("norm", "final_layernorm", "ln_f"):
+        mod = getattr(base, attr, None)
+        if mod is not None:
+            return mod
+    raise AttributeError(
+        "Could not locate the final norm module on the model "
+        "(expected model.model.{norm,final_layernorm,ln_f})."
+    )
+
+
 @torch.no_grad()
 def forward_hidden_states_all_layers(
     model,
@@ -388,14 +400,37 @@ def forward_hidden_states_all_layers(
     generation_prompt_len: Optional[int] = None,
 ) -> Union[List[torch.Tensor], Tuple[List[torch.Tensor], torch.Tensor]]:
     attn = attention_mask_from_ids(input_ids).to(model.device)
-    out = model(
-        input_ids=input_ids.to(model.device),
-        attention_mask=attn,
-        output_hidden_states=True,
-        use_cache=False,
-        return_dict=True,
-    )
-    hs = out.hidden_states
+
+    final_norm = _get_final_norm_module(model)
+    captured: Dict[str, torch.Tensor] = {}
+
+    def _capture_pre_norm(module, args):
+        x = args[0] if isinstance(args, tuple) else args
+        captured["pre_norm"] = x.detach()
+
+    handle = final_norm.register_forward_pre_hook(_capture_pre_norm)
+    try:
+        out = model(
+            input_ids=input_ids.to(model.device),
+            attention_mask=attn,
+            output_hidden_states=True,
+            use_cache=False,
+            return_dict=True,
+        )
+    finally:
+        handle.remove()
+
+    if "pre_norm" not in captured:
+        raise RuntimeError(
+            "Forward pre-hook on final norm did not fire; model layout is unexpected."
+        )
+
+    hs = list(out.hidden_states)
+    # HF returns the post-final-norm tensor as hidden_states[-1] for decoder-only LMs,
+    # collapsing the last layer to a much smaller scale than the rest of the residual
+    # stream. Replace it with the pre-norm input so all layers are on the same scale.
+    hs[-1] = captured["pre_norm"]
+
     num_layers = len(hs) - 1
     hs_layers = [hs[l + 1][0].detach().float().cpu() for l in range(num_layers)]
     if not return_generation_logits:
