@@ -501,15 +501,37 @@ def token_scores_from_hs_layers(
     concept_vectors: np.ndarray,
     layer_indices: List[int],
     aggregate: str,
+    reference_layer: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
+    """Project each selected layer's hidden states onto a concept direction.
+
+    By default each layer ``li`` is scored with its own concept vector
+    ``concept_vectors[li]`` (the usual per-layer probe). If ``reference_layer``
+    is given, *every* selected layer is instead scored against the single
+    direction ``concept_vectors[reference_layer]``. This is a "logit-lens"-style
+    read: it measures how decodable a *fixed* direction (e.g. the one learned at
+    a late layer) is from the activations at every other layer, holding the
+    direction constant so that changes across layers reflect the representation
+    rather than a change of basis. ``reference_layer`` accepts negative indices.
+    """
     if not layer_indices:
         raise ValueError("layer_indices must be non-empty")
+    num_vectors = int(concept_vectors.shape[0])
+    if reference_layer is not None:
+        ref = int(reference_layer)
+        if ref < 0:
+            ref += num_vectors
+        if not (0 <= ref < num_vectors):
+            raise ValueError(
+                f"reference_layer={reference_layer} out of range for {num_vectors} concept vectors."
+            )
     total = int(hs_layers[0].shape[0])
     scores_per_layer = np.zeros((total, len(layer_indices)), dtype=np.float32)
 
     for i, li in enumerate(layer_indices):
         hs = hs_layers[li]
-        v = torch.tensor(concept_vectors[li], dtype=hs.dtype)
+        vi = li if reference_layer is None else ref
+        v = torch.tensor(concept_vectors[vi], dtype=hs.dtype)
         scores_per_layer[:, i] = (hs @ v).numpy()
 
     if aggregate == "mean":
@@ -520,6 +542,78 @@ def token_scores_from_hs_layers(
         raise ValueError(f"Unknown aggregate: {aggregate}")
 
     return scores_per_layer, scores_agg
+
+
+@torch.no_grad()
+def score_text_tokens(
+    model,
+    tokenizer,
+    concept_vectors: np.ndarray,
+    text: str,
+    *,
+    layer_indices: Optional[List[int]] = None,
+    reference_layer: Optional[int] = None,
+    unit_norm: bool = False,
+    add_special_tokens: bool = True,
+) -> Dict[str, Any]:
+    """Score every token of a RAW text against the per-layer concept directions, in memory.
+
+    Low-level read primitive for callers that need per-token, per-layer scores together with
+    character offsets (e.g. to target a specific word/subtoken), without the artifact-writing or
+    chat-template wrapping of ``ConceptProbe.score_texts``. The text is tokenized as-is (no chat
+    template); the forward pass uses the same all-layers capture as training (with the final-norm
+    fix), so layer ``l`` of the result aligns with ``concept_vectors[l]`` (i.e. hidden_states[l+1]).
+
+    Args:
+        concept_vectors: (num_layers, hidden_dim) directions. Pass unit vectors, or set
+            ``unit_norm=True`` to divide each row by its L2 norm before projecting (so the score is
+            ``hs · v̂``, i.e. divided by ``||v_l||``).
+        layer_indices: which layers to score (default: all). ``scores_per_layer`` has shape
+            ``(num_tokens, len(layer_indices))``.
+        reference_layer: if set, project every selected layer onto the single direction of that
+            layer (logit-lens); see ``token_scores_from_hs_layers``.
+        unit_norm: L2-normalize each concept vector before projecting (default False, to match
+            ``token_scores_from_hs_layers`` semantics).
+        add_special_tokens: passed to the tokenizer (default True; BOS gets offset (0, 0)).
+
+    Returns:
+        dict with ``token_ids`` (np.int32 [num_tokens]), ``tokens`` (List[str]),
+        ``offset_mapping`` (List[[start, end]] char spans), ``scores_per_layer``
+        (np.float32 [num_tokens, len(layer_indices)]) and ``layer_indices`` (List[int]).
+    """
+    cv = np.asarray(concept_vectors, dtype=np.float32)
+    if cv.ndim != 2:
+        raise ValueError(f"concept_vectors must be 2D [num_layers, hidden_dim], got shape={cv.shape}")
+    num_layers = int(cv.shape[0])
+    if unit_norm:
+        norms = np.linalg.norm(cv, axis=1, keepdims=True)
+        cv = cv / np.clip(norms, 1e-12, None)
+    layers = list(range(num_layers)) if layer_indices is None else [int(i) for i in layer_indices]
+
+    enc = tokenizer(text, return_tensors="pt", return_offsets_mapping=True,
+                    add_special_tokens=add_special_tokens)
+    om = enc["offset_mapping"]
+    if hasattr(om, "tolist"):
+        om = om.tolist()
+    offsets = [list(span) for span in om[0]]
+    input_ids = enc["input_ids"]
+
+    hs_layers = forward_hidden_states_all_layers(model, input_ids)
+    if len(hs_layers) != num_layers:
+        raise ValueError(
+            f"Layer mismatch: model returned {len(hs_layers)} layers, concept_vectors has {num_layers}."
+        )
+    scores_per_layer, _ = token_scores_from_hs_layers(
+        hs_layers, cv, layers, aggregate="mean", reference_layer=reference_layer
+    )
+    token_ids = input_ids[0].detach().cpu().numpy().astype(np.int32)
+    return {
+        "token_ids": token_ids,
+        "tokens": _decode_tokens(tokenizer, token_ids),
+        "offset_mapping": offsets,
+        "scores_per_layer": scores_per_layer.astype(np.float32),
+        "layer_indices": layers,
+    }
 
 
 @torch.no_grad()
@@ -1209,6 +1303,7 @@ class ConceptProbe:
         batch_subdir: Optional[str] = None,
         random_scoring_vector: bool = False,
         random_vector_seed: Optional[int] = None,
+        reference_layer: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         self._require_trained()
         tokenizer = self.model_bundle.tokenizer
@@ -1263,7 +1358,8 @@ class ConceptProbe:
                 used_prompt_system = False
             hs_layers = forward_hidden_states_all_layers(model, input_ids)
             scores_per_layer, scores_agg = token_scores_from_hs_layers(
-                hs_layers, scoring_vectors, layers, aggregate=aggregate
+                hs_layers, scoring_vectors, layers, aggregate=aggregate,
+                reference_layer=reference_layer,
             )
             token_ids = input_ids[0].detach().cpu().numpy().astype(np.int32)
             tokens = _decode_tokens(tokenizer, token_ids)

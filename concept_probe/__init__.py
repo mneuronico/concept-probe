@@ -1,5 +1,5 @@
 from .config import ConceptSpec, load_defaults, resolve_config
-from .probe import ConceptProbe, ProbeWorkspace
+from .probe import ConceptProbe, ProbeWorkspace, score_text_tokens
 from .multi_probe import multi_probe_score_prompts
 from .console import ConsoleLogger
 from .concept_runner import train_concept_from_json
@@ -27,6 +27,7 @@ __all__ = [
     "resolve_config",
     "ConceptProbe",
     "ProbeWorkspace",
+    "score_text_tokens",
     "multi_probe_score_prompts",
     "ConsoleLogger",
     "train_concept_from_json",

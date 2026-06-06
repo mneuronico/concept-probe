@@ -20,6 +20,7 @@ def test_public_api_surface_is_exposed():
         "resolve_config",
         "run_multi_scored_eval",
         "run_scored_eval",
+        "score_text_tokens",
         "simple_equality_evaluator",
         "train_concept_from_json",
     }
