@@ -790,17 +790,22 @@ def _compute_stats(per_sample: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], Li
     mean_score_vals: List[float] = []
     sem_score_vals: List[float] = []
     counts: List[int] = []
+    score_counts: List[int] = []
     for alpha in alpha_vals:
-        rows = [r for r in by_alpha.get(alpha, []) if _is_bool(r.get("correct"))]
+        all_rows = by_alpha.get(alpha, [])
+        rows = [r for r in all_rows if _is_bool(r.get("correct"))]
         counts.append(len(rows))
         if rows:
             acc = sum(1 for r in rows if r.get("correct") is True) / len(rows)
         else:
             acc = float("nan")
         accuracy_vals.append(float(acc))
+        # Score stats use every row with a finite score, independent of correctness labels:
+        # a custom evaluator that emits no "correct" field must not blank the score analysis.
         scores = [
-            s for s in (_finite_float(r.get("score_mean")) for r in rows) if np.isfinite(s)
+            s for s in (_finite_float(r.get("score_mean")) for r in all_rows) if np.isfinite(s)
         ]
+        score_counts.append(len(scores))
         mean_score_vals.append(float(np.mean(scores)) if scores else float("nan"))
         sem_score_vals.append(_sem(scores))
 
@@ -873,7 +878,7 @@ def _compute_stats(per_sample: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], Li
         ],
         "score_by_alpha": [
             {"alpha": float(a), "mean_score": float(m), "sem": float(s), "n": int(n)}
-            for a, m, s, n in zip(alpha_vals, mean_score_vals, sem_score_vals, counts)
+            for a, m, s, n in zip(alpha_vals, mean_score_vals, sem_score_vals, score_counts)
         ],
         "correct_vs_incorrect": {
             "mean_correct": mean_correct,

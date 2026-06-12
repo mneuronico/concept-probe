@@ -28,10 +28,12 @@ def normed_np(v: np.ndarray) -> np.ndarray:
 def _resolve_random_control_seed(explicit_seed: Optional[int], config_seed: Any) -> int:
     if explicit_seed is not None:
         return int(explicit_seed)
+    if config_seed is None:
+        return 0
     try:
         return int(config_seed)
-    except Exception:
-        return 0
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"random.seed in config must be an integer; got {config_seed!r}") from exc
 
 
 def _mix_random_control_seed(base_seed: int, salt: int) -> int:
@@ -308,7 +310,7 @@ def _normalize_messages(
     if system_count > 0:
         if default_system and warn is not None:
             warn(
-                f"{warn_prefix} includes a system message; overriding the provided default system prompt."
+                f"{warn_prefix} includes a system message; the provided default system prompt is ignored."
             )
         if system_count > 1 and warn is not None:
             warn(f"{warn_prefix} includes multiple system messages; using them as provided.")
@@ -1006,6 +1008,8 @@ class ConceptProbe:
 
         eval_prompts = list(self.config["prompts"]["eval_questions"])
         did_eval = False
+        n_eval_pos = 0
+        n_eval_neg = 0
         eval_mode = eval_cfg.get("eval_mode", "auto")
         if eval_cfg.get("do_eval", True):
             if eval_mode == "auto":
@@ -1097,6 +1101,8 @@ class ConceptProbe:
                             _, p = ttest_ind(pos_scores, neg_scores, equal_var=False)
                             sweep_p[l] = float(p)
                     did_eval = True
+                    n_eval_pos = len(eval_pos_texts)
+                    n_eval_neg = len(eval_neg_texts)
                 else:
                     self._warn("eval_mode=read but eval_pos_texts/eval_neg_texts are empty.")
             elif eval_mode == "generate":
@@ -1197,6 +1203,8 @@ class ConceptProbe:
                             _, p = ttest_ind(pos_scores, neg_scores, equal_var=False)
                             sweep_p[l] = float(p)
                     did_eval = True
+                    n_eval_pos = len(eval_prompts)
+                    n_eval_neg = len(eval_prompts)
             elif eval_mode != "skip":
                 raise ValueError(f"Unknown evaluation.eval_mode: {eval_mode!r} (use 'auto', 'read', or 'generate').")
 
@@ -1354,7 +1362,10 @@ class ConceptProbe:
             "n_train_pos": n_train_pos,
             "n_train_neg": n_train_neg,
             "train_prompt_mode": train_prompt_mode,
-            "n_eval": len(eval_prompts),
+            "n_eval": n_eval_pos + n_eval_neg,
+            "n_eval_pos": n_eval_pos,
+            "n_eval_neg": n_eval_neg,
+            "eval_mode_used": eval_mode if did_eval else None,
         }
         json_dump(os.path.join(self.run_dir, "metrics.json"), metrics)
         self.logger.log("artifacts_saved", {"npz_path": npz_path})
@@ -1905,6 +1916,12 @@ class ProbeWorkspace:
 
         probe = ConceptProbe.load(run_dir, model_bundle=self.model_bundle)
         # Use the workspace's config + console so scoring behavior matches workspace.config.
+        if probe.config != self.config:
+            self.console.warn(
+                "Workspace config differs from the saved run config; scoring will use the "
+                "workspace config (settings like layer_selection or score_aggregate may not "
+                "match what was used at training time)."
+            )
         probe.config = self.config
         probe.console = self.console
 
