@@ -14,7 +14,6 @@ class JsonlLogger:
     def log(self, event: str, payload: Optional[Dict[str, Any]] = None) -> None:
         if not self.enabled:
             return
-        rec = {"event": event}
-        if payload:
-            rec.update(payload)
+        rec = dict(payload) if payload else {}
+        rec["event"] = event  # the event name must not be clobbered by a payload key
         jsonl_append(self.path, rec)

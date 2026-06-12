@@ -82,119 +82,125 @@ def _compute_summary(rows: List[Dict[str, object]], probe_names: List[str]):
     return overall, correct, incorrect
 
 
-def _fit_model(rows: List[Dict[str, object]], probe_names: List[str], seed: int = 123):
+def _fit_model(rows: List[Dict[str, object]], probe_names: List[str], seed: int = 123, n_folds: int = 5):
+    """Logistic model of correctness from probe scores.
+
+    Metrics are pooled out-of-fold predictions from stratified K-fold CV (so they are
+    not inflated by in-sample fitting and every row is scored exactly once);
+    coefficients/p-values come from a single fit on all rows.
+    """
     if not rows:
         return None
     X = np.array([[r["scores"][p] for p in probe_names] for r in rows], dtype=np.float64)
     y = np.array([1 if r["correct"] else 0 for r in rows], dtype=np.int32)
 
-    rng = np.random.default_rng(seed)
-    idx = np.arange(len(rows))
-    rng.shuffle(idx)
-    if len(rows) < 2:
-        return {
-            "train_n": int(len(rows)),
-            "test_n": 0,
-            "coefficients": [],
-            "metrics": {},
-            "note": "Need at least 2 labeled rows for train/test modeling.",
-        }
-
-    split = int(0.75 * len(rows))
-    split = max(1, min(len(rows) - 1, split))
-    train_idx, test_idx = idx[:split], idx[split:]
-
-    X_train = X[train_idx]
-    X_test = X[test_idx]
-    y_train = y[train_idx]
-    y_test = y[test_idx]
-
-    mean = X_train.mean(axis=0)
-    std = X_train.std(axis=0)
-    std[std == 0] = 1.0
-    X_train_z = (X_train - mean) / std
-    X_test_z = (X_test - mean) / std
-
     result = {
-        "train_n": int(len(train_idx)),
-        "test_n": int(len(test_idx)),
+        "n": int(len(rows)),
+        "cv_folds": 0,
         "coefficients": [],
         "metrics": {},
+        "metrics_source": "out_of_fold_cv",
         "note": "",
     }
 
-    if len(train_idx) == 0 or len(test_idx) == 0:
-        result["note"] = "Train/test split is empty; skipping classifier fit."
-        return result
-    if np.unique(y_train).size < 2:
-        result["note"] = "Training split has a single class; skipping classifier fit."
+    n_pos = int(y.sum())
+    n_neg = int(len(y) - n_pos)
+    if n_pos < 2 or n_neg < 2:
+        result["note"] = "Need at least 2 rows of each class for cross-validated modeling."
         return result
 
     try:
         import statsmodels.api as sm
     except Exception:
-        sm = None
-
-    if sm is not None:
-        try:
-            X_train_sm = sm.add_constant(X_train_z)
-            X_test_sm = sm.add_constant(X_test_z)
-            model = sm.Logit(y_train, X_train_sm).fit(disp=False)
-            probs = model.predict(X_test_sm)
-        except Exception as exc:
-            result["note"] = f"Logistic model fit failed: {exc}"
-            return result
-
-        try:
-            from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, log_loss
-        except Exception:
-            accuracy_score = None
-            f1_score = None
-            roc_auc_score = None
-            log_loss = None
-
-        if accuracy_score is not None:
-            preds = (probs >= 0.5).astype(int)
-            metrics = {"accuracy": float(accuracy_score(y_test, preds))}
-            try:
-                metrics["f1"] = float(f1_score(y_test, preds))
-            except Exception:
-                pass
-            try:
-                if np.unique(y_test).size >= 2:
-                    metrics["roc_auc"] = float(roc_auc_score(y_test, probs))
-            except Exception:
-                pass
-            try:
-                metrics["log_loss"] = float(log_loss(y_test, probs))
-            except Exception:
-                pass
-        else:
-            metrics = {}
-
-        conf_int = model.conf_int()
-        pvals = model.pvalues
-        params = model.params
-        names = ["(intercept)"] + probe_names
-        for i, name in enumerate(names):
-            coef = float(params[i])
-            ci_lo = float(conf_int[i, 0])
-            ci_hi = float(conf_int[i, 1])
-            pval = float(pvals[i])
-            result["coefficients"].append(
-                {
-                    "feature": name,
-                    "coef": coef,
-                    "odds_ratio": float(np.exp(coef)),
-                    "ci_low": ci_lo,
-                    "ci_high": ci_hi,
-                    "p_value": pval,
-                }
-            )
-        result["metrics"] = metrics
+        result["note"] = "statsmodels not available; model not fit."
         return result
 
-    result["note"] = "statsmodels not available; p-values not computed."
+    k = int(max(2, min(n_folds, n_pos, n_neg)))
+    result["cv_folds"] = k
+
+    # Stratified fold assignment: shuffle within each class, deal round-robin so every
+    # fold's training split contains both classes.
+    rng = np.random.default_rng(seed)
+    folds = np.zeros(len(y), dtype=np.int32)
+    for cls in (0, 1):
+        idx = np.where(y == cls)[0]
+        rng.shuffle(idx)
+        for j, i in enumerate(idx):
+            folds[i] = j % k
+
+    oof_probs = np.full(len(y), np.nan, dtype=np.float64)
+    failed_folds = 0
+    for f in range(k):
+        tr = folds != f
+        te = folds == f
+        mean = X[tr].mean(axis=0)
+        std = X[tr].std(axis=0)
+        std[std == 0] = 1.0
+        X_tr = sm.add_constant((X[tr] - mean) / std, has_constant="add")
+        X_te = sm.add_constant((X[te] - mean) / std, has_constant="add")
+        try:
+            fold_model = sm.Logit(y[tr], X_tr).fit(disp=False)
+            oof_probs[te] = np.asarray(fold_model.predict(X_te), dtype=np.float64)
+        except Exception:
+            failed_folds += 1
+    if failed_folds:
+        result["note"] = (
+            f"{failed_folds}/{k} CV folds failed to fit (e.g. perfect separation); "
+            "metrics use the remaining folds."
+        )
+
+    valid = np.isfinite(oof_probs)
+    metrics: Dict[str, float] = {}
+    if valid.any():
+        y_v = y[valid]
+        p_v = oof_probs[valid]
+        preds = (p_v >= 0.5).astype(int)
+        metrics["accuracy"] = float((preds == y_v).mean())
+        tp = int(((preds == 1) & (y_v == 1)).sum())
+        fp = int(((preds == 1) & (y_v == 0)).sum())
+        fn = int(((preds == 0) & (y_v == 1)).sum())
+        if (2 * tp + fp + fn) > 0:
+            metrics["f1"] = float(2 * tp / (2 * tp + fp + fn))
+        try:
+            from sklearn.metrics import log_loss, roc_auc_score
+
+            if np.unique(y_v).size >= 2:
+                metrics["roc_auc"] = float(roc_auc_score(y_v, p_v))
+            metrics["log_loss"] = float(
+                log_loss(y_v, np.clip(p_v, 1e-12, 1 - 1e-12), labels=[0, 1])
+            )
+        except Exception:
+            pass
+    result["metrics"] = metrics
+
+    # Coefficients and p-values from a fit on all rows (metrics above are out-of-fold).
+    mean = X.mean(axis=0)
+    std = X.std(axis=0)
+    std[std == 0] = 1.0
+    X_z = sm.add_constant((X - mean) / std, has_constant="add")
+    try:
+        full_model = sm.Logit(y, X_z).fit(disp=False)
+    except Exception as exc:
+        extra = f"Full-data coefficient fit failed: {exc}"
+        result["note"] = f"{result['note']} {extra}".strip()
+        return result
+
+    conf_int = np.asarray(full_model.conf_int())
+    pvals = np.asarray(full_model.pvalues)
+    params = np.asarray(full_model.params)
+    names = ["(intercept)"] + probe_names
+    for i, name in enumerate(names):
+        coef = float(params[i])
+        result["coefficients"].append(
+            {
+                "feature": name,
+                "coef": coef,
+                "odds_ratio": float(np.exp(coef)),
+                "ci_low": float(conf_int[i, 0]),
+                "ci_high": float(conf_int[i, 1]),
+                "p_value": float(pvals[i]),
+            }
+        )
     return result
 
 
@@ -427,11 +433,16 @@ def generate_multi_probe_report(
         return;
       }}
       let metricsHtml = "<table><tr><th>Metric</th><th>Value</th></tr>";
-      metricsHtml += `<tr><td>Train N</td><td>${{model.train_n}}</td></tr>`;
-      metricsHtml += `<tr><td>Test N</td><td>${{model.test_n}}</td></tr>`;
+      const info = [["N", model.n], ["CV folds", model.cv_folds], ["Train N", model.train_n], ["Test N", model.test_n]];
+      for (const [k, v] of info) {{
+        if (v !== undefined && v !== null) {{
+          metricsHtml += `<tr><td>${{k}}</td><td>${{v}}</td></tr>`;
+        }}
+      }}
       if (model.metrics) {{
+        const src = model.metrics_source ? ` (${{model.metrics_source}})` : "";
         for (const [k, v] of Object.entries(model.metrics)) {{
-          metricsHtml += `<tr><td>${{k}}</td><td>${{v.toFixed(4)}}</td></tr>`;
+          metricsHtml += `<tr><td>${{k}}${{src}}</td><td>${{v.toFixed(4)}}</td></tr>`;
         }}
       }}
       metricsHtml += "</table>";

@@ -10,12 +10,20 @@ import numpy as np
 import torch
 
 
+_LAST_TAG_US = [-1]
+
+
 def now_tag() -> str:
     # Microsecond suffix: second-resolution tags collide when runs/batches are created
-    # in a loop, silently mixing artifacts in the same directory.
-    t = time.time()
-    base = time.strftime("%Y%m%d_%H%M%S", time.localtime(t))
-    return f"{base}_{int((t % 1) * 1e6):06d}"
+    # in a loop, silently mixing artifacts in the same directory. The clock can be
+    # coarser than 1us (notably on Windows), so bump past the last tag to stay unique
+    # and sortable within a process.
+    us = int(time.time() * 1e6)
+    if us <= _LAST_TAG_US[0]:
+        us = _LAST_TAG_US[0] + 1
+    _LAST_TAG_US[0] = us
+    base = time.strftime("%Y%m%d_%H%M%S", time.localtime(us / 1e6))
+    return f"{base}_{us % 1_000_000:06d}"
 
 
 def ensure_dir(path: str) -> None:
