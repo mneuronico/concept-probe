@@ -48,7 +48,15 @@ def _build_rows(items: List[Dict[str, object]], probe_names: List[str]) -> List[
             if probe not in scores:
                 ok = False
                 break
-            row["scores"][probe] = float(scores[probe])
+            try:
+                val = float(scores[probe])
+            except (TypeError, ValueError):
+                ok = False
+                break
+            if not np.isfinite(val):
+                ok = False
+                break
+            row["scores"][probe] = val
         if ok:
             rows.append(row)
     return rows

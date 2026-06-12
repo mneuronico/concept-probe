@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import random
 import re
@@ -17,14 +18,29 @@ def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
+def _json_sanitize(obj: Any) -> Any:
+    """Map NaN/Inf to None (and numpy scalars to Python) so emitted files are valid strict JSON."""
+    if isinstance(obj, dict):
+        return {k: _json_sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_sanitize(v) for v in obj]
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        obj = float(obj)
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return None
+    return obj
+
+
 def json_dump(path: str, obj: Dict[str, Any]) -> None:
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=True, indent=2, sort_keys=True)
+        json.dump(_json_sanitize(obj), f, ensure_ascii=True, indent=2, sort_keys=True, allow_nan=False)
 
 
 def jsonl_append(path: str, obj: Dict[str, Any]) -> None:
     with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(obj, ensure_ascii=True) + "\n")
+        f.write(json.dumps(_json_sanitize(obj), ensure_ascii=True, allow_nan=False) + "\n")
 
 
 def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:

@@ -9,7 +9,7 @@ import torch
 
 from .config import ConceptSpec, resolve_config
 from .logger import JsonlLogger
-from .modeling import ModelBundle, apply_chat, attention_mask_from_ids
+from .modeling import ModelBundle, _resolve_attr_path, apply_chat, attention_mask_from_ids
 from .steering import MultiLayerSteererLayerwise
 from .utils import deep_merge, ensure_dir, json_dump, jsonl_to_pretty, now_tag, safe_slug, set_seed
 from .visuals import plot_score_hist, plot_sweep, render_batch_heatmap, render_token_heatmap, segment_token_scores
@@ -85,14 +85,23 @@ def _progress_print(current: int, total: int, *, label: str, enabled: bool, last
 
 def cohen_d_np(x: np.ndarray, y: np.ndarray) -> float:
     nx, ny = x.size, y.size
+    if nx < 2 or ny < 2:
+        return float("nan")
     vx, vy = x.var(ddof=1), y.var(ddof=1)
     pooled = ((nx - 1) * vx + (ny - 1) * vy) / (nx + ny - 2)
     return float((x.mean() - y.mean()) / (np.sqrt(pooled) + 1e-12))
 
 
+def _validate_layer_index(value: Any, num_layers: int, what: str) -> int:
+    idx = int(value)
+    if not (0 <= idx < num_layers):
+        raise ValueError(f"{what} must be in [0, {num_layers - 1}]; got {idx}.")
+    return idx
+
+
 def pick_layer(num_layers: int, layer_idx: Optional[int], layer_frac: float) -> int:
     if layer_idx is not None:
-        return int(layer_idx)
+        return _validate_layer_index(layer_idx, num_layers, "training.layer_idx")
     return int(layer_frac * (num_layers - 1))
 
 
@@ -104,7 +113,10 @@ def _layer_index_from_value(value: Any, num_layers: int) -> int:
     if isinstance(value, (float, np.floating)):
         if 0.0 <= float(value) <= 1.0:
             return int(float(value) * (num_layers - 1))
-        return int(value)
+        raise ValueError(
+            f"Float layer values are interpreted as fractions of depth in [0, 1]; got {value}. "
+            "Use an int for an absolute layer index."
+        )
     raise TypeError(f"Layer values must be int or float; got {type(value)}")
 
 
@@ -170,7 +182,10 @@ def select_layers(selection: Dict[str, Any], best_layer: int, num_layers: int) -
         hi = min(num_layers - 1, best_layer + radius)
         return list(range(lo, hi + 1))
     if mode == "explicit":
-        return list(map(int, selection.get("layers", [])))
+        return [
+            _validate_layer_index(l, num_layers, "layer_selection.layers entries")
+            for l in selection.get("layers", [])
+        ]
     if mode == "all":
         return list(range(num_layers))
     raise ValueError(f"Unknown layer selection mode: {mode}")
@@ -379,15 +394,33 @@ def _slice_generation_step_logits(
     return full_logits[start:end]
 
 
+# Mirrors the wrapper layouts handled by modeling.get_transformer_layers, so any model
+# whose blocks we can find also has a findable final norm.
+_FINAL_NORM_PATHS = (
+    "model.norm",
+    "model.final_layernorm",
+    "model.ln_f",
+    "model.language_model.norm",
+    "language_model.norm",
+    "model.model.norm",
+    "model.model.language_model.norm",
+    "base_model.model.norm",
+    "base_model.model.language_model.norm",
+    "transformer.ln_f",
+    "norm",
+    "final_layernorm",
+    "ln_f",
+)
+
+
 def _get_final_norm_module(model):
-    base = getattr(model, "model", model)
-    for attr in ("norm", "final_layernorm", "ln_f"):
-        mod = getattr(base, attr, None)
-        if mod is not None:
+    for path in _FINAL_NORM_PATHS:
+        mod = _resolve_attr_path(model, path)
+        if mod is not None and isinstance(mod, torch.nn.Module):
             return mod
+    tried = ", ".join(_FINAL_NORM_PATHS)
     raise AttributeError(
-        "Could not locate the final norm module on the model "
-        "(expected model.model.{norm,final_layernorm,ln_f})."
+        f"Could not locate the final norm module on {type(model).__name__}; tried: {tried}"
     )
 
 
@@ -455,10 +488,24 @@ def reps_from_hs_layers(
     prompt_len: Optional[int],
     mode: str,
     last_k: int,
+    warn: Optional[Callable[[str], None]] = None,
 ) -> np.ndarray:
     num_layers = len(hs_layers)
     dim = int(hs_layers[0].shape[1])
     reps = np.zeros((num_layers, dim), dtype=np.float32)
+
+    if (
+        warn is not None
+        and prompt_len is not None
+        and mode in ("assistant_last_k_mean", "assistant_all_mean")
+        and prompt_len >= int(hs_layers[0].shape[0])
+    ):
+        warn(
+            f"mode={mode}: no completion tokens (prompt_len={prompt_len} >= "
+            f"seq_len={int(hs_layers[0].shape[0])}); falling back to full-sequence pooling, "
+            "which includes prompt/system tokens and can leak the system-prompt difference "
+            "into the concept vector."
+        )
 
     for l in range(num_layers):
         hs = hs_layers[l]
@@ -588,7 +635,11 @@ def score_text_tokens(
     if unit_norm:
         norms = np.linalg.norm(cv, axis=1, keepdims=True)
         cv = cv / np.clip(norms, 1e-12, None)
-    layers = list(range(num_layers)) if layer_indices is None else [int(i) for i in layer_indices]
+    layers = (
+        list(range(num_layers))
+        if layer_indices is None
+        else [_validate_layer_index(i, num_layers, "layer_indices entries") for i in layer_indices]
+    )
 
     enc = tokenizer(text, return_tensors="pt", return_offsets_mapping=True,
                     add_special_tokens=add_special_tokens)
@@ -695,6 +746,11 @@ class ConceptProbe:
         num_layers = self.model_bundle.num_layers
 
         self._status(f"Training concept '{self.concept.name}' with model {self.model_bundle.model_id}")
+        if train_prompt_mode in ("shared", "opposed") and self.concept.pos_system == self.concept.neg_system:
+            self._warn(
+                "pos_system == neg_system; contrastive training will compare identical conditions "
+                "and the learned direction will be noise."
+            )
         phase1_action = "Reading training texts" if train_prompt_mode == "texts" else "Generating training completions"
         self._status(f"[Phase 1/4] {phase1_action} ({train_prompt_mode})")
         train_pos_ids, train_neg_ids = [], []
@@ -908,6 +964,7 @@ class ConceptProbe:
                     prompt_len=train_pos_plens[i],
                     mode=train_readout_mode,
                     last_k=train_readout_last_k,
+                    warn=None if train_prompt_mode == "texts" else self._warn,
                 )
                 for i in range(len(train_pos_ids))
             ],
@@ -921,6 +978,7 @@ class ConceptProbe:
                     prompt_len=train_neg_plens[i],
                     mode=train_readout_mode,
                     last_k=train_readout_last_k,
+                    warn=None if train_prompt_mode == "texts" else self._warn,
                 )
                 for i in range(len(train_neg_ids))
             ],
@@ -953,8 +1011,21 @@ class ConceptProbe:
             if eval_mode == "auto":
                 if len(self.concept.eval_pos_texts) > 0 and len(self.concept.eval_neg_texts) > 0:
                     eval_mode = "read"
+                elif train_prompt_mode == "texts":
+                    self._warn(
+                        "eval_mode=auto with train_prompt_mode=texts but no eval_pos_texts/"
+                        "eval_neg_texts; skipping evaluation (generate-mode eval would contrast "
+                        "pos_system vs neg_system, which texts-mode concepts typically leave identical)."
+                    )
+                    eval_mode = "skip"
                 else:
                     eval_mode = "generate"
+
+            if eval_mode == "generate" and self.concept.pos_system == self.concept.neg_system:
+                self._warn(
+                    "pos_system == neg_system; generate-mode eval contrasts identical conditions, "
+                    "so the layer sweep cannot separate the concept."
+                )
 
             if eval_mode == "read":
                 eval_pos_texts = list(self.concept.eval_pos_texts)
@@ -1028,7 +1099,7 @@ class ConceptProbe:
                     did_eval = True
                 else:
                     self._warn("eval_mode=read but eval_pos_texts/eval_neg_texts are empty.")
-            else:
+            elif eval_mode == "generate":
                 if len(eval_prompts) > 0:
                     self._status("[Phase 3/4] Generating eval completions")
                     eval_pos_ids, eval_neg_ids = [], []
@@ -1087,6 +1158,7 @@ class ConceptProbe:
                                 prompt_len=eval_pos_plens[i],
                                 mode=readout["train_mode"],
                                 last_k=readout["train_last_k"],
+                                warn=self._warn,
                             )
                             for i in range(len(eval_prompts))
                         ],
@@ -1100,6 +1172,7 @@ class ConceptProbe:
                                 prompt_len=eval_neg_plens[i],
                                 mode=readout["train_mode"],
                                 last_k=readout["train_last_k"],
+                                warn=self._warn,
                             )
                             for i in range(len(eval_prompts))
                         ],
@@ -1124,12 +1197,16 @@ class ConceptProbe:
                             _, p = ttest_ind(pos_scores, neg_scores, equal_var=False)
                             sweep_p[l] = float(p)
                     did_eval = True
+            elif eval_mode != "skip":
+                raise ValueError(f"Unknown evaluation.eval_mode: {eval_mode!r} (use 'auto', 'read', or 'generate').")
 
         if not did_eval:
             reason = "evaluation disabled"
             if eval_cfg.get("do_eval", True):
                 if eval_mode == "read":
                     reason = "missing eval_pos_texts/eval_neg_texts"
+                elif eval_mode == "skip":
+                    reason = "no eval texts provided for texts-mode concept"
                 elif len(eval_prompts) == 0:
                     reason = "empty eval_questions"
             self._warn(reason)
@@ -1149,10 +1226,13 @@ class ConceptProbe:
             allowed_mask = np.zeros((num_layers,), dtype=bool)
             allowed_mask[search_layers] = True
             if train_cfg["sweep_select"] == "effect_size":
-                masked = np.where(allowed_mask, sweep_d, -np.inf)
+                masked = np.where(allowed_mask & np.isfinite(sweep_d), sweep_d, -np.inf)
                 best_layer = int(np.argmax(masked))
                 if not np.isfinite(masked[best_layer]):
-                    raise ValueError("No valid layers available for best_layer_search selection.")
+                    raise ValueError(
+                        "No finite Cohen's d in the best_layer_search range. This typically means "
+                        "fewer than 2 eval samples per side; add eval data or disable the layer sweep."
+                    )
             else:
                 masked = np.where(allowed_mask, sweep_p, np.nan)
                 if np.all(np.isnan(masked)):
@@ -1161,6 +1241,11 @@ class ConceptProbe:
                         "Install scipy or use sweep_select='effect_size'."
                     )
                 best_layer = int(np.nanargmin(masked))
+            self._warn(
+                f"best_layer was selected by optimizing over {len(search_layers)} layers on the eval "
+                "set; best_d/best_p at that layer are selection diagnostics (no multiple-comparison "
+                "correction), not confirmatory statistics. Confirm on held-out data before reporting."
+            )
         else:
             best_layer = pick_layer(num_layers, train_cfg.get("layer_idx"), train_cfg.get("layer_frac", 0.75))
 
@@ -1253,6 +1338,12 @@ class ConceptProbe:
             "best_layer": best_layer,
             "best_d": float(sweep_d[best_layer]),
             "best_p": None if np.isnan(sweep_p[best_layer]) else float(sweep_p[best_layer]),
+            "best_layer_selection_note": (
+                "best_d/best_p are post-selection values (best layer chosen by optimizing over the "
+                "layer sweep on the same eval data); confirm on held-out data before reporting."
+                if (train_cfg["do_layer_sweep"] and did_eval)
+                else None
+            ),
             "best_layer_search": train_cfg.get("best_layer_search"),
             "best_layer_search_intervals": search_intervals,
             "best_layer_search_layers": search_layers,
@@ -1310,7 +1401,7 @@ class ConceptProbe:
         model = self.model_bundle.model
         aggregate = self.config["evaluation"]["score_aggregate"]
         layers = self._layer_selection(layer_selection)
-        sys_prompt = system_prompt or self.config["prompts"]["neutral_system"]
+        sys_prompt = self.config["prompts"]["neutral_system"] if system_prompt is None else system_prompt
         save_html = self.config["plots"].get("heatmap_html", True) if save_html is None else save_html
         save_token_scores_npz = self.config["output"].get("save_token_scores_npz", True)
         base_random_seed = _resolve_random_control_seed(
@@ -1438,7 +1529,7 @@ class ConceptProbe:
         model = self.model_bundle.model
         aggregate = self.config["evaluation"]["score_aggregate"]
         layers = self._layer_selection(layer_selection)
-        sys_prompt = system_prompt or self.config["prompts"]["neutral_system"]
+        sys_prompt = self.config["prompts"]["neutral_system"] if system_prompt is None else system_prompt
         save_html = self.config["plots"].get("heatmap_html", True) if save_html is None else save_html
         save_segments = False if save_segments is None else save_segments
         do_steering = bool(self.config["steering"].get("do_steering", True))
@@ -1568,15 +1659,19 @@ class ConceptProbe:
                             pad_token_id=tokenizer.eos_token_id,
                         )[0].detach().cpu()
                         if save_generation_logits:
-                            hs_layers, generation_step_logits = forward_hidden_states_all_layers(
+                            # Generation logits must reflect the steered model that produced the text.
+                            _, generation_step_logits = forward_hidden_states_all_layers(
                                 model,
                                 gen_ids.unsqueeze(0),
                                 return_generation_logits=True,
                                 generation_prompt_len=prompt_len,
                             )
                         else:
-                            hs_layers = forward_hidden_states_all_layers(model, gen_ids.unsqueeze(0))
                             generation_step_logits = None
+                    # Score with the hooks removed: with them active, the injected vector reads
+                    # itself back (score inflation ~ alpha * cos(steer_dir, score_dir) at steered
+                    # layers), contaminating the probe readout of the generated text.
+                    hs_layers = forward_hidden_states_all_layers(model, gen_ids.unsqueeze(0))
                 else:
                     gen_ids = model.generate(
                         input_ids=input_ids,
@@ -1606,14 +1701,14 @@ class ConceptProbe:
                         generation_step_logits,
                         logits_top_k=generation_logits_top_k,
                         logits_dtype_name=generation_logits_dtype,
-                        logits_source="raw_model",
+                        logits_source="steered_model" if should_steer else "raw_model",
                     )
 
                 token_ids = gen_ids.numpy().astype(np.int32)
                 tokens = _decode_tokens(tokenizer, token_ids)
                 completion_ids = token_ids[prompt_len:]
                 completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True)
-                completion_scores = scores_agg[prompt_len:] if prompt_len < scores_agg.shape[0] else scores_agg
+                completion_scores = scores_agg[prompt_len:]
                 score_mean = float(np.mean(completion_scores)) if completion_scores.size else float("nan")
 
                 alpha_label = _alpha_label(float(alpha), alpha_unit)

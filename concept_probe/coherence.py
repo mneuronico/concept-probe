@@ -44,13 +44,17 @@ def _load_env(env_path: Optional[Path] = None) -> None:
             os.environ[key] = value
 
 
-def _find_log_jsonl(start_dir: Path) -> Path:
+def _find_log_jsonl(start_dir: Path, max_levels: int = 6) -> Path:
+    # Bounded ascent: run layout is <run_dir>/log.jsonl with batches at most a few levels
+    # below; walking to the filesystem root risks latching onto an unrelated log.jsonl.
     cur = start_dir.resolve()
-    for parent in [cur] + list(cur.parents):
+    for parent in [cur] + list(cur.parents)[:max_levels]:
         candidate = parent / "log.jsonl"
         if candidate.exists():
             return candidate
-    raise FileNotFoundError(f"Could not find log.jsonl above {start_dir}")
+    raise FileNotFoundError(
+        f"Could not find log.jsonl within {max_levels} levels above {start_dir}"
+    )
 
 
 def _normalize_npz_path(path_str: str, repo_root: Path, log_dir: Path) -> Path:
@@ -89,6 +93,10 @@ def _collect_completion_map(log_path: Path, repo_root: Path) -> Dict[str, str]:
             continue
         normalized = _normalize_npz_path(npz_path, repo_root, log_dir)
         completion_map[str(normalized)] = completion
+        # cwd-independent key: logged npz paths may be relative to a different working
+        # directory, so also index by <batch_name>/<file_name>.
+        raw = Path(npz_path)
+        completion_map[f"{raw.parent.name}/{raw.name}"] = completion
     return completion_map
 
 
@@ -199,8 +207,9 @@ def rate_batch_coherence(
     records: List[Tuple[int, Path, str]] = []
     missing: List[str] = []
     for idx, npz_path in enumerate(npz_files):
-        key = str(npz_path.resolve())
-        completion = completion_map.get(key)
+        completion = completion_map.get(str(npz_path.resolve()))
+        if completion is None:
+            completion = completion_map.get(f"{npz_path.parent.name}/{npz_path.name}")
         if completion is None:
             missing.append(npz_path.name)
             continue

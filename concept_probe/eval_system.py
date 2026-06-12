@@ -41,10 +41,7 @@ def _mean_completion_score(npz_path: str) -> float:
     data = np.load(npz_path)
     scores = data["scores_agg"]
     prompt_len = int(data["prompt_len"][0]) if "prompt_len" in data else 0
-    if prompt_len < scores.shape[0]:
-        span = scores[prompt_len:]
-    else:
-        span = scores
+    span = scores[prompt_len:]
     if span.size == 0:
         return float("nan")
     return float(np.mean(span))
@@ -83,7 +80,7 @@ def _mean_completion_score_multi(npz_path: str) -> Dict[str, float]:
     prompt_len = int(data["prompt_len"][0]) if "prompt_len" in data else 0
 
     if scores.ndim == 1:
-        span = scores[prompt_len:] if prompt_len < scores.shape[0] else scores
+        span = scores[prompt_len:]
         mean_val = float(np.mean(span)) if span.size else float("nan")
         return {"_probe_0": mean_val}
 
@@ -98,7 +95,7 @@ def _mean_completion_score_multi(npz_path: str) -> Dict[str, float]:
     score_map: Dict[str, float] = {}
     for idx, name in enumerate(probe_names):
         row = scores[idx]
-        span = row[prompt_len:] if prompt_len < row.shape[0] else row
+        span = row[prompt_len:]
         mean_val = float(np.mean(span)) if span.size else float("nan")
         score_map[name] = mean_val
     return score_map
@@ -119,6 +116,14 @@ def _score_mean_by_probe_from_result(rec: Dict[str, Any]) -> Dict[str, float]:
     if isinstance(npz_path, str):
         return _mean_completion_score_multi(npz_path)
     return {}
+
+
+def _finite_float(value: Any) -> float:
+    """Coerce to float, mapping None/non-numeric to NaN (per_sample.json stores NaN as null)."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
 
 
 def _sem(values: List[float]) -> float:
@@ -760,6 +765,9 @@ def _load_coherence_ratings(batch_dir: Path) -> Dict[str, str]:
         rating = entry.get("rating")
         if isinstance(example, str) and isinstance(rating, str):
             ratings[str((batch_dir / example).resolve())] = rating
+            # cwd-independent key: per_sample.json may store npz paths relative to a
+            # different working directory, so also match on <batch_name>/<file_name>.
+            ratings[f"{batch_dir.name}/{example}"] = rating
     return ratings
 
 
@@ -791,26 +799,28 @@ def _compute_stats(per_sample: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], Li
             acc = float("nan")
         accuracy_vals.append(float(acc))
         scores = [
-            float(r.get("score_mean"))
-            for r in rows
-            if np.isfinite(r.get("score_mean", float("nan")))
+            s for s in (_finite_float(r.get("score_mean")) for r in rows) if np.isfinite(s)
         ]
         mean_score_vals.append(float(np.mean(scores)) if scores else float("nan"))
         sem_score_vals.append(_sem(scores))
 
     correct_scores = np.array(
         [
-            float(r.get("score_mean"))
-            for r in per_sample
-            if r.get("correct") is True and np.isfinite(r.get("score_mean", float("nan")))
+            s
+            for s in (
+                _finite_float(r.get("score_mean")) for r in per_sample if r.get("correct") is True
+            )
+            if np.isfinite(s)
         ],
         dtype=np.float32,
     )
     incorrect_scores = np.array(
         [
-            float(r.get("score_mean"))
-            for r in per_sample
-            if r.get("correct") is False and np.isfinite(r.get("score_mean", float("nan")))
+            s
+            for s in (
+                _finite_float(r.get("score_mean")) for r in per_sample if r.get("correct") is False
+            )
+            if np.isfinite(s)
         ],
         dtype=np.float32,
     )
@@ -827,14 +837,14 @@ def _compute_stats(per_sample: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], Li
     for alpha in alpha_vals:
         rows = [r for r in by_alpha.get(alpha, []) if _is_bool(r.get("correct"))]
         correct_scores_alpha = [
-            float(r.get("score_mean"))
-            for r in rows
-            if r.get("correct") is True and np.isfinite(r.get("score_mean", float("nan")))
+            s
+            for s in (_finite_float(r.get("score_mean")) for r in rows if r.get("correct") is True)
+            if np.isfinite(s)
         ]
         incorrect_scores_alpha = [
-            float(r.get("score_mean"))
-            for r in rows
-            if r.get("correct") is False and np.isfinite(r.get("score_mean", float("nan")))
+            s
+            for s in (_finite_float(r.get("score_mean")) for r in rows if r.get("correct") is False)
+            if np.isfinite(s)
         ]
         mean_c = float(np.mean(correct_scores_alpha)) if correct_scores_alpha else float("nan")
         mean_i = float(np.mean(incorrect_scores_alpha)) if incorrect_scores_alpha else float("nan")
@@ -910,6 +920,8 @@ def _compute_coherence(
     accuracy_by_rating: Dict[str, List[float]] = {k: [float("nan")] * len(alpha_vals) for k in RATING_COLORS}
     by_alpha: Dict[float, List[Dict[str, Any]]] = {}
     for row in per_sample:
+        if "alpha" not in row:
+            continue
         by_alpha.setdefault(float(row["alpha"]), []).append(row)
 
     for i, alpha in enumerate(alpha_vals):
@@ -920,8 +932,11 @@ def _compute_coherence(
                 npz_path = item.get("npz_path")
                 if not isinstance(npz_path, str):
                     continue
-                key = str(Path(npz_path).resolve())
-                if ratings.get(key) == rating:
+                p = Path(npz_path)
+                item_rating = ratings.get(str(p.resolve()))
+                if item_rating is None:
+                    item_rating = ratings.get(f"{p.parent.name}/{p.name}")
+                if item_rating == rating:
                     rated_rows.append(item)
             counts_by_rating[rating][i] = len(rated_rows)
             if rated_rows:

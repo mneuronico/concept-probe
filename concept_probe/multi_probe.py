@@ -145,7 +145,11 @@ def multi_probe_score_prompts(
         alphas = [0.0]
         nonzero_alpha_requested = False
 
-    sys_prompt = system_prompt or probes[0].config["prompts"].get("neutral_system", "You are a helpful assistant.")
+    sys_prompt = (
+        probes[0].config["prompts"].get("neutral_system", "You are a helpful assistant.")
+        if system_prompt is None
+        else system_prompt
+    )
     steer_cfg = probes[0].config.get("steering", {})
     max_new_tokens = max_new_tokens if max_new_tokens is not None else steer_cfg.get("steer_max_new_tokens", 128)
     greedy = greedy if greedy is not None else (not steer_cfg.get("steer_sampling", False))
@@ -325,6 +329,7 @@ def multi_probe_score_prompts(
             attn = attention_mask_from_ids(input_ids).to(model.device)
             prompt_len = int(input_ids.shape[-1])
 
+            should_steer = steer_probe_obj is not None and abs(float(alpha_val)) > 1e-12
             if steer_probe_obj is not None:
                 with MultiLayerSteererLayerwise(
                     model,
@@ -343,15 +348,18 @@ def multi_probe_score_prompts(
                         pad_token_id=tokenizer.eos_token_id,
                     )[0].detach().cpu()
                     if save_generation_logits:
-                        hs_layers, generation_step_logits = forward_hidden_states_all_layers(
+                        # Generation logits must reflect the steered model that produced the text.
+                        _, generation_step_logits = forward_hidden_states_all_layers(
                             model,
                             gen_ids.unsqueeze(0),
                             return_generation_logits=True,
                             generation_prompt_len=prompt_len,
                         )
                     else:
-                        hs_layers = forward_hidden_states_all_layers(model, gen_ids.unsqueeze(0))
                         generation_step_logits = None
+                # Score with the hooks removed: with them active, the injected vector reads itself
+                # back at the steered layers, contaminating every probe whose direction overlaps it.
+                hs_layers = forward_hidden_states_all_layers(model, gen_ids.unsqueeze(0))
             else:
                 gen_ids = model.generate(
                     input_ids=input_ids,
@@ -382,7 +390,7 @@ def multi_probe_score_prompts(
                     generation_step_logits,
                     logits_top_k=generation_logits_top_k,
                     logits_dtype_name=generation_logits_dtype,
-                    logits_source="raw_model",
+                    logits_source="steered_model" if should_steer else "raw_model",
                 )
 
             scores_agg_list: List[np.ndarray] = []
@@ -400,7 +408,7 @@ def multi_probe_score_prompts(
             score_mean_by_probe: Dict[str, float] = {}
             for idx, name in enumerate(probe_names):
                 row = scores_agg_stack[idx]
-                completion_span = row[prompt_len:] if prompt_len < row.shape[0] else row
+                completion_span = row[prompt_len:]
                 score_mean_by_probe[name] = float(np.mean(completion_span)) if completion_span.size else float("nan")
 
             alpha_label = _alpha_label(float(alpha), alpha_unit)
