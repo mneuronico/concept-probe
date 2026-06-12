@@ -21,7 +21,7 @@ from .probe import (
     token_scores_from_hs_layers,
 )
 from .steering import MultiLayerSteererLayerwise
-from .utils import ensure_dir, json_dump, now_tag, safe_slug
+from .utils import ensure_dir, json_dump, now_tag, safe_slug, set_seed
 from .visuals import render_batch_heatmap_multi, render_token_heatmap_multi, segment_token_scores
 
 
@@ -117,9 +117,12 @@ def multi_probe_score_prompts(
     random_scoring_vector: bool = False,
     random_steering_vector: bool = False,
     random_vector_seed: Optional[int] = None,
+    seed: Optional[int] = None,
 ) -> Dict[str, Any]:
     if not probes:
         raise ValueError("probes must be a non-empty list of ConceptProbe objects.")
+    if seed is not None:
+        set_seed(int(seed))
     if not prompts:
         return {"run_dir": None, "results": []}
 
@@ -249,6 +252,7 @@ def multi_probe_score_prompts(
             "greedy": greedy,
             "temperature": temperature,
             "top_p": top_p,
+            "sampling_seed": seed,
             "save_generation_logits": bool(save_generation_logits),
             "generation_logits_top_k": generation_logits_top_k,
             "generation_logits_dtype": generation_logits_dtype,

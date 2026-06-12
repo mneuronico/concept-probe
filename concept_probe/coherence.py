@@ -174,12 +174,18 @@ def rate_batch_coherence(
     batch_dir: str,
     max_elements_per_request: int = DEFAULT_MAX_PER_REQUEST,
     *,
-    model: str = DEFAULT_MODEL,
+    model: Optional[str] = None,
     api_key: Optional[str] = None,
     env_path: Optional[str] = None,
 ) -> List[Dict[str, str]]:
     """
     Rate completion coherence for a score batch directory.
+
+    NOTE: this sends the batch's completions to the external Groq API. Do not enable it
+    for data that must not leave the machine.
+
+    model: explicit model id; when None, falls back to the GROQ_MODEL env var, then to
+    the package default. (An explicitly passed model is never overridden by the env.)
 
     Saves output to <batch_dir>/coherence_rating.json and returns the list.
     """
@@ -190,7 +196,7 @@ def rate_batch_coherence(
     api_key = api_key or os.environ.get("GROQ_API_KEY")
     if not api_key:
         raise EnvironmentError("Missing GROQ_API_KEY (set it in .env or environment).")
-    if model == DEFAULT_MODEL:
+    if model is None:
         model = os.environ.get("GROQ_MODEL") or DEFAULT_MODEL
 
     batch_path = Path(batch_dir).resolve()
@@ -222,6 +228,7 @@ def rate_batch_coherence(
         )
 
     items = [{"id": idx, "completion": completion} for idx, _, completion in records]
+    print(f"Sending {len(items)} completions to the Groq API (model={model}) for coherence rating.")
     ratings_by_id: Dict[int, str] = {}
     for chunk in _chunked(items, max_elements_per_request):
         user_payload = json.dumps(chunk, ensure_ascii=False)

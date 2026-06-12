@@ -11,7 +11,11 @@ import torch
 
 
 def now_tag() -> str:
-    return time.strftime("%Y%m%d_%H%M%S")
+    # Microsecond suffix: second-resolution tags collide when runs/batches are created
+    # in a loop, silently mixing artifacts in the same directory.
+    t = time.time()
+    base = time.strftime("%Y%m%d_%H%M%S", time.localtime(t))
+    return f"{base}_{int((t % 1) * 1e6):06d}"
 
 
 def ensure_dir(path: str) -> None:

@@ -201,6 +201,17 @@ GitHub Actions CI runs the same lightweight checks and also builds source and wh
 - `best_d`/`best_p` in `metrics.json` are post-selection values (the best layer is
   chosen by optimizing over the layer sweep on the same eval data); confirm effect
   sizes on held-out data before reporting them.
+- About `alpha_unit="sigma"`: alpha is multiplied by the std of the *sequence-pooled*
+  eval projections at the best layer, and the resulting raw offset is added at every
+  token position of each steered layer (split across layers when
+  `steer_distribute=true`, compounding through subsequent layers). It is a convenient
+  scale knob, not literally "n standard deviations of behavior".
+- `score_prompts(..., seed=...)` / `multi_probe_score_prompts(..., seed=...)` seed the
+  RNGs for reproducible sampling (best-effort: GPU kernels are not bit-deterministic
+  across hardware/library versions).
+- Coherence rating sends completions to the external Groq API (it runs by default in
+  `run_scored_eval` when a `GROQ_API_KEY` is configured; a notice is printed before
+  sending). Pass `rate_coherence=False` for data that must not leave the machine.
 - The default config in `concept_probe/defaults.json` is usable, but opinionated.
 - Behavioral eval helpers depend on optional packages and, for coherence rating, an external API key.
 - Example scripts are intended as starting points and will download model weights when you run them.

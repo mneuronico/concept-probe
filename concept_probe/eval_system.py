@@ -419,7 +419,7 @@ def run_scored_eval(
     analysis_name: str = "analysis",
     analyze: bool = True,
     rate_coherence: bool = True,
-    coherence_model: str = "openai/gpt-oss-20b",
+    coherence_model: Optional[str] = None,
     coherence_max_per_request: int = 8,
     coherence_env_path: Optional[str] = None,
     marker: Optional[str] = None,
@@ -587,7 +587,7 @@ def run_multi_scored_eval(
     analysis_name: str = "analysis",
     analyze: bool = True,
     rate_coherence: bool = True,
-    coherence_model: str = "openai/gpt-oss-20b",
+    coherence_model: Optional[str] = None,
     coherence_max_per_request: int = 8,
     coherence_env_path: Optional[str] = None,
     **score_kwargs: Any,
@@ -1133,7 +1133,7 @@ def rate_batch_coherence_safe(
     batch_dir: str,
     *,
     max_elements_per_request: int = 8,
-    model: str = "openai/gpt-oss-20b",
+    model: Optional[str] = None,
     env_path: Optional[str] = None,
 ) -> bool:
     try:
@@ -1160,7 +1160,7 @@ def rehydrate_batch_analysis(
     *,
     analysis_name: str = "analysis",
     rate_coherence: bool = True,
-    coherence_model: str = "openai/gpt-oss-20b",
+    coherence_model: Optional[str] = None,
     coherence_max_per_request: int = 8,
     coherence_env_path: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:

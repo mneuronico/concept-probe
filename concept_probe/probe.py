@@ -1534,8 +1534,24 @@ class ConceptProbe:
         random_scoring_vector: bool = False,
         random_steering_vector: bool = False,
         random_vector_seed: Optional[int] = None,
+        seed: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
+        """Generate (optionally steered) completions and score them with the probe.
+
+        alphas/alpha_unit: with alpha_unit="sigma", alpha is multiplied by
+        proj_std_best_layer — the std of the *sequence-pooled* eval projections at the
+        best layer — and the resulting raw offset is added to the residual stream at
+        every token position of each steered layer (divided across layers when
+        steer_distribute=True, and compounding through subsequent layers). It is a
+        convenient scale knob, not literally "n standard deviations of behavior".
+
+        seed: seeds python/numpy/torch RNGs before generation for reproducible
+        sampling. Note: GPU kernels are not bit-deterministic across
+        hardware/library versions, so reproducibility is best-effort.
+        """
         self._require_trained()
+        if seed is not None:
+            set_seed(int(seed))
         tokenizer = self.model_bundle.tokenizer
         model = self.model_bundle.model
         aggregate = self.config["evaluation"]["score_aggregate"]
@@ -1769,6 +1785,7 @@ class ConceptProbe:
                     "alpha": float(alpha),
                     "alpha_unit": alpha_unit,
                     "alpha_value": float(alpha_val),
+                    "sampling_seed": seed,
                     "steer_layers": steer_layer_list,
                     "completion": completion_text,
                     "prompt_len": prompt_len,
