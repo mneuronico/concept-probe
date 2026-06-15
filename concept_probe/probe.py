@@ -545,6 +545,48 @@ def reps_from_hs_layers(
     return reps
 
 
+@torch.no_grad()
+def extract_completion_reps(
+    model,
+    tokenizer,
+    pairs: List[Tuple[PromptLike, str]],
+    *,
+    pool: str = "assistant_all_mean",
+    last_k: int = 12,
+    system: Optional[str] = None,
+) -> np.ndarray:
+    """Per-layer reps pooled over the completion tokens, for ``(prompt, completion)`` pairs.
+
+    Reconstructs the readout used during training: each prompt is chat-formatted with an
+    assistant generation prompt, the completion tokens are appended, one forward pass
+    captures all layers, and the hidden states are pooled over the completion span per
+    layer (``pool='assistant_all_mean'`` by default). Returns an array of shape
+    ``(len(pairs), num_layers, hidden_dim)``.
+
+    Use it to score externally-provided text -- e.g. another model's generations -- against
+    trained concept vectors, or to compare how different models represent the same text.
+    Pass ``system=None`` (default) to format prompts with no system message.
+    """
+    out_reps: List[np.ndarray] = []
+    for prompt, completion in pairs:
+        if isinstance(prompt, str):
+            messages: List[PromptMessage] = []
+            if system:
+                messages.append({"role": "system", "content": system})
+            messages.append({"role": "user", "content": prompt})
+        else:
+            messages = list(prompt)
+        prompt_ids = apply_chat(tokenizer, messages, add_generation_prompt=True)
+        plen = int(prompt_ids.shape[-1])
+        comp_ids = tokenizer(str(completion), add_special_tokens=False, return_tensors="pt")["input_ids"]
+        if comp_ids.dim() == 1:
+            comp_ids = comp_ids.unsqueeze(0)
+        full_ids = torch.cat([prompt_ids, comp_ids.to(prompt_ids.dtype)], dim=1)
+        hs_layers = forward_hidden_states_all_layers(model, full_ids)
+        out_reps.append(reps_from_hs_layers(hs_layers, prompt_len=plen, mode=pool, last_k=last_k))
+    return np.stack(out_reps, axis=0).astype(np.float32)
+
+
 def token_scores_from_hs_layers(
     hs_layers: List[torch.Tensor],
     concept_vectors: np.ndarray,
@@ -704,6 +746,76 @@ def generate_once(
     return gen_ids[0].detach().cpu(), prompt_len
 
 
+@torch.no_grad()
+def generate_batch(
+    model,
+    tokenizer,
+    system: str,
+    prompts: List[PromptLike],
+    max_new_tokens: int,
+    greedy: bool,
+    temperature: Optional[float],
+    top_p: Optional[float],
+    batch_size: int = 16,
+    warn: Optional[Callable[[str], None]] = None,
+    warn_prefix: str = "prompt",
+) -> List[Tuple[torch.Tensor, int]]:
+    """Batched equivalent of ``generate_once`` over many prompts under one system.
+
+    Returns one ``(ids, prompt_len)`` per prompt, where ``ids`` is a 1D CPU tensor of
+    ``[prompt_tokens + completion_tokens]`` with all padding stripped -- the same
+    contract as ``generate_once``, so callers can use the results interchangeably.
+    Prompts are left-padded within each batch and an attention mask is passed so
+    greedy decoding matches the unbatched path; left padding and any trailing right
+    padding are stripped per item before returning.
+    """
+    if not prompts:
+        return []
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
+
+    encoded: List[torch.Tensor] = []
+    for i, p in enumerate(prompts):
+        messages, _ = _normalize_messages(p, system, warn=warn, warn_prefix=f"{warn_prefix}[{i}]")
+        if warn is not None and len(messages) > 0 and messages[-1].get("role") != "user":
+            warn(
+                f"{warn_prefix}[{i}] ends with role='{messages[-1].get('role')}'; "
+                "generation typically expects the last message to be a user turn."
+            )
+        encoded.append(apply_chat(tokenizer, messages, add_generation_prompt=True)[0])
+
+    step = max(1, int(batch_size))
+    results: List[Optional[Tuple[torch.Tensor, int]]] = [None] * len(encoded)
+    for start in range(0, len(encoded), step):
+        chunk = encoded[start : start + step]
+        plens = [int(t.shape[-1]) for t in chunk]
+        maxlen = max(plens)
+        input_ids = torch.full((len(chunk), maxlen), pad_id, dtype=torch.long)
+        attn = torch.zeros((len(chunk), maxlen), dtype=torch.long)
+        for j, t in enumerate(chunk):
+            input_ids[j, maxlen - plens[j] :] = t.to(input_ids.dtype)
+            attn[j, maxlen - plens[j] :] = 1
+        gen = model.generate(
+            input_ids=input_ids.to(model.device),
+            attention_mask=attn.to(model.device),
+            max_new_tokens=max_new_tokens,
+            do_sample=not greedy,
+            temperature=temperature if not greedy else None,
+            top_p=top_p if not greedy else None,
+            pad_token_id=pad_id,
+        )
+        gen = gen.detach().cpu()
+        for j in range(len(chunk)):
+            plen = plens[j]
+            row = gen[j][maxlen - plen :]  # drop left padding -> [prompt + completion (+ right pad)]
+            keep = int(row.shape[-1])
+            while keep > plen and int(row[keep - 1]) == pad_id:
+                keep -= 1
+            results[start + j] = (row[:keep].clone(), plen)
+    return results  # type: ignore[return-value]
+
+
 @dataclass
 class ConceptProbe:
     model_bundle: ModelBundle
@@ -767,31 +879,36 @@ class ConceptProbe:
                 self._warn(
                     "train_prompt_mode=shared; ignoring prompts.train_questions_pos/train_questions_neg."
                 )
+            gen_bs = int(train_cfg.get("gen_batch_size", 16))
+            pos_results = generate_batch(
+                model,
+                tokenizer,
+                self.concept.pos_system,
+                train_prompts,
+                train_cfg["train_max_new_tokens"],
+                train_cfg["train_greedy"],
+                temperature=train_cfg.get("train_temperature", 0.7),
+                top_p=train_cfg.get("train_top_p", 0.9),
+                batch_size=gen_bs,
+                warn=self._warn,
+                warn_prefix="train_questions (pos_system)",
+            )
+            neg_results = generate_batch(
+                model,
+                tokenizer,
+                self.concept.neg_system,
+                train_prompts,
+                train_cfg["train_max_new_tokens"],
+                train_cfg["train_greedy"],
+                temperature=train_cfg.get("train_temperature", 0.7),
+                top_p=train_cfg.get("train_top_p", 0.9),
+                batch_size=gen_bs,
+                warn=self._warn,
+                warn_prefix="train_questions (neg_system)",
+            )
             for i, q in enumerate(train_prompts):
-                ids_pos, plen_pos = generate_once(
-                    model,
-                    tokenizer,
-                    self.concept.pos_system,
-                    q,
-                    train_cfg["train_max_new_tokens"],
-                    train_cfg["train_greedy"],
-                    temperature=train_cfg.get("train_temperature", 0.7),
-                    top_p=train_cfg.get("train_top_p", 0.9),
-                    warn=self._warn,
-                    warn_prefix=f"train_questions[{i}] (pos_system)",
-                )
-                ids_neg, plen_neg = generate_once(
-                    model,
-                    tokenizer,
-                    self.concept.neg_system,
-                    q,
-                    train_cfg["train_max_new_tokens"],
-                    train_cfg["train_greedy"],
-                    temperature=train_cfg.get("train_temperature", 0.7),
-                    top_p=train_cfg.get("train_top_p", 0.9),
-                    warn=self._warn,
-                    warn_prefix=f"train_questions[{i}] (neg_system)",
-                )
+                ids_pos, plen_pos = pos_results[i]
+                ids_neg, plen_neg = neg_results[i]
                 train_pos_ids.append(ids_pos)
                 train_neg_ids.append(ids_neg)
                 train_pos_plens.append(plen_pos)
@@ -1113,31 +1230,36 @@ class ConceptProbe:
                     total_eval = len(eval_prompts)
                     progress_every = max(1, total_eval // 5) if total_eval else 1
 
+                    gen_bs = int(eval_cfg.get("gen_batch_size", train_cfg.get("gen_batch_size", 16)))
+                    pos_results = generate_batch(
+                        model,
+                        tokenizer,
+                        self.concept.pos_system,
+                        eval_prompts,
+                        eval_cfg["eval_max_new_tokens"],
+                        eval_cfg["eval_greedy"],
+                        temperature=eval_cfg.get("eval_temperature", 0.7),
+                        top_p=eval_cfg.get("eval_top_p", 0.9),
+                        batch_size=gen_bs,
+                        warn=self._warn,
+                        warn_prefix="eval_questions (pos_system)",
+                    )
+                    neg_results = generate_batch(
+                        model,
+                        tokenizer,
+                        self.concept.neg_system,
+                        eval_prompts,
+                        eval_cfg["eval_max_new_tokens"],
+                        eval_cfg["eval_greedy"],
+                        temperature=eval_cfg.get("eval_temperature", 0.7),
+                        top_p=eval_cfg.get("eval_top_p", 0.9),
+                        batch_size=gen_bs,
+                        warn=self._warn,
+                        warn_prefix="eval_questions (neg_system)",
+                    )
                     for i, q in enumerate(eval_prompts):
-                        ids_pos, plen_pos = generate_once(
-                            model,
-                            tokenizer,
-                            self.concept.pos_system,
-                            q,
-                            eval_cfg["eval_max_new_tokens"],
-                            eval_cfg["eval_greedy"],
-                            temperature=eval_cfg.get("eval_temperature", 0.7),
-                            top_p=eval_cfg.get("eval_top_p", 0.9),
-                            warn=self._warn,
-                            warn_prefix=f"eval_questions[{i}] (pos_system)",
-                        )
-                        ids_neg, plen_neg = generate_once(
-                            model,
-                            tokenizer,
-                            self.concept.neg_system,
-                            q,
-                            eval_cfg["eval_max_new_tokens"],
-                            eval_cfg["eval_greedy"],
-                            temperature=eval_cfg.get("eval_temperature", 0.7),
-                            top_p=eval_cfg.get("eval_top_p", 0.9),
-                            warn=self._warn,
-                            warn_prefix=f"eval_questions[{i}] (neg_system)",
-                        )
+                        ids_pos, plen_pos = pos_results[i]
+                        ids_neg, plen_neg = neg_results[i]
                         eval_pos_ids.append(ids_pos)
                         eval_neg_ids.append(ids_neg)
                         eval_pos_plens.append(plen_pos)

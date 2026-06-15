@@ -189,6 +189,11 @@ GitHub Actions CI runs the same lightweight checks and also builds source and wh
 
 ## Release notes
 
+- `apply_chat` now normalizes `apply_chat_template` output to a `(1, seq_len)`
+  LongTensor. Recent transformers versions can return a `BatchEncoding`/dict (or a
+  1D tensor) instead of a bare 2D tensor; previously this raised
+  `AttributeError` on `.shape` during generation and read paths. All
+  generation/read now works regardless of the tokenizer's return shape.
 - Steered generations are now scored with the steering hooks removed. Previously the
   scoring forward pass ran with the hooks still active, so the injected vector "read
   itself back" and inflated probe scores under steering by roughly

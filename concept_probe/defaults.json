@@ -61,6 +61,7 @@
     "train_prompt_mode": "shared",
     "train_greedy": true,
     "train_max_new_tokens": 64,
+    "gen_batch_size": 16,
     "train_temperature": 0.7,
     "train_top_p": 0.9,
     "train_text_system": null,

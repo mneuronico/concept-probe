@@ -14,11 +14,24 @@ def attention_mask_from_ids(input_ids: torch.Tensor) -> torch.Tensor:
 
 
 def apply_chat(tokenizer, messages: List[Dict[str, str]], add_generation_prompt: bool) -> torch.Tensor:
-    return tokenizer.apply_chat_template(
+    """Tokenize chat messages into a ``(1, seq_len)`` input_ids tensor.
+
+    Depending on the transformers version, ``apply_chat_template`` returns either a
+    bare tensor of token ids or a ``BatchEncoding``/dict (when it tokenizes into a
+    full encoding). Normalize both cases to a 2D LongTensor of input ids.
+    """
+    out = tokenizer.apply_chat_template(
         messages,
         add_generation_prompt=add_generation_prompt,
+        tokenize=True,
         return_tensors="pt",
     )
+    if not isinstance(out, torch.Tensor):
+        # BatchEncoding / dict-like result from newer transformers.
+        out = out["input_ids"]
+    if out.dim() == 1:
+        out = out.unsqueeze(0)
+    return out
 
 
 @dataclass
