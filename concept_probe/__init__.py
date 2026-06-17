@@ -1,6 +1,13 @@
 from .config import ConceptSpec, load_defaults, resolve_config
 from .probe import ConceptProbe, ProbeWorkspace, score_text_tokens, extract_completion_reps
 from .multi_probe import multi_probe_score_prompts
+from .patching import (
+    ActivationPatch,
+    ResidualStreamEditor,
+    build_patch_edit_fn,
+    cache_residual_stream,
+    patched_forward_hidden_states,
+)
 from .console import ConsoleLogger
 from .concept_runner import train_concept_from_json
 from .reporting import generate_multi_probe_report
@@ -30,6 +37,11 @@ __all__ = [
     "score_text_tokens",
     "extract_completion_reps",
     "multi_probe_score_prompts",
+    "ActivationPatch",
+    "ResidualStreamEditor",
+    "build_patch_edit_fn",
+    "cache_residual_stream",
+    "patched_forward_hidden_states",
     "ConsoleLogger",
     "train_concept_from_json",
     "EvalRunResult",
