@@ -34,6 +34,18 @@ def apply_chat(tokenizer, messages: List[Dict[str, str]], add_generation_prompt:
     return out
 
 
+def apply_tokenizer_overrides(tokenizer, model_cfg: Dict[str, Any]) -> None:
+    """Apply the tokenizer settings of ``model_cfg``.
+
+    ``model.chat_template`` (a Jinja string, default null) replaces the tokenizer's own chat
+    template for every use of this bundle: training, eval, scoring, generation. Use it to
+    drop parts a template injects unasked, such as the dated system block of Llama 3.1.
+    """
+    chat_template = model_cfg.get("chat_template")
+    if chat_template:
+        tokenizer.chat_template = str(chat_template)
+
+
 @dataclass
 class ModelBundle:
     model_id: str
@@ -60,6 +72,7 @@ class ModelBundle:
         tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token)
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token = tokenizer.eos_token
+        apply_tokenizer_overrides(tokenizer, model_cfg)
 
         quant = BitsAndBytesConfig(load_in_4bit=True) if use_4bit else None
         try:

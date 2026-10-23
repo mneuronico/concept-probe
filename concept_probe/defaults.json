@@ -4,7 +4,8 @@
     "use_4bit": true,
     "dtype": "bfloat16",
     "device_map": "auto",
-    "hf_token_env": "HF_TOKEN"
+    "hf_token_env": "HF_TOKEN",
+    "chat_template": null
   },
   "concept": {
     "name": "concept",

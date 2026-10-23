@@ -137,7 +137,13 @@ model's own reply and pool over the text's tokens only, set `training.train_text
 "assistant"` with an `assistant_*` read mode. The optional `training.train_text_prompt` is a user
 turn placed before every text. Eval texts are read the same way, so the layer sweep sees the
 same readout as training. To score other texts with the trained probe under the same readout,
-use `extract_completion_reps` with the same prompt and system.
+use `extract_text_reps` with the same `role`, `prompt` and `system`: it encodes texts exactly as
+training does, and can return several readouts from one forward pass.
+
+`training.train_text_role = "raw"` reads each text alone, with no chat template: the BOS token
+and the text, with the `assistant_*` readouts skipping BOS. `model.chat_template` (a Jinja
+string) replaces the tokenizer's chat template for everything the bundle does. Use it, for
+instance, to drop the dated system block that Llama 3.1 inserts when there is no system message.
 
 ```python
 config_overrides = {
@@ -148,6 +154,9 @@ config_overrides = {
     },
     "readout": {"read_mode": "assistant_all_mean"},  # or assistant_last / assistant_last_k_mean
 }
+reps = extract_text_reps(model, tokenizer, new_texts, role="assistant",
+                         prompt="What do you think of the painting?", system=neutral_system,
+                         pool=["assistant_all_mean", "assistant_last"])
 ```
 
 ## Variance-normalized directions
@@ -206,6 +215,7 @@ from concept_probe import (
     ConceptProbe,
     concept_direction,
     extract_completion_reps,
+    extract_text_reps,
     multi_probe_score_prompts,
     train_concept_from_json,
     generate_multi_probe_report,
@@ -232,6 +242,9 @@ GitHub Actions CI runs the same lightweight checks and also builds source and wh
 
 ## Release notes
 
+- New, opt-in, defaults unchanged: `training.train_text_role = "raw"` (the text alone, BOS
+  included, no chat template), `model.chat_template` to replace the tokenizer's template, and
+  `extract_text_reps` to score new texts exactly as texts-mode training read its own.
 - New, opt-in, defaults unchanged: `training.direction_normalization` (`"none"`, `"var"`,
   `"sd"`) for variance-normalized concept directions, and `training.train_text_role =
   "assistant"` (with `training.train_text_prompt`) to read labelled texts as the model's

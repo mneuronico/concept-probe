@@ -2,7 +2,7 @@ import json
 import os
 import sys
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -279,6 +279,9 @@ def _completion_input_ids(tokenizer, messages: "List[PromptMessage]", completion
     return torch.cat([prompt_ids, comp_ids.to(prompt_ids.dtype)], dim=1), plen
 
 
+TEXT_ROLES = ("user", "assistant", "raw")
+
+
 def _encode_text_for_read(
     tokenizer,
     text: "PromptLike",
@@ -295,14 +298,27 @@ def _encode_text_for_read(
     ``prompt_len`` is None. ``role="assistant"`` reads the text as the model's own reply, as
     :func:`extract_completion_reps` does: an optional system message, an optional user turn
     ``prompt``, the assistant header, then the text; ``prompt_len`` marks where the text starts,
-    so the ``assistant_*`` readout modes pool over the text's tokens only.
+    so the ``assistant_*`` readout modes pool over the text's tokens only. ``role="raw"`` reads
+    the text alone, with no chat template: the BOS token (if the tokenizer has one) and the
+    text; ``prompt_len`` is 1 (0 without BOS), so ``assistant_*`` readouts skip BOS. ``system``
+    and ``prompt`` are ignored with ``"raw"``.
     """
     if role == "user":
         return _encode_for_read(tokenizer, text, system, warn=warn, warn_prefix=warn_prefix), None
-    if role != "assistant":
-        raise ValueError(f"training.train_text_role must be 'user' or 'assistant'; got {role!r}")
+    if role not in TEXT_ROLES:
+        raise ValueError(f"training.train_text_role must be one of {TEXT_ROLES}; got {role!r}")
     if not isinstance(text, str):
-        raise TypeError(f"{warn_prefix}: train_text_role='assistant' needs plain-string texts; got {type(text)}")
+        raise TypeError(f"{warn_prefix}: train_text_role={role!r} needs plain-string texts; got {type(text)}")
+    if role == "raw":
+        if (prompt is not None or system) and warn is not None:
+            warn(f"{warn_prefix}: train_text_role='raw' reads the text alone; system and train_text_prompt are ignored.")
+        ids = tokenizer(text, add_special_tokens=False, return_tensors="pt")["input_ids"]
+        if ids.dim() == 1:
+            ids = ids.unsqueeze(0)
+        bos = getattr(tokenizer, "bos_token_id", None)
+        if bos is None:
+            return ids, 0
+        return torch.cat([torch.tensor([[bos]], dtype=ids.dtype), ids], dim=1), 1
     if not _has_chat_template(tokenizer):
         raise ValueError("train_text_role='assistant' needs a tokenizer with a chat template.")
     messages: "List[PromptMessage]" = []
@@ -661,6 +677,38 @@ def extract_completion_reps(
     return np.stack(out_reps, axis=0).astype(np.float32)
 
 
+@torch.no_grad()
+def extract_text_reps(
+    model,
+    tokenizer,
+    texts: List[str],
+    *,
+    role: str = "assistant",
+    prompt: Optional[str] = None,
+    system: str = "",
+    pool: Union[str, Sequence[str]] = "assistant_all_mean",
+    last_k: int = 12,
+) -> Union[np.ndarray, Dict[str, np.ndarray]]:
+    """Per-layer reps of texts, encoded exactly as texts-mode training encodes them.
+
+    ``role``, ``prompt`` and ``system`` mean what ``training.train_text_role``,
+    ``training.train_text_prompt`` and the training system prompt mean, so a probe trained on
+    labelled texts scores new texts under the same readout. ``pool`` is one readout mode,
+    returning ``(len(texts), num_layers, hidden_dim)``, or several, returning a dict of such
+    arrays from a single forward pass per text.
+    """
+    pools = [pool] if isinstance(pool, str) else list(pool)
+    out: Dict[str, List[np.ndarray]] = {p: [] for p in pools}
+    for i, text in enumerate(texts):
+        ids, plen = _encode_text_for_read(tokenizer, text, system, role=role, prompt=prompt,
+                                          warn_prefix=f"texts[{i}]")
+        hs_layers = forward_hidden_states_all_layers(model, ids)
+        for p in pools:
+            out[p].append(reps_from_hs_layers(hs_layers, prompt_len=plen, mode=p, last_k=last_k))
+    arrays = {p: np.stack(v, axis=0).astype(np.float32) for p, v in out.items()}
+    return arrays[pool] if isinstance(pool, str) else arrays
+
+
 def token_scores_from_hs_layers(
     hs_layers: List[torch.Tensor],
     concept_vectors: np.ndarray,
@@ -935,13 +983,13 @@ class ConceptProbe:
                 f"got {direction_normalization!r}"
             )
         text_role = str(train_cfg.get("train_text_role", "user"))
-        if text_role not in ("user", "assistant"):
-            raise ValueError(f"training.train_text_role must be 'user' or 'assistant'; got {text_role!r}")
+        if text_role not in TEXT_ROLES:
+            raise ValueError(f"training.train_text_role must be one of {TEXT_ROLES}; got {text_role!r}")
         text_prompt = train_cfg.get("train_text_prompt")
-        if text_role == "assistant" and not str(readout["read_mode"]).startswith("assistant_"):
+        if text_role != "user" and not str(readout["read_mode"]).startswith("assistant_"):
             self._warn(
-                f"train_text_role=assistant with read_mode={readout['read_mode']}: the readout pools over "
-                "the prompt and template tokens too; use an assistant_* read_mode to pool over the text only."
+                f"train_text_role={text_role} with read_mode={readout['read_mode']}: the readout pools over "
+                "the prompt, template or BOS tokens too; use an assistant_* read_mode to pool over the text only."
             )
 
         tokenizer = self.model_bundle.tokenizer
