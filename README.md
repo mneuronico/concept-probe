@@ -131,6 +131,47 @@ workspace = ProbeWorkspace(
 probe = workspace.train_concept(concept)
 ```
 
+By default each labelled text is read as a user message after the neutral system prompt, and
+`sequence_*` readouts pool over the whole chat-formatted sequence. To read each text as the
+model's own reply and pool over the text's tokens only, set `training.train_text_role =
+"assistant"` with an `assistant_*` read mode. The optional `training.train_text_prompt` is a user
+turn placed before every text. Eval texts are read the same way, so the layer sweep sees the
+same readout as training. To score other texts with the trained probe under the same readout,
+use `extract_completion_reps` with the same prompt and system.
+
+```python
+config_overrides = {
+    "training": {
+        "train_prompt_mode": "texts",
+        "train_text_role": "assistant",
+        "train_text_prompt": "What do you think of the painting?",
+    },
+    "readout": {"read_mode": "assistant_all_mean"},  # or assistant_last / assistant_last_k_mean
+}
+```
+
+## Variance-normalized directions
+
+`training.direction_normalization` chooses how the per-layer direction is estimated from the
+pole representations:
+
+- `"none"` (default): the difference of means, `mu_pos - mu_neg`.
+- `"var"`: the difference of means divided coordinate-wise by the pooled within-pole variance,
+  `0.5 * (var_pos + var_neg)`. This is the diagonal form of the covariance correction of
+  mass-mean probing. It keeps a few very high-variance coordinates from dominating the
+  direction, as with the massive activations of Gemma 3.
+- `"sd"`: the same, divided by the pooled standard deviation.
+
+The direction is always normalized to unit length and stored in `tensors.npz`. Every later use
+of the probe (scoring, steering, `ConceptProbe.load`) reads the stored vector, so a probe trained
+with `"var"` stays variance-normalized wherever it is used. The layer sweep, and therefore
+`best_layer`, is computed with the normalized directions. `concept_direction(pos, neg,
+normalization)` exposes the same estimator for representations computed elsewhere.
+
+```python
+config_overrides = {"training": {"direction_normalization": "var", "best_layer_search": [0.2, 0.8]}}
+```
+
 ## JSON-driven workflow
 
 You can train from a JSON concept spec:
@@ -163,6 +204,8 @@ from concept_probe import (
     ConceptSpec,
     ProbeWorkspace,
     ConceptProbe,
+    concept_direction,
+    extract_completion_reps,
     multi_probe_score_prompts,
     train_concept_from_json,
     generate_multi_probe_report,
@@ -189,6 +232,11 @@ GitHub Actions CI runs the same lightweight checks and also builds source and wh
 
 ## Release notes
 
+- New, opt-in, defaults unchanged: `training.direction_normalization` (`"none"`, `"var"`,
+  `"sd"`) for variance-normalized concept directions, and `training.train_text_role =
+  "assistant"` (with `training.train_text_prompt`) to read labelled texts as the model's
+  reply and pool over their tokens only. With the defaults, training produces exactly the
+  same vectors as before.
 - `apply_chat` now normalizes `apply_chat_template` output to a `(1, seq_len)`
   LongTensor. Recent transformers versions can return a `BatchEncoding`/dict (or a
   1D tensor) instead of a bare 2D tensor; previously this raised

@@ -25,6 +25,37 @@ def normed_np(v: np.ndarray) -> np.ndarray:
     return v / (np.linalg.norm(v) + 1e-12)
 
 
+DIRECTION_NORMALIZATIONS = ("none", "var", "sd")
+
+
+def concept_direction(pos_reps: np.ndarray, neg_reps: np.ndarray, normalization: str = "none") -> np.ndarray:
+    """Unit concept direction at one layer from pole reps of shape ``(n, dim)``.
+
+    - ``"none"``: difference of means, ``mu_pos - mu_neg``.
+    - ``"var"``: difference of means divided coordinate-wise by the pooled within-pole
+      variance, ``0.5 * (var_pos + var_neg)``. The diagonal form of the covariance
+      correction of mass-mean probing: it keeps a few high-variance coordinates (the
+      massive activations of e.g. Gemma 3) from dominating the direction.
+    - ``"sd"``: the same, divided by the pooled standard deviation instead.
+
+    Variances are population variances (``ddof=0``), computed in float64. The result is
+    normalized to unit length, so scoring and steering use it exactly like an unnormalized
+    direction. ``"none"`` is computed in the input dtype, as training always did.
+    """
+    if normalization not in DIRECTION_NORMALIZATIONS:
+        raise ValueError(
+            f"Unknown direction normalization {normalization!r}; expected one of {DIRECTION_NORMALIZATIONS}."
+        )
+    if normalization == "none":
+        return normed_np(np.asarray(pos_reps).mean(axis=0) - np.asarray(neg_reps).mean(axis=0))
+    pos = np.asarray(pos_reps, dtype=np.float64)
+    neg = np.asarray(neg_reps, dtype=np.float64)
+    pooled_var = 0.5 * (pos.var(axis=0) + neg.var(axis=0)) + 1e-12
+    gap = pos.mean(axis=0) - neg.mean(axis=0)
+    gap = gap / (pooled_var if normalization == "var" else np.sqrt(pooled_var))
+    return normed_np(gap).astype(np.float32)
+
+
 def _resolve_random_control_seed(explicit_seed: Optional[int], config_seed: Any) -> int:
     if explicit_seed is not None:
         return int(explicit_seed)
@@ -232,6 +263,54 @@ def _encode_for_read(
         _CHAT_TEMPLATE_FALLBACK_WARNED.add(fallback_key)
     enc = tokenizer(text, return_tensors="pt", add_special_tokens=True)
     return enc["input_ids"]
+
+
+def _completion_input_ids(tokenizer, messages: "List[PromptMessage]", completion: str) -> Tuple[torch.Tensor, int]:
+    """Chat-format ``messages`` with an assistant generation prompt and append ``completion``.
+
+    Returns ``(input_ids, prompt_len)``: the completion occupies ``input_ids[0, prompt_len:]``,
+    with no end-of-turn token after it.
+    """
+    prompt_ids = apply_chat(tokenizer, messages, add_generation_prompt=True)
+    plen = int(prompt_ids.shape[-1])
+    comp_ids = tokenizer(str(completion), add_special_tokens=False, return_tensors="pt")["input_ids"]
+    if comp_ids.dim() == 1:
+        comp_ids = comp_ids.unsqueeze(0)
+    return torch.cat([prompt_ids, comp_ids.to(prompt_ids.dtype)], dim=1), plen
+
+
+def _encode_text_for_read(
+    tokenizer,
+    text: "PromptLike",
+    system: str,
+    *,
+    role: str = "user",
+    prompt: Optional[str] = None,
+    warn: Optional[Callable[[str], None]] = None,
+    warn_prefix: str = "read",
+) -> Tuple[torch.Tensor, Optional[int]]:
+    """Encode a labelled text for texts-mode training or read-mode evaluation.
+
+    ``role="user"`` (default) is the historical behaviour: :func:`_encode_for_read`, and
+    ``prompt_len`` is None. ``role="assistant"`` reads the text as the model's own reply, as
+    :func:`extract_completion_reps` does: an optional system message, an optional user turn
+    ``prompt``, the assistant header, then the text; ``prompt_len`` marks where the text starts,
+    so the ``assistant_*`` readout modes pool over the text's tokens only.
+    """
+    if role == "user":
+        return _encode_for_read(tokenizer, text, system, warn=warn, warn_prefix=warn_prefix), None
+    if role != "assistant":
+        raise ValueError(f"training.train_text_role must be 'user' or 'assistant'; got {role!r}")
+    if not isinstance(text, str):
+        raise TypeError(f"{warn_prefix}: train_text_role='assistant' needs plain-string texts; got {type(text)}")
+    if not _has_chat_template(tokenizer):
+        raise ValueError("train_text_role='assistant' needs a tokenizer with a chat template.")
+    messages: "List[PromptMessage]" = []
+    if system:
+        messages.append({"role": "system", "content": str(system)})
+    if prompt is not None:
+        messages.append({"role": "user", "content": str(prompt)})
+    return _completion_input_ids(tokenizer, messages, text)
 
 
 def _prompt_slug(text: str, max_words: int = 8, max_len: int = 48) -> str:
@@ -576,12 +655,7 @@ def extract_completion_reps(
             messages.append({"role": "user", "content": prompt})
         else:
             messages = list(prompt)
-        prompt_ids = apply_chat(tokenizer, messages, add_generation_prompt=True)
-        plen = int(prompt_ids.shape[-1])
-        comp_ids = tokenizer(str(completion), add_special_tokens=False, return_tensors="pt")["input_ids"]
-        if comp_ids.dim() == 1:
-            comp_ids = comp_ids.unsqueeze(0)
-        full_ids = torch.cat([prompt_ids, comp_ids.to(prompt_ids.dtype)], dim=1)
+        full_ids, plen = _completion_input_ids(tokenizer, messages, completion)
         hs_layers = forward_hidden_states_all_layers(model, full_ids)
         out_reps.append(reps_from_hs_layers(hs_layers, prompt_len=plen, mode=pool, last_k=last_k))
     return np.stack(out_reps, axis=0).astype(np.float32)
@@ -854,6 +928,21 @@ class ConceptProbe:
         train_prompts = list(prompts_cfg.get("train_questions", []))
         train_prompts_pos = list(prompts_cfg.get("train_questions_pos", []))
         train_prompts_neg = list(prompts_cfg.get("train_questions_neg", []))
+        direction_normalization = str(train_cfg.get("direction_normalization", "none"))
+        if direction_normalization not in DIRECTION_NORMALIZATIONS:
+            raise ValueError(
+                f"training.direction_normalization must be one of {DIRECTION_NORMALIZATIONS}; "
+                f"got {direction_normalization!r}"
+            )
+        text_role = str(train_cfg.get("train_text_role", "user"))
+        if text_role not in ("user", "assistant"):
+            raise ValueError(f"training.train_text_role must be 'user' or 'assistant'; got {text_role!r}")
+        text_prompt = train_cfg.get("train_text_prompt")
+        if text_role == "assistant" and not str(readout["read_mode"]).startswith("assistant_"):
+            self._warn(
+                f"train_text_role=assistant with read_mode={readout['read_mode']}: the readout pools over "
+                "the prompt and template tokens too; use an assistant_* read_mode to pool over the text only."
+            )
 
         tokenizer = self.model_bundle.tokenizer
         model = self.model_bundle.model
@@ -1023,16 +1112,18 @@ class ConceptProbe:
             total_pos = len(train_pos_texts)
             progress_every_pos = max(1, total_pos // 5) if total_pos else 1
             for i, s in enumerate(train_pos_texts):
-                input_ids = _encode_for_read(
+                input_ids, plen = _encode_text_for_read(
                     tokenizer,
                     s,
                     train_text_system,
+                    role=text_role,
+                    prompt=text_prompt,
                     warn=self._warn,
                     warn_prefix=f"train_pos_texts[{i}]",
                 )
                 ids_1d = input_ids[0].detach().cpu()
                 train_pos_ids.append(ids_1d)
-                train_pos_plens.append(int(ids_1d.shape[-1]))
+                train_pos_plens.append(int(ids_1d.shape[-1]) if plen is None else plen)
                 self.logger.log(
                     "train_read_pos",
                     {
@@ -1048,16 +1139,18 @@ class ConceptProbe:
             total_neg = len(train_neg_texts)
             progress_every_neg = max(1, total_neg // 5) if total_neg else 1
             for i, s in enumerate(train_neg_texts):
-                input_ids = _encode_for_read(
+                input_ids, plen = _encode_text_for_read(
                     tokenizer,
                     s,
                     train_text_system,
+                    role=text_role,
+                    prompt=text_prompt,
                     warn=self._warn,
                     warn_prefix=f"train_neg_texts[{i}]",
                 )
                 ids_1d = input_ids[0].detach().cpu()
                 train_neg_ids.append(ids_1d)
-                train_neg_plens.append(int(ids_1d.shape[-1]))
+                train_neg_plens.append(int(ids_1d.shape[-1]) if plen is None else plen)
                 self.logger.log(
                     "train_read_neg",
                     {
@@ -1083,7 +1176,7 @@ class ConceptProbe:
                     prompt_len=train_pos_plens[i],
                     mode=train_readout_mode,
                     last_k=train_readout_last_k,
-                    warn=None if train_prompt_mode == "texts" else self._warn,
+                    warn=None if (train_prompt_mode == "texts" and text_role == "user") else self._warn,
                 )
                 for i in range(len(train_pos_ids))
             ],
@@ -1097,7 +1190,7 @@ class ConceptProbe:
                     prompt_len=train_neg_plens[i],
                     mode=train_readout_mode,
                     last_k=train_readout_last_k,
-                    warn=None if train_prompt_mode == "texts" else self._warn,
+                    warn=None if (train_prompt_mode == "texts" and text_role == "user") else self._warn,
                 )
                 for i in range(len(train_neg_ids))
             ],
@@ -1110,9 +1203,7 @@ class ConceptProbe:
 
         concept_vectors = np.zeros((num_layers, reps_pos.shape[2]), dtype=np.float32)
         for l in range(num_layers):
-            mu_pos = reps_pos[:, l, :].mean(axis=0)
-            mu_neg = reps_neg[:, l, :].mean(axis=0)
-            concept_vectors[l] = normed_np(mu_pos - mu_neg)
+            concept_vectors[l] = concept_direction(reps_pos[:, l, :], reps_neg[:, l, :], direction_normalization)
 
         eval_pos_scores_mat = np.zeros((0, num_layers), dtype=np.float32)
         eval_neg_scores_mat = np.zeros((0, num_layers), dtype=np.float32)
@@ -1158,17 +1249,19 @@ class ConceptProbe:
                     total_eval_pos = len(eval_pos_texts)
                     progress_every_pos = max(1, total_eval_pos // 5) if total_eval_pos else 1
                     for i, s in enumerate(eval_pos_texts):
-                        input_ids = _encode_for_read(
+                        input_ids, plen = _encode_text_for_read(
                             tokenizer,
                             s,
                             eval_system,
+                            role=text_role,
+                            prompt=text_prompt,
                             warn=self._warn,
                             warn_prefix=f"eval_pos_texts[{i}]",
                         )
                         eval_pos_reps_list.append(
                             reps_from_hs_layers(
                                 forward_hidden_states_all_layers(model, input_ids),
-                                prompt_len=None,
+                                prompt_len=plen,
                                 mode=readout["read_mode"],
                                 last_k=readout["read_last_k"],
                             )
@@ -1181,17 +1274,19 @@ class ConceptProbe:
                     total_eval_neg = len(eval_neg_texts)
                     progress_every_neg = max(1, total_eval_neg // 5) if total_eval_neg else 1
                     for i, s in enumerate(eval_neg_texts):
-                        input_ids = _encode_for_read(
+                        input_ids, plen = _encode_text_for_read(
                             tokenizer,
                             s,
                             eval_system,
+                            role=text_role,
+                            prompt=text_prompt,
                             warn=self._warn,
                             warn_prefix=f"eval_neg_texts[{i}]",
                         )
                         eval_neg_reps_list.append(
                             reps_from_hs_layers(
                                 forward_hidden_states_all_layers(model, input_ids),
-                                prompt_len=None,
+                                prompt_len=plen,
                                 mode=readout["read_mode"],
                                 last_k=readout["read_last_k"],
                             )
@@ -1484,6 +1579,8 @@ class ConceptProbe:
             "n_train_pos": n_train_pos,
             "n_train_neg": n_train_neg,
             "train_prompt_mode": train_prompt_mode,
+            "direction_normalization": direction_normalization,
+            "train_text_role": text_role,
             "n_eval": n_eval_pos + n_eval_neg,
             "n_eval_pos": n_eval_pos,
             "n_eval_neg": n_eval_neg,
