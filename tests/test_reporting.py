@@ -55,3 +55,4 @@ def test_generate_multi_probe_report_smoke(tmp_path, monkeypatch):
     assert report_path.exists()
     assert "Smoke Test Report" in report_html
     assert "plotly" in report_html.lower()
+    assert 'id="alpha-select"' in report_html  # one alpha at a time, never pooled

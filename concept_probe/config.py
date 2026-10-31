@@ -6,24 +6,38 @@ from typing import Any, Dict, List, Optional, Union
 PromptMessage = Dict[str, str]
 PromptLike = Union[str, List[PromptMessage]]
 
-from .utils import deep_merge
+from .utils import deep_merge, unknown_config_keys
 
 
 DEFAULTS_PATH = Path(__file__).resolve().parent / "defaults.json"
 
 
+def check_config_keys(override: Dict[str, Any], reference: Dict[str, Any], what: str = "config override") -> None:
+    """Raise if ``override`` has keys that ``reference`` does not (a misspelled key is otherwise ignored)."""
+    unknown = unknown_config_keys(override, reference)
+    if unknown:
+        raise ValueError(f"Unknown keys in {what}: {', '.join(unknown)}.")
+
+
 def load_defaults(path: Optional[str] = None) -> Dict[str, Any]:
-    defaults_path = Path(path) if path else DEFAULTS_PATH
-    with open(defaults_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    with open(DEFAULTS_PATH, "r", encoding="utf-8") as f:
+        packaged = json.load(f)
+    if not path:
+        return packaged
+    with open(path, "r", encoding="utf-8") as f:
+        custom = json.load(f)
+    check_config_keys(custom, packaged, what=f"defaults file {path}")
+    return custom
 
 
 def resolve_config(
     overrides: Optional[Dict[str, Any]] = None,
     defaults_path: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """Defaults merged with ``overrides``. Keys the defaults do not have raise."""
     config = load_defaults(defaults_path)
     if overrides:
+        check_config_keys(overrides, load_defaults())
         config = deep_merge(config, overrides)
     return config
 
@@ -45,6 +59,10 @@ class ConceptSpec:
         base = dict(config.get("concept", {}))
         if overrides:
             base = deep_merge(base, overrides)
+        fields = set(cls.__dataclass_fields__)
+        unknown = sorted(set(base) - fields)
+        if unknown:
+            raise ValueError(f"Unknown concept keys: {', '.join(unknown)}; expected some of {sorted(fields)}.")
         return cls(
             name=str(base.get("name", "concept")),
             pos_label=str(base.get("pos_label", "positive")),

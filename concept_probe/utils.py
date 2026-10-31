@@ -4,7 +4,7 @@ import os
 import random
 import re
 import time
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import numpy as np
 import torch
@@ -53,6 +53,46 @@ def json_dump(path: str, obj: Dict[str, Any]) -> None:
 def jsonl_append(path: str, obj: Dict[str, Any]) -> None:
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(_json_sanitize(obj), ensure_ascii=True, allow_nan=False) + "\n")
+
+
+def unknown_config_keys(override: Dict[str, Any], reference: Dict[str, Any], prefix: str = "") -> List[str]:
+    """Dotted keys of ``override`` that ``reference`` does not have, recursing into dict sections.
+
+    A misspelled key in a config override would otherwise be merged and then never read.
+    """
+    unknown: List[str] = []
+    for key, value in override.items():
+        path = f"{prefix}{key}"
+        if key not in reference:
+            unknown.append(path)
+        elif isinstance(value, dict) and isinstance(reference[key], dict):
+            unknown.extend(unknown_config_keys(value, reference[key], prefix=f"{path}."))
+    return unknown
+
+
+def resolve_layer_index(value: Any, num_layers: int, what: str = "layer") -> int:
+    """One layer index in ``[0, num_layers)``.
+
+    An int is a layer index; negative ints count from the end, as in Python. ``{"frac": x}``
+    with ``x`` in [0, 1] is a fraction of depth, ``int(x * (num_layers - 1))``. Anything out of
+    range raises; bare floats raise too, since 1 and 1.0 would otherwise mean different layers.
+    """
+    if isinstance(value, dict):
+        if set(value) != {"frac"}:
+            raise ValueError(f"{what}: a fraction of depth is written {{'frac': x}}; got {value!r}")
+        frac = value["frac"]
+        if isinstance(frac, bool) or not isinstance(frac, (int, float, np.integer, np.floating)) or not 0.0 <= float(frac) <= 1.0:
+            raise ValueError(f"{what}: 'frac' must be a number in [0, 1]; got {frac!r}")
+        return int(float(frac) * (num_layers - 1))
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise TypeError(
+            f"{what} must be an int layer index (negative counts from the end) or {{'frac': x}}; got {value!r}"
+        )
+    idx = int(value)
+    resolved = idx + num_layers if idx < 0 else idx
+    if not 0 <= resolved < num_layers:
+        raise ValueError(f"{what} {idx} out of range for {num_layers} layers")
+    return resolved
 
 
 def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:

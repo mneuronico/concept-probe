@@ -3,13 +3,13 @@ import numpy as np
 import pytest
 
 from concept_probe.probe import (
-    _layer_index_from_value,
     _normalize_best_layer_search,
     cohen_d_np,
     normed_np,
     pick_layer,
     select_layers,
 )
+from concept_probe.utils import resolve_layer_index
 
 
 def test_cohen_d_known_value():
@@ -32,29 +32,28 @@ def test_normed_np_unit_norm():
 def test_pick_layer_fraction_and_explicit():
     assert pick_layer(29, None, 0.75) == 21
     assert pick_layer(29, 5, 0.75) == 5
+    assert pick_layer(29, -1, 0.75) == 28  # negative indices count from the end
 
 
 def test_pick_layer_rejects_out_of_range():
     with pytest.raises(ValueError):
-        pick_layer(29, -1, 0.75)
-    with pytest.raises(ValueError):
         pick_layer(29, 29, 0.75)
-
-
-def test_layer_index_from_value_fraction_vs_int():
-    assert _layer_index_from_value(1, 29) == 1
-    assert _layer_index_from_value(0.5, 29) == 14
-    assert _layer_index_from_value(1.0, 29) == 28  # fraction: last layer
-
-
-def test_layer_index_from_value_rejects_ambiguous_float():
     with pytest.raises(ValueError):
-        _layer_index_from_value(2.0, 29)
+        pick_layer(29, -30, 0.75)
+    with pytest.raises(ValueError):
+        pick_layer(29, None, 1.5)
 
 
-def test_layer_index_from_value_rejects_bool():
-    with pytest.raises(TypeError):
-        _layer_index_from_value(True, 29)
+def test_layer_index_ints_fractions_and_errors():
+    assert resolve_layer_index(1, 29) == 1
+    assert resolve_layer_index(-1, 29) == 28
+    assert resolve_layer_index({"frac": 0.5}, 29) == 14
+    assert resolve_layer_index({"frac": 1.0}, 29) == 28
+    for bad in (1.0, 0.5, True, "3", {"fraction": 0.5}, {"frac": 2.0}):
+        with pytest.raises((TypeError, ValueError)):
+            resolve_layer_index(bad, 29)
+    with pytest.raises(ValueError, match="out of range"):
+        resolve_layer_index(29, 29)
 
 
 def test_best_layer_search_default_and_merge():
@@ -67,21 +66,34 @@ def test_best_layer_search_default_and_merge():
     info = _normalize_best_layer_search([[0, 2], [2, 5]], 10)  # overlapping merge
     assert info["intervals"] == [(0, 5)]
 
-    info = _normalize_best_layer_search([0.0, 1.0], 10)  # fractions span all layers
+    info = _normalize_best_layer_search({"frac": [0.0, 1.0]}, 10)  # fractions span all layers
     assert info["layers"] == list(range(10))
+
+    info = _normalize_best_layer_search([-3, -1], 10)  # negative indices count from the end
+    assert info["intervals"] == [(7, 9)]
+
+
+def test_best_layer_search_rejects_out_of_range_and_bare_floats():
+    with pytest.raises(ValueError, match="out of range"):
+        _normalize_best_layer_search([5, 40], 10)  # used to be clamped silently
+    with pytest.raises(TypeError):
+        _normalize_best_layer_search([0.2, 0.8], 10)  # fractions must be written {"frac": [...]}
 
 
 def test_select_layers_modes():
     assert select_layers({"mode": "best"}, 16, 29) == [16]
     assert select_layers({"mode": "window", "window_radius": 2}, 1, 29) == [0, 1, 2, 3]
     assert select_layers({"mode": "explicit", "layers": [3, 7]}, 16, 29) == [3, 7]
+    assert select_layers({"mode": "explicit", "layers": [-1]}, 16, 29) == [28]
     assert select_layers({"mode": "all"}, 16, 3) == [0, 1, 2]
 
 
-def test_select_layers_rejects_negative_and_out_of_range():
-    with pytest.raises(ValueError):
-        select_layers({"mode": "explicit", "layers": [-1]}, 16, 29)
+def test_select_layers_rejects_out_of_range_and_unknown_modes():
     with pytest.raises(ValueError):
         select_layers({"mode": "explicit", "layers": [29]}, 16, 29)
+    with pytest.raises(ValueError):
+        select_layers({"mode": "explicit", "layers": []}, 16, 29)
+    with pytest.raises(ValueError):
+        select_layers({"mode": "window", "window_radius": -1}, 16, 29)
     with pytest.raises(ValueError):
         select_layers({"mode": "bogus"}, 16, 29)

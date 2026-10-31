@@ -42,7 +42,13 @@ def _build_rows(items: List[Dict[str, object]], probe_names: List[str]) -> List[
         scores = item.get("score_mean_by_probe", {})
         if not isinstance(scores, dict):
             continue
-        row = {"correct": bool(correct), "scores": {}}
+        alpha = item.get("alpha")
+        row = {
+            "correct": bool(correct),
+            "alpha": None if alpha is None else float(alpha),
+            "item_index": item.get("item_index"),
+            "scores": {},
+        }
         ok = True
         for probe in probe_names:
             if probe not in scores:
@@ -68,35 +74,56 @@ def _mean(values: List[float]) -> float:
     return float(np.mean(values))
 
 
-def _compute_summary(rows: List[Dict[str, object]], probe_names: List[str]):
-    overall = {}
-    correct = {}
-    incorrect = {}
-    for probe in probe_names:
-        vals = [r["scores"][probe] for r in rows]
-        overall[probe] = _mean(vals)
-        correct_vals = [r["scores"][probe] for r in rows if r["correct"]]
-        incorrect_vals = [r["scores"][probe] for r in rows if not r["correct"]]
-        correct[probe] = _mean(correct_vals)
-        incorrect[probe] = _mean(incorrect_vals)
-    return overall, correct, incorrect
+def _alpha_key(alpha: Optional[float]) -> str:
+    return "none" if alpha is None else f"{float(alpha):g}"
+
+
+def _compute_summary(rows: List[Dict[str, object]], probe_names: List[str]) -> Dict[str, Dict[str, Dict[str, float]]]:
+    """Mean score per probe, overall and by correctness, separately for each alpha.
+
+    Alphas are never pooled: steering moves both the scores and the accuracy.
+    """
+    summary: Dict[str, Dict[str, Dict[str, float]]] = {}
+    for key in sorted({_alpha_key(r["alpha"]) for r in rows}):
+        sub = [r for r in rows if _alpha_key(r["alpha"]) == key]
+        summary[key] = {
+            "overall": {p: _mean([r["scores"][p] for r in sub]) for p in probe_names},
+            "correct": {p: _mean([r["scores"][p] for r in sub if r["correct"]]) for p in probe_names},
+            "incorrect": {p: _mean([r["scores"][p] for r in sub if not r["correct"]]) for p in probe_names},
+        }
+    return summary
 
 
 def _fit_model(rows: List[Dict[str, object]], probe_names: List[str], seed: int = 123, n_folds: int = 5):
-    """Logistic model of correctness from probe scores.
+    """Logistic model of correctness from probe scores, with alpha as a categorical covariate.
 
-    Metrics are pooled out-of-fold predictions from stratified K-fold CV (so they are
-    not inflated by in-sample fitting and every row is scored exactly once);
-    coefficients/p-values come from a single fit on all rows.
+    Metrics are pooled out-of-fold predictions from K-fold CV in which all rows of an item
+    (one per alpha) fall in the same fold, so no item is both trained and tested on; rows
+    without an item index are stratified by class instead. Coefficients and p-values come
+    from a single fit on all rows, with standard errors clustered by item when items repeat.
     """
     if not rows:
         return None
-    X = np.array([[r["scores"][p] for p in probe_names] for r in rows], dtype=np.float64)
+    alphas = sorted({r.get("alpha") for r in rows if r.get("alpha") is not None})
+    feature_names = list(probe_names) + [f"alpha={a:g}" for a in alphas[1:]]
+    X = np.array(
+        [[r["scores"][p] for p in probe_names] + [1.0 if r.get("alpha") == a else 0.0 for a in alphas[1:]] for r in rows],
+        dtype=np.float64,
+    )
     y = np.array([1 if r["correct"] else 0 for r in rows], dtype=np.int32)
+    groups = np.array(
+        [r["item_index"] if r.get("item_index") is not None else f"row{i}" for i, r in enumerate(rows)],
+        dtype=object,
+    )
+    clustered = len(set(groups.tolist())) < len(rows)
 
     result = {
         "n": int(len(rows)),
+        "n_items": int(len(set(groups.tolist()))),
         "cv_folds": 0,
+        "cv_grouped_by_item": bool(clustered),
+        "alpha_covariate": len(alphas) > 1,
+        "se_clustered_by_item": bool(clustered),
         "coefficients": [],
         "metrics": {},
         "metrics_source": "out_of_fold_cv",
@@ -115,32 +142,45 @@ def _fit_model(rows: List[Dict[str, object]], probe_names: List[str], seed: int 
         result["note"] = "statsmodels not available; model not fit."
         return result
 
-    k = int(max(2, min(n_folds, n_pos, n_neg)))
-    result["cv_folds"] = k
-
-    # Stratified fold assignment: shuffle within each class, deal round-robin so every
-    # fold's training split contains both classes.
     rng = np.random.default_rng(seed)
     folds = np.zeros(len(y), dtype=np.int32)
-    for cls in (0, 1):
-        idx = np.where(y == cls)[0]
-        rng.shuffle(idx)
-        for j, i in enumerate(idx):
-            folds[i] = j % k
+    if clustered:
+        items = np.array(sorted(set(groups.tolist()), key=str), dtype=object)
+        rng.shuffle(items)
+        k = int(max(2, min(n_folds, len(items))))
+        fold_of_item = {item: j % k for j, item in enumerate(items.tolist())}
+        folds = np.array([fold_of_item[g] for g in groups.tolist()], dtype=np.int32)
+    else:
+        # Stratified fold assignment: shuffle within each class, deal round-robin so every
+        # fold's training split contains both classes.
+        k = int(max(2, min(n_folds, n_pos, n_neg)))
+        for cls in (0, 1):
+            idx = np.where(y == cls)[0]
+            rng.shuffle(idx)
+            for j, i in enumerate(idx):
+                folds[i] = j % k
+    result["cv_folds"] = k
+
+    n_scores = len(probe_names)
+
+    def design(train_mask: np.ndarray, rows_mask: np.ndarray) -> np.ndarray:
+        # z-score the probe scores with the training rows' moments; alpha dummies stay 0/1
+        mean = X[train_mask, :n_scores].mean(axis=0)
+        std = X[train_mask, :n_scores].std(axis=0)
+        std[std == 0] = 1.0
+        Z = np.concatenate([(X[rows_mask, :n_scores] - mean) / std, X[rows_mask, n_scores:]], axis=1)
+        return sm.add_constant(Z, has_constant="add")
 
     oof_probs = np.full(len(y), np.nan, dtype=np.float64)
     failed_folds = 0
     for f in range(k):
         tr = folds != f
         te = folds == f
-        mean = X[tr].mean(axis=0)
-        std = X[tr].std(axis=0)
-        std[std == 0] = 1.0
-        X_tr = sm.add_constant((X[tr] - mean) / std, has_constant="add")
-        X_te = sm.add_constant((X[te] - mean) / std, has_constant="add")
         try:
-            fold_model = sm.Logit(y[tr], X_tr).fit(disp=False)
-            oof_probs[te] = np.asarray(fold_model.predict(X_te), dtype=np.float64)
+            if len(np.unique(y[tr])) < 2:
+                raise ValueError("one class only in the training split")
+            fold_model = sm.Logit(y[tr], design(tr, tr)).fit(disp=False)
+            oof_probs[te] = np.asarray(fold_model.predict(design(tr, te)), dtype=np.float64)
         except Exception:
             failed_folds += 1
     if failed_folds:
@@ -174,12 +214,15 @@ def _fit_model(rows: List[Dict[str, object]], probe_names: List[str], seed: int 
     result["metrics"] = metrics
 
     # Coefficients and p-values from a fit on all rows (metrics above are out-of-fold).
-    mean = X.mean(axis=0)
-    std = X.std(axis=0)
-    std[std == 0] = 1.0
-    X_z = sm.add_constant((X - mean) / std, has_constant="add")
+    everything = np.ones(len(y), dtype=bool)
     try:
-        full_model = sm.Logit(y, X_z).fit(disp=False)
+        if clustered:
+            codes = {g: i for i, g in enumerate(sorted(set(groups.tolist()), key=str))}
+            full_model = sm.Logit(y, design(everything, everything)).fit(
+                disp=False, cov_type="cluster", cov_kwds={"groups": np.array([codes[g] for g in groups.tolist()])}
+            )
+        else:
+            full_model = sm.Logit(y, design(everything, everything)).fit(disp=False)
     except Exception as exc:
         extra = f"Full-data coefficient fit failed: {exc}"
         result["note"] = f"{result['note']} {extra}".strip()
@@ -188,7 +231,7 @@ def _fit_model(rows: List[Dict[str, object]], probe_names: List[str], seed: int 
     conf_int = np.asarray(full_model.conf_int())
     pvals = np.asarray(full_model.pvalues)
     params = np.asarray(full_model.params)
-    names = ["(intercept)"] + probe_names
+    names = ["(intercept)"] + feature_names
     for i, name in enumerate(names):
         coef = float(params[i])
         result["coefficients"].append(
@@ -228,7 +271,10 @@ def generate_multi_probe_report(
         path: Batch directory or analysis/per_sample.json path.
         title: Title shown in the HTML.
         output_name: Output HTML filename (written under the analysis dir).
-        seed: Random seed for train/test split in the classifier.
+        seed: Random seed for the cross-validation folds.
+
+    Charts show one steering alpha at a time (a selector switches between them); the
+    correctness model uses every alpha, with alpha as a covariate.
     """
     items, analysis_dir = _load_items(Path(path))
     probe_names = _extract_probe_names(items)
@@ -238,19 +284,21 @@ def generate_multi_probe_report(
     if not rows:
         raise ValueError("No valid rows with correct labels and scores.")
 
-    overall, correct, incorrect = _compute_summary(rows, probe_names)
+    summary = _compute_summary(rows, probe_names)
     model_result = _fit_model(rows, probe_names, seed=seed)
+    alpha_keys = list(summary.keys())
+    default_alpha = "0" if "0" in alpha_keys else alpha_keys[0]
 
     data_blob = {
-        "rows": rows,
+        "rows": [dict(r, alpha_key=_alpha_key(r["alpha"])) for r in rows],
         "probe_names": probe_names,
-        "summary": {
-            "overall": overall,
-            "correct": correct,
-            "incorrect": incorrect,
-        },
+        "summary_by_alpha": summary,
+        "alpha_keys": alpha_keys,
+        "default_alpha": default_alpha,
         "model": model_result,
     }
+    # "</" would end the <script> block early if a probe name contained "</script>".
+    payload_json = json.dumps(data_blob).replace("</", "<" + chr(92) + "/")
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -273,6 +321,8 @@ def generate_multi_probe_report(
 </head>
 <body>
   <h1>{_html_escape(title)}</h1>
+  <div>Steering alpha: <select id="alpha-select"></select>
+    <span class="note">Charts show one alpha at a time; steering moves both scores and accuracy.</span></div>
   <div class="row">
     <div class="panel">
       <h2>Mean score by probe</h2>
@@ -308,9 +358,14 @@ def generate_multi_probe_report(
   <div id="model-coefs"></div>
 
   <script>
-    const payload = {json.dumps(data_blob)};
+    const payload = {payload_json};
     const probeNames = payload.probe_names;
-    const rows = payload.rows;
+    const allRows = payload.rows;
+    let rows = allRows;
+
+    function selectedAlpha() {{
+      return document.getElementById("alpha-select").value;
+    }}
 
     function buildOptions(selectId, defaultIdx) {{
       const sel = document.getElementById(selectId);
@@ -337,9 +392,10 @@ def generate_multi_probe_report(
     }}
 
     function buildBarCharts() {{
-      const overall = payload.summary.overall;
-      const correct = payload.summary.correct;
-      const incorrect = payload.summary.incorrect;
+      const summary = payload.summary_by_alpha[selectedAlpha()];
+      const overall = summary.overall;
+      const correct = summary.correct;
+      const incorrect = summary.incorrect;
 
       const meanTrace = {{
         x: probeNames,
@@ -433,7 +489,9 @@ def generate_multi_probe_report(
         return;
       }}
       let metricsHtml = "<table><tr><th>Metric</th><th>Value</th></tr>";
-      const info = [["N", model.n], ["CV folds", model.cv_folds], ["Train N", model.train_n], ["Test N", model.test_n]];
+      const info = [["N rows", model.n], ["N items", model.n_items], ["CV folds", model.cv_folds],
+                    ["CV grouped by item", model.cv_grouped_by_item], ["Alpha covariate", model.alpha_covariate],
+                    ["SE clustered by item", model.se_clustered_by_item]];
       for (const [k, v] of info) {{
         if (v !== undefined && v !== null) {{
           metricsHtml += `<tr><td>${{k}}</td><td>${{v}}</td></tr>`;
@@ -464,6 +522,23 @@ def generate_multi_probe_report(
       coefHtml += "</table>";
       coefs.innerHTML = coefHtml;
     }}
+
+    const alphaSelect = document.getElementById("alpha-select");
+    payload.alpha_keys.forEach(a => {{
+      const opt = document.createElement("option");
+      opt.value = a;
+      opt.textContent = a;
+      if (a === payload.default_alpha) opt.selected = true;
+      alphaSelect.appendChild(opt);
+    }});
+    function refreshAlpha() {{
+      rows = allRows.filter(r => r.alpha_key === selectedAlpha());
+      buildBarCharts();
+      updateScatter2D();
+      updateScatter3D();
+    }}
+    alphaSelect.addEventListener("change", refreshAlpha);
+    rows = allRows.filter(r => r.alpha_key === selectedAlpha());
 
     buildOptions("x-probe", 0);
     buildOptions("y-probe", Math.min(1, probeNames.length - 1));

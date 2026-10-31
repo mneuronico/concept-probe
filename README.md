@@ -93,15 +93,61 @@ probe.score_prompts(
 )
 ```
 
-Outputs are written under `outputs/<concept_name>/<timestamp>/`.
+Outputs are written under `outputs/<concept_name>/<timestamp>/`. A `run_name` that already
+holds a run raises instead of mixing two runs; pass `overwrite=True` to replace it.
+
+## What the model sees
+
+By default the library adds nothing to your text that you did not ask for:
+
+- **Texts to read** (`score_texts`, `extract_text_reps`, texts-mode training, eval texts) are
+  read raw: the tokenizer's BOS token and the text, with no chat template and no system prompt.
+- **Prompts to generate from** (`score_prompts`, `multi_probe_score_prompts`, training
+  questions) are a user turn of the chat template, which generation needs. No system prompt is
+  added unless you set one: `prompts.neutral_system` (default null), or `system_prompt=` in the
+  call. In shared and opposed training the concept's `pos_system`/`neg_system` are the system
+  prompts, since they define the concept.
+- A message list is used as given. A system prompt you set is added only if the list has none.
+
+To read texts inside the chat template instead, use `role="user"` (the text as a user turn,
+after the system prompt if one is set) or `role="assistant"` (the text as the model's reply,
+after the system prompt and an optional user turn `prompt`). Settings a role would ignore
+raise: a system prompt with `role="raw"`, or a `prompt` with `role="user"`.
+
+The chat template itself can add or change things, and it differs by model:
+
+- Llama 3.x writes a "Cutting Knowledge Date / Today Date" block into every prompt, with or
+  without a system prompt. Llama 3.2/3.3 write *today's* date there, so the same input would
+  tokenize differently on different days; `model.chat_template_date` (ISO `YYYY-MM-DD`, default
+  `"2024-07-26"`, the date those templates fall back to) fixes it, and null writes the real date.
+- Qwen 2.5 inserts its own system prompt ("You are Qwen, created by Alibaba Cloud...") when
+  there is none.
+- Gemma 3 has no system role: it puts the system prompt inside the first user turn.
+- Llama and Gemma strip leading and trailing whitespace from each message; the library warns
+  once when that happens to a text.
+
+`model.chat_template` (a Jinja string) replaces the tokenizer's template for everything the
+bundle does. To see exactly what goes into the model, before running anything:
+
+```python
+from concept_probe import preview_input
+
+preview_input(tokenizer, "The river was calm.")                              # raw (default)
+preview_input(tokenizer, "The river was calm.", role="user", system="...")   # chat-formatted
+preview_input(tokenizer, "Write about the sea.", generation=True)            # as score_prompts
+```
+
+It returns the decoded input with every special and template token, the token ids, and the
+span of the text's own tokens. `score_texts` records the same `input_text` and `text_span`, and
+`score_prompts` records `prompt_text`.
 
 ## Training from labelled texts
 
 If you already have labelled example sentences for each pole, set
-`training.train_prompt_mode = "texts"` and provide them on the concept
-itself via `train_pos_texts` / `train_neg_texts`. No `pos_system` /
-`neg_system` is needed; pooling falls back to `readout.read_mode`
-(default `sequence_all_mean`), the same path the read-side eval uses.
+`training.train_prompt_mode = "texts"` and provide them on the concept itself via
+`train_pos_texts` / `train_neg_texts`. No `pos_system` / `neg_system` is needed. Each text is
+read raw (see above) and pooled with `readout.read_mode` (default `assistant_all_mean`: the mean
+over the text's own tokens).
 
 ```python
 from concept_probe import ConceptSpec, ProbeWorkspace
@@ -131,33 +177,102 @@ workspace = ProbeWorkspace(
 probe = workspace.train_concept(concept)
 ```
 
-By default each labelled text is read as a user message after the neutral system prompt, and
-`sequence_*` readouts pool over the whole chat-formatted sequence. To read each text as the
-model's own reply and pool over the text's tokens only, set `training.train_text_role =
-"assistant"` with an `assistant_*` read mode. The optional `training.train_text_prompt` is a user
-turn placed before every text. Eval texts are read the same way, so the layer sweep sees the
-same readout as training. To score other texts with the trained probe under the same readout,
-use `extract_text_reps` with the same `role`, `prompt` and `system`: it encodes texts exactly as
-training does, and can return several readouts from one forward pass.
+`training.train_text_role` (`"raw"`, `"user"` or `"assistant"`) sets how the labelled texts are
+read, with `training.train_text_system` (null: `prompts.neutral_system`) and, for the assistant
+role, `training.train_text_prompt`. The `assistant_*` readouts pool over the text's own tokens
+in every role: they leave out the BOS, the system block and role headers before the text, and
+the end-of-turn tokens after it. The `sequence_*` readouts pool over the whole input instead;
+the template part is identical in every input, so under mean pooling its weight is 1/length and
+scores and the direction partly track text length. Training warns when a `sequence_*` readout
+is used.
 
-`training.train_text_role = "raw"` reads each text alone, with no chat template: the BOS token
-and the text, with the `assistant_*` readouts skipping BOS. `model.chat_template` (a Jinja
-string) replaces the tokenizer's chat template for everything the bundle does. Use it, for
-instance, to drop the dated system block that Llama 3.1 inserts when there is no system message.
+To score other texts under the same readout, use `extract_text_reps` with the same `role`,
+`prompt` and `system` (its defaults are the training defaults). It can return several readouts
+from one forward pass:
 
 ```python
-config_overrides = {
-    "training": {
-        "train_prompt_mode": "texts",
-        "train_text_role": "assistant",
-        "train_text_prompt": "What do you think of the painting?",
-    },
-    "readout": {"read_mode": "assistant_all_mean"},  # or assistant_last / assistant_last_k_mean
-}
-reps = extract_text_reps(model, tokenizer, new_texts, role="assistant",
-                         prompt="What do you think of the painting?", system=neutral_system,
-                         pool=["assistant_all_mean", "assistant_last"])
+reps = extract_text_reps(model, tokenizer, new_texts, pool=["assistant_all_mean", "assistant_last"])
 ```
+
+## Evaluation
+
+The evaluation that picks the layer and measures the effect uses the same kind of data as
+training, read the same way:
+
+- **Texts mode**: the concept's `eval_pos_texts` / `eval_neg_texts`, read with the training
+  texts' role and system prompt and pooled with `readout.read_mode`. `evaluation.eval_system`
+  (null by default) overrides the system prompt, with a warning.
+- **Shared and opposed modes**: completions generated for `prompts.eval_questions` under
+  `pos_system` / `neg_system`, pooled with `readout.train_mode`, like the training completions.
+  `eval_questions` should not repeat the training questions; training warns if they do.
+
+In shared and opposed modes, eval texts given with the concept are a **transfer check**: they are
+read with `training.train_text_role` (raw by default), scored at the chosen layer and reported
+under `transfer_eval` in `metrics.json` (`d_at_best_layer`, its p and bootstrap interval), plus a
+`transfer_sweep.png` plot. They do not take part in choosing the layer. The check matters
+because a generated completion has the system prompt that defines the concept in its context: a
+vector could partly encode that context, which the generated eval shares and plain texts do not.
+`evaluation.eval_mode = "read"` chooses the layer on the eval texts instead, with a warning.
+
+`metrics.json` records each readout (`eval_readout`, `transfer_eval.readout`). Generated
+completions (training, evaluation, scoring) are pooled up to and not including their
+end-of-sequence token, whichever generation path produced them.
+
+## Layers
+
+Every layer argument (`training.layer_idx`, `best_layer_search`, `layer_selection.layers`,
+`steer_layers`, `reference_layer`, patch layers) takes layer indices: negative ones count from
+the end, as in Python, and indices outside the model raise. A fraction of depth is written
+explicitly, `{"frac": 0.75}`, so that `1` and `1.0` cannot mean different layers:
+
+```python
+config_overrides = {"training": {"best_layer_search": {"frac": [0.2, 0.8]}}}  # or [6, 20], or [[0, 3], [10, -1]]
+```
+
+## Layer selection and its statistics
+
+`best_layer` is chosen by a sweep over `training.best_layer_search` on the eval items, by
+largest Cohen's d (`sweep_select = "effect_size"`) or smallest Welch p among layers with d > 0
+(`"p_value"`). Choosing the layer and measuring its effect on the same items overstates the
+effect, so by default (`evaluation.selection_split = 0.5`) the layer is chosen on half of the
+eval items and `best_d`, `best_p` and `best_d_ci95` (bootstrap, `evaluation.n_bootstrap`) are
+measured on the other half. `metrics.json` also reports:
+
+- `selection`: `"split"`, `"all_eval"` (too few items to split, or `selection_split = null`:
+  `best_d` is then post-selection and a warning says so) or `"fixed_layer"`.
+- `best_d_all_eval`: d at that layer on all eval items (post-selection).
+- `sweep_max_d` and `sweep_max_d_perm_p`: the largest d over the searched layers and its
+  permutation p-value (`evaluation.n_permutations`), which accounts for having searched them.
+
+Without evaluation, `best_d`/`best_p` are null and the sweep is NaN.
+
+## Scores and steering units
+
+Probe scores are raw projections onto the unit concept direction, with an arbitrary offset.
+Each probe stores two references per layer, both from the evaluation items:
+
+- per item (`score_center`, `score_scale`): the midpoint between the poles' mean item score and
+  the pooled within-pole SD of item scores, where an item's score is its mean over its tokens;
+- per token (`token_center`, `token_scale`): the same over single tokens.
+
+A single token spreads much more than a mean over a text's tokens, which averages most of the
+token-to-token variation away, so the two scales differ (by 1.9-3.4x across layers in a 1B
+Llama on ~16-token texts). Scoring functions save standardized scores next to the raw ones, each with its own
+reference: per-token z (`scores_z_per_layer`, `scores_agg_z`, shown in the heatmaps) and the z of
+an item's mean (`score_mean_z`). In both, 0 is the midpoint between the poles, so positive leans
+toward the positive pole, and 1 is a within-pole SD.
+
+Steering adds `alpha * v_l` to every token position of each steered layer. `alpha_unit`:
+
+- `"raw"`: alpha as is.
+- `"sigma"`: alpha times `sigma_best_layer`, the pooled within-pole SD at the best layer. It is a
+  scale knob, not "n standard deviations of behavior".
+- `"resid_norm"`: alpha times each layer's mean residual norm on the training tokens, so
+  `alpha=0.1` adds 10% of a typical token's norm at each steered layer.
+
+With `steer_distribute = true` (default) alpha is split across the steered layers.
+`random_scoring_vector` / `random_steering_vector` use one random direction per probe, derived
+from its name and run directory, so the control is the same vector in every function.
 
 ## Variance-normalized directions
 
@@ -178,8 +293,45 @@ with `"var"` stays variance-normalized wherever it is used. The layer sweep, and
 normalization)` exposes the same estimator for representations computed elsewhere.
 
 ```python
-config_overrides = {"training": {"direction_normalization": "var", "best_layer_search": [0.2, 0.8]}}
+config_overrides = {"training": {"direction_normalization": "var", "best_layer_search": {"frac": [0.2, 0.8]}}}
 ```
+
+## Behavioral evals and reports
+
+`run_scored_eval` / `run_multi_scored_eval` score prompts at several alphas and check
+correctness. Their analysis never pools correct and incorrect answers across alphas (steering
+moves both the scores and the accuracy, and each item recurs at every alpha):
+
+- per alpha: accuracy with 95% Wilson intervals, mean score, and correct vs incorrect scores;
+- across alphas: a logistic GEE of correctness on the standardized score with alpha as a
+  covariate, clustered by item (`correctness_gee` in `stats.json`).
+
+`generate_multi_probe_report` shows one alpha at a time. Its correctness model has alpha as a
+covariate, cross-validation folds that keep all rows of an item together, and standard errors
+clustered by item.
+
+Coherence rating sends completions to the external Groq API, so it is off by default
+(`rate_coherence=False`). The key comes from `GROQ_API_KEY` in the environment, or from a file
+you pass as `coherence_env_path`; no `.env` is read otherwise. Ratings record the judge model and
+date: they are labels from another model, not ground truth.
+
+## Loading a trained probe
+
+```python
+workspace = ProbeWorkspace(project_directory="outputs/sad_vs_happy/<run>")
+probe = workspace.get_probe()
+```
+
+This loads the run's own model settings. `get_probe` on a workspace created otherwise raises if
+the model (`model_id`, `dtype`, `use_4bit`, chat template or its date) differs from the run's,
+since the directions only apply to the activations they were trained on;
+`allow_model_mismatch=True` loads it anyway.
+
+## Configuration
+
+`concept_probe/defaults.json` holds every setting. Overrides with a key the defaults do not have
+(a misspelling, for instance) raise instead of being ignored. `model.use_4bit` (default false) loads NF4 4-bit weights; it needs bitsandbytes and
+fails rather than loading the full-precision model in its place.
 
 ## JSON-driven workflow
 
@@ -191,7 +343,9 @@ from concept_probe import train_concept_from_json
 probe = train_concept_from_json("examples/concepts/bored_vs_interested.json")
 ```
 
-The example configs in `examples/concepts/` are intentionally general and are not tied to the paper repo.
+It trains the probe and scores the eval prompts with the config's `steering` settings. The
+example configs in `examples/concepts/` are intentionally general and are not tied to the paper
+repo.
 
 ## Repo layout
 
@@ -216,6 +370,7 @@ from concept_probe import (
     concept_direction,
     extract_completion_reps,
     extract_text_reps,
+    preview_input,
     multi_probe_score_prompts,
     train_concept_from_json,
     generate_multi_probe_report,
@@ -242,42 +397,65 @@ GitHub Actions CI runs the same lightweight checks and also builds source and wh
 
 ## Release notes
 
-- New, opt-in, defaults unchanged: `training.train_text_role = "raw"` (the text alone, BOS
-  included, no chat template), `model.chat_template` to replace the tokenizer's template, and
-  `extract_text_reps` to score new texts exactly as texts-mode training read its own.
-- New, opt-in, defaults unchanged: `training.direction_normalization` (`"none"`, `"var"`,
-  `"sd"`) for variance-normalized concept directions, and `training.train_text_role =
-  "assistant"` (with `training.train_text_prompt`) to read labelled texts as the model's
-  reply and pool over their tokens only. With the defaults, training produces exactly the
-  same vectors as before.
-- `apply_chat` now normalizes `apply_chat_template` output to a `(1, seq_len)`
-  LongTensor. Recent transformers versions can return a `BatchEncoding`/dict (or a
-  1D tensor) instead of a bare 2D tensor; previously this raised
-  `AttributeError` on `.shape` during generation and read paths. All
-  generation/read now works regardless of the tokenizer's return shape.
-- Steered generations are now scored with the steering hooks removed. Previously the
-  scoring forward pass ran with the hooks still active, so the injected vector "read
-  itself back" and inflated probe scores under steering by roughly
-  `alpha * cos(steer_dir, score_dir)` at the steered layers — a large effect when
-  steering and scoring with the same probe (and ~zero for random-vector controls,
-  which therefore could not detect it). Probe-score-vs-alpha curves from earlier
-  versions should be regenerated by re-scoring the saved completions. Saved
-  generation logits still reflect the steered model and are labeled
-  `generation_logits_source = "steered_model"`.
-- `best_d`/`best_p` in `metrics.json` are post-selection values (the best layer is
-  chosen by optimizing over the layer sweep on the same eval data); confirm effect
-  sizes on held-out data before reporting them.
-- About `alpha_unit="sigma"`: alpha is multiplied by the std of the *sequence-pooled*
-  eval projections at the best layer, and the resulting raw offset is added at every
-  token position of each steered layer (split across layers when
-  `steer_distribute=true`, compounding through subsequent layers). It is a convenient
-  scale knob, not literally "n standard deviations of behavior".
-- `score_prompts(..., seed=...)` / `multi_probe_score_prompts(..., seed=...)` seed the
-  RNGs for reproducible sampling (best-effort: GPU kernels are not bit-deterministic
-  across hardware/library versions).
-- Coherence rating sends completions to the external Groq API (it runs by default in
-  `run_scored_eval` when a `GROQ_API_KEY` is configured; a notice is printed before
-  sending). Pass `rate_coherence=False` for data that must not leave the machine.
-- The default config in `concept_probe/defaults.json` is usable, but opinionated.
-- Behavioral eval helpers depend on optional packages and, for coherence rating, an external API key.
-- Example scripts are intended as starting points and will download model weights when you run them.
+### Unreleased
+
+- **Nothing is added to your text by default.** Texts are read raw (BOS + text);
+  `training.train_text_role` defaults to `"raw"`, `prompts.neutral_system` to null, and
+  `score_texts` / `extract_text_reps` default to the raw text. Generation prompts are a user turn
+  with no system prompt unless one is set. Message lists are no longer given a system message.
+  Previously every text and prompt got "You are a helpful assistant. Answer clearly and
+  concisely." and the chat template. `preview_input` shows the exact input.
+- **Evaluation uses the same kind of data as training.** Shared and opposed modes evaluate on
+  completions generated for `eval_questions`, read like the training completions; eval texts
+  given with such a concept are reported as a transfer check (`transfer_eval`) and do not pick
+  the layer. Previously shared-mode eval texts picked the layer, read as user turns pooled over
+  the whole chat sequence, so the sweep measured another readout, partly text length.
+- **`assistant_*` readouts pool over the text's own tokens in every role**, and
+  `readout.read_mode` defaults to `assistant_all_mean`. Previously `sequence_all_mean` mixed in
+  the chat-template prefix with weight 1/length.
+- **One end-of-sequence rule**: every generation path keeps the EOS token in its ids and pools
+  up to it. Previously batched generation dropped it and the other paths pooled it.
+- **Layer selection is measured on held-out eval items** (`evaluation.selection_split`), with a
+  bootstrap interval and a permutation p for the largest d. `sweep_select = "p_value"` only
+  considers layers with d > 0, and p-values are kept in float64.
+- **Standardized scores and new units**: per-item and per-token references per layer, z scores
+  for single tokens and for item means, `sigma_best_layer` (pooled within-pole SD, used by
+  `alpha_unit="sigma"`; it used to include the between-pole gap) and `alpha_unit="resid_norm"`.
+- **Fixed chat-template date**: `model.chat_template_date` (default `"2024-07-26"`). Llama 3.2
+  inputs used to contain the date of the run.
+- **Errors instead of silent fallbacks**: unknown config and concept keys; `alpha_unit`,
+  `steer_layers`, `sweep_select` and layer indices outside their values (previously `"12"`
+  steered layers 1 and 2, and out-of-range layer bounds were clipped); settings a text role
+  would ignore; `pos_system == neg_system` in contrastive modes; `use_4bit` without bitsandbytes;
+  a different model in `get_probe`; a reused `run_name`. Most are checked before anything runs.
+- **Fixes**: `multi_probe_score_prompts` scored every probe sharing a concept name with the last
+  one's vectors (names must now be distinct); `ActivationPatch` layers outside the model,
+  including negative indices, were skipped; `extract_text_reps(role="assistant")` with no system
+  or prompt raised an `IndexError`.
+- **Statistics**: eval analyses no longer pool correct vs incorrect across alphas (per-alpha
+  stats plus a GEE clustered by item), accuracy uses Wilson intervals, and the multi-probe report
+  groups its CV folds and standard errors by item, adjusts for alpha and shows one alpha at a time.
+- **Other defaults**: `use_4bit` false (NF4 when on); coherence rating off, and no `.env` read
+  unless passed; `train_concept_from_json` follows the config's steering settings; the random
+  control vector is the same for a probe in every function; `metrics.json` reports null instead
+  of 0 when there was no evaluation.
+
+### Earlier
+
+- `training.direction_normalization` (`"none"`, `"var"`, `"sd"`) for variance-normalized
+  concept directions; `extract_text_reps`; `model.chat_template`.
+- `apply_chat` normalizes `apply_chat_template` output to a `(1, seq_len)` LongTensor, whatever
+  the transformers version returns.
+- Steered generations are scored with the steering hooks removed. Previously the scoring
+  forward pass ran with the hooks still active, so the injected vector "read itself back" and
+  inflated probe scores under steering by roughly `alpha * cos(steer_dir, score_dir)` at the
+  steered layers. Probe-score-vs-alpha curves from those versions should be regenerated by
+  re-scoring the saved completions. Saved generation logits still reflect the steered model and
+  are labeled `generation_logits_source = "steered_model"`.
+- `score_prompts(..., seed=...)` / `multi_probe_score_prompts(..., seed=...)` seed the RNGs for
+  reproducible sampling (best-effort: GPU kernels are not bit-deterministic across
+  hardware/library versions). Batched generation can differ from unbatched generation in half
+  precision; use `training.gen_batch_size = 1` when that matters.
+- Behavioral eval helpers depend on optional packages and, for coherence rating, an external API
+  key. Example scripts are intended as starting points and will download model weights when you
+  run them.

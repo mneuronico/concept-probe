@@ -54,10 +54,10 @@ def test_exposed_in_public_api():
     assert concept_probe.concept_direction is concept_direction
 
 
-def test_defaults_keep_the_historical_behaviour():
+def test_training_defaults():
     training = concept_probe.load_defaults()["training"]
     assert training["direction_normalization"] == "none"
-    assert training["train_text_role"] == "user"
+    assert training["train_text_role"] == "raw"  # the text alone: no chat template, no system prompt
     assert training["train_text_prompt"] is None
 
 
@@ -79,17 +79,19 @@ class _ChatTok:
 
 def test_assistant_role_puts_the_text_after_the_assistant_header():
     tok = _ChatTok()
-    ids, plen = _encode_text_for_read(tok, "one two three", "sys", role="assistant", prompt="question?")
+    ids, start, end = _encode_text_for_read(tok, "one two three", "sys", role="assistant", prompt="question?")
     assert tok.messages == [{"role": "system", "content": "sys"}, {"role": "user", "content": "question?"}]
-    assert plen == 5 and ids.shape == (1, 8)
-    assert ids[0, plen:].tolist() == [7, 7, 7]
+    assert (start, end) == (5, 8) and ids.shape == (1, 8)
+    assert ids[0, start:end].tolist() == [7, 7, 7]
 
 
-def test_assistant_role_without_system_or_prompt():
-    tok = _ChatTok()
-    ids, plen = _encode_text_for_read(tok, "one two", "", role="assistant", prompt=None)
-    assert tok.messages == []
-    assert ids[0, plen:].tolist() == [7, 7]
+def test_assistant_role_without_system_or_prompt_is_rejected():
+    # Chat templates cannot format a conversation that starts with the reply (real tokenizers
+    # raise IndexError on an empty message list), so this fails with a clear message instead.
+    with pytest.raises(ValueError, match="system prompt or a user prompt"):
+        _encode_text_for_read(_ChatTok(), "one two", "", role="assistant", prompt=None)
+    ids, start, end = _encode_text_for_read(_ChatTok(), "one two", "", role="assistant", prompt="q")
+    assert ids[0, start:end].tolist() == [7, 7]
 
 
 def test_assistant_role_rejects_message_lists_and_unknown_roles():

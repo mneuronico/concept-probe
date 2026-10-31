@@ -30,6 +30,7 @@ from typing import Callable, Dict, List, Optional, Sequence
 import torch
 
 from .modeling import attention_mask_from_ids, get_transformer_layers
+from .utils import resolve_layer_index
 
 # edit_fn(layer_idx, hidden[batch, seq, hidden_dim]) -> hidden[batch, seq, hidden_dim]
 EditFn = Callable[[int, torch.Tensor], torch.Tensor]
@@ -57,10 +58,7 @@ class ResidualStreamEditor:
         if layers is None:
             self.layers = list(range(n))
         else:
-            self.layers = [int(l) + n if int(l) < 0 else int(l) for l in layers]
-            for l in self.layers:
-                if not (0 <= l < n):
-                    raise ValueError(f"layer index {l} out of range for {n} blocks")
+            self.layers = [resolve_layer_index(l, n, "layer index") for l in layers]
         self.handles: List[torch.utils.hooks.RemovableHandle] = []
 
     def _make_hook(self, layer_idx: int):
@@ -92,7 +90,10 @@ class ActivationPatch:
     ``(len(positions), hidden_dim)`` tensor (or ``(hidden_dim,)`` broadcast to a
     single position). Donor activations come from :func:`cache_residual_stream`
     on the donor input, read at ``hs_layers[layer][donor_positions]``; the donor
-    and receiver positions need not match.
+    and receiver positions need not match. ``layer`` may be negative (``-1`` is
+    the last block): :func:`patched_forward_hidden_states` resolves it against
+    the model, and :func:`build_patch_edit_fn` does when given ``num_layers``.
+    A layer outside the model raises instead of being skipped.
     """
 
     layer: int
@@ -112,15 +113,29 @@ class ActivationPatch:
             )
 
 
-def build_patch_edit_fn(patches: Sequence[ActivationPatch]) -> EditFn:
+def build_patch_edit_fn(patches: Sequence[ActivationPatch], num_layers: Optional[int] = None) -> EditFn:
     """Compile a list of :class:`ActivationPatch` into an ``edit_fn``.
 
     The edit is out-of-place (the block output is cloned before writing) so the
     model's own forward bookkeeping is never mutated underneath it.
+
+    ``num_layers`` (the model's block count) lets patches use negative layer
+    indices (``-1`` is the last block) and checks that every patch targets an
+    existing block. Without it a negative layer raises: ``edit_fn`` is called
+    with non-negative block indices, so such a patch would never be applied.
     """
     by_layer: Dict[int, List[ActivationPatch]] = {}
     for p in patches:
-        by_layer.setdefault(int(p.layer), []).append(p)
+        if num_layers is not None:
+            layer = resolve_layer_index(p.layer, int(num_layers), "patch layer")
+        elif int(p.layer) < 0:
+            raise ValueError(
+                f"patch layer {p.layer} is negative; pass num_layers to build_patch_edit_fn "
+                "to use negative layer indices"
+            )
+        else:
+            layer = int(p.layer)
+        by_layer.setdefault(layer, []).append(p)
 
     def edit(layer_idx: int, hidden: torch.Tensor) -> torch.Tensor:
         ps = by_layer.get(layer_idx)
@@ -178,9 +193,9 @@ def patched_forward_hidden_states(
     returned stream self-consistent. (The downstream readout, e.g. the final
     layer, is identical either way -- it is always post-edit.)
     """
-    edit_fn = build_patch_edit_fn(patches)
     blocks = get_transformer_layers(model)
     n = len(blocks)
+    edit_fn = build_patch_edit_fn(patches, num_layers=n)
     captured: List[torch.Tensor] = [None] * n  # type: ignore[list-item]
     handles: List[torch.utils.hooks.RemovableHandle] = []
 

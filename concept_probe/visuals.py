@@ -575,7 +575,7 @@ def plot_sweep(
         return False
 
     d = np.array(list(sweep_d), dtype=np.float32)
-    p = np.array(list(sweep_p), dtype=np.float32)
+    p = np.array(list(sweep_p), dtype=np.float64)
     layers = np.arange(len(d))
 
     fig, ax = plt.subplots(2, 1, figsize=(8, 6), sharex=True)

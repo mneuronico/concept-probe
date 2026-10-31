@@ -1,4 +1,5 @@
 import os
+import shutil
 import sys
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -11,11 +12,13 @@ from .probe import (
     PromptLike,
     _pack_generation_logits_arrays,
     _alpha_label,
+    _completion_end,
+    _eos_token_ids,
+    _resolve_steer_layers,
+    _validate_alpha_unit,
     _decode_tokens,
-    _mix_random_control_seed,
     _normalize_messages,
     _prompt_slug_any,
-    _random_vectors_same_norm,
     _resolve_random_control_seed,
     forward_hidden_states_all_layers,
     token_scores_from_hs_layers,
@@ -76,16 +79,9 @@ def _steer_layer_list(
         steer_layers = probe.config["steering"]["steer_layers"]
     if steer_window_radius is None:
         steer_window_radius = probe.config["steering"]["steer_window_radius"]
-
-    if steer_layers == "probe":
-        return [int(probe.best_layer)]
-    if steer_layers == "window":
-        lo = max(0, int(probe.best_layer) - int(steer_window_radius))
-        hi = min(probe.model_bundle.num_layers - 1, int(probe.best_layer) + int(steer_window_radius))
-        return list(range(lo, hi + 1))
-    if isinstance(steer_layers, list):
-        return list(map(int, steer_layers))
-    return list(map(int, steer_layers))
+    return _resolve_steer_layers(
+        steer_layers, int(probe.best_layer), steer_window_radius, probe.model_bundle.num_layers
+    )
 
 
 def multi_probe_score_prompts(
@@ -118,9 +114,26 @@ def multi_probe_score_prompts(
     random_steering_vector: bool = False,
     random_vector_seed: Optional[int] = None,
     seed: Optional[int] = None,
+    overwrite: bool = False,
 ) -> Dict[str, Any]:
+    """Generate (optionally steered by one probe) completions and score them with every probe.
+
+    Prompts follow :meth:`ConceptProbe.score_prompts`: a user turn after ``system_prompt`` (or
+    the first probe's ``prompts.neutral_system``) if one is set, and ``score_mean_by_probe``
+    averages the completion's tokens up to and not including the end-of-sequence token. A
+    ``run_name`` whose directory already holds files raises unless ``overwrite=True``.
+    """
     if not probes:
         raise ValueError("probes must be a non-empty list of ConceptProbe objects.")
+    alpha_unit = _validate_alpha_unit(alpha_unit)
+    # Scores, plots, per-sample records and reports are all keyed by concept name.
+    slugs = [safe_slug(str(probe.concept.name)) for probe in probes]
+    repeated = sorted({str(probe.concept.name) for probe, slug in zip(probes, slugs) if slugs.count(slug) > 1})
+    if repeated:
+        raise ValueError(
+            f"Probes must have distinct concept names, since outputs are keyed by name; repeated: {repeated}. "
+            "Rename them first, e.g. probe.concept.name = '<name>_var'."
+        )
     if seed is not None:
         set_seed(int(seed))
     if not prompts:
@@ -148,11 +161,7 @@ def multi_probe_score_prompts(
         alphas = [0.0]
         nonzero_alpha_requested = False
 
-    sys_prompt = (
-        probes[0].config["prompts"].get("neutral_system", "You are a helpful assistant.")
-        if system_prompt is None
-        else system_prompt
-    )
+    sys_prompt = probes[0].config["prompts"].get("neutral_system") if system_prompt is None else system_prompt
     steer_cfg = probes[0].config.get("steering", {})
     max_new_tokens = max_new_tokens if max_new_tokens is not None else steer_cfg.get("steer_max_new_tokens", 128)
     greedy = greedy if greedy is not None else (not steer_cfg.get("steer_sampling", False))
@@ -179,19 +188,19 @@ def multi_probe_score_prompts(
         random_vector_seed,
         probes[0].config.get("random", {}).get("seed", 0),
     )
+    # Each probe's random control comes from the probe itself, so it is the same vector that
+    # score_texts and score_prompts use for it.
     random_scoring_seed_map: Dict[str, Optional[int]] = {}
-    scoring_vectors_by_probe_name: Dict[str, np.ndarray] = {}
-    for idx, probe in enumerate(probes):
+    scoring_vectors_by_probe: List[np.ndarray] = []
+    for probe in probes:
         probe_name = str(probe.concept.name)
         if random_scoring_vector:
-            probe_seed = _mix_random_control_seed(base_random_seed, 3000 + idx)
+            vectors, probe_seed = probe._random_control_vectors(random_vector_seed)
             random_scoring_seed_map[probe_name] = probe_seed
-            scoring_vectors_by_probe_name[probe_name] = _random_vectors_same_norm(
-                probe.concept_vectors, seed=probe_seed
-            )
+            scoring_vectors_by_probe.append(vectors)
         else:
             random_scoring_seed_map[probe_name] = None
-            scoring_vectors_by_probe_name[probe_name] = probe.concept_vectors
+            scoring_vectors_by_probe.append(probe.concept_vectors)
     steering_seed: Optional[int] = None
     steering_vectors: Optional[np.ndarray] = None
     if steer_distribute is None:
@@ -209,9 +218,7 @@ def multi_probe_score_prompts(
         probes[0]._warn("random_steering_vector=true but steering is inactive; no steering is applied.")
     if steer_probe_obj is not None:
         if random_steering_vector:
-            steer_idx = probes.index(steer_probe_obj)
-            steering_seed = _mix_random_control_seed(base_random_seed, 4000 + steer_idx)
-            steering_vectors = _random_vectors_same_norm(steer_probe_obj.concept_vectors, seed=steering_seed)
+            steering_vectors, steering_seed = steer_probe_obj._random_control_vectors(random_vector_seed)
             probes[0]._warn(
                 f"multi_probe_score_prompts using random steering vector control "
                 f"(same-norm per layer, seed={steering_seed}, steer_probe={steer_probe_obj.concept.name})."
@@ -223,9 +230,19 @@ def multi_probe_score_prompts(
             f"multi_probe_score_prompts using random scoring vector control "
             f"(same-norm per layer, base_seed={base_random_seed})."
         )
+    if steer_probe_obj is not None:
+        steer_layer_list = _steer_layer_list(steer_probe_obj, steer_layers, steer_window_radius)
+        if nonzero_alpha_requested:
+            steer_probe_obj._check_alpha_unit(alpha_unit)
+    else:
+        steer_layer_list = []
 
     run_tag = run_name or now_tag()
     run_dir = os.path.join(output_root, safe_slug(project_name), run_tag)
+    if os.path.isdir(run_dir) and os.listdir(run_dir):
+        if not overwrite:
+            raise FileExistsError(f"{run_dir} already holds a run; pass another run_name, or overwrite=True to replace it.")
+        shutil.rmtree(run_dir)
     ensure_dir(run_dir)
     log_path = os.path.join(run_dir, "log.jsonl")
     logger = JsonlLogger(
@@ -305,23 +322,17 @@ def multi_probe_score_prompts(
     if show_progress and total_runs:
         _progress_print(0, total_runs, label="Generating", enabled=True)
 
-    if steer_probe_obj is not None:
-        steer_layer_list = _steer_layer_list(steer_probe_obj, steer_layers, steer_window_radius)
-    else:
-        steer_layer_list = []
-
     warn_fn = probes[0]._warn if probes[0].console is not None else None
 
+    eos_ids = _eos_token_ids(model, tokenizer)
     run_idx = 0
     progress_every = 1
     for i, prompt in enumerate(prompts):
         prompt_slug = _prompt_slug_any(prompt)
         for alpha in alphas:
-            alpha_val = float(alpha)
-            if steer_probe_obj is not None and alpha_unit == "sigma":
-                if steer_probe_obj.proj_std_best_layer is None or np.isnan(steer_probe_obj.proj_std_best_layer):
-                    raise ValueError("proj_std_best_layer is not available for sigma scaling.")
-                alpha_val = alpha_val * float(steer_probe_obj.proj_std_best_layer)
+            alpha_val, layer_scales = float(alpha), None
+            if steer_probe_obj is not None:
+                alpha_val, layer_scales = steer_probe_obj._steering_alpha(alpha, alpha_unit, steer_layer_list)
 
             messages, used_prompt_system = _normalize_messages(
                 prompt,
@@ -341,6 +352,7 @@ def multi_probe_score_prompts(
                     steering_vectors,
                     float(alpha_val),
                     distribute=steer_distribute,
+                    layer_scales=layer_scales,
                 ):
                     gen_ids = model.generate(
                         input_ids=input_ids,
@@ -386,8 +398,8 @@ def multi_probe_score_prompts(
                     generation_step_logits = None
             token_ids = gen_ids.numpy().astype(np.int32)
             tokens = _decode_tokens(tokenizer, token_ids)
-            completion_ids = token_ids[prompt_len:]
-            completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True)
+            completion_end = _completion_end(token_ids, prompt_len, eos_ids)
+            completion_text = tokenizer.decode(token_ids[prompt_len:completion_end], skip_special_tokens=True)
             generation_logits_payload: Dict[str, np.ndarray] = {}
             if save_generation_logits and generation_step_logits is not None:
                 generation_logits_payload = _pack_generation_logits_arrays(
@@ -398,22 +410,33 @@ def multi_probe_score_prompts(
                 )
 
             scores_agg_list: List[np.ndarray] = []
-            for probe in probes:
+            z_agg_list: List[np.ndarray] = []
+            item_z: List[Optional[float]] = []
+            for probe, scoring_vectors in zip(probes, scoring_vectors_by_probe):
                 layers = probe._layer_selection(layer_selection)
                 aggregate = probe.config["evaluation"]["score_aggregate"]
-                scoring_vectors = scoring_vectors_by_probe_name[str(probe.concept.name)]
-                _, scores_agg = token_scores_from_hs_layers(
+                scores_per_layer, scores_agg = token_scores_from_hs_layers(
                     hs_layers, scoring_vectors, layers, aggregate=aggregate
                 )
                 scores_agg_list.append(scores_agg.astype(np.float32))
+                standardized = None if random_scoring_vector else probe._token_z(scores_per_layer, layers, aggregate)
+                item_z.append(
+                    None if random_scoring_vector
+                    else probe._item_z(scores_per_layer[prompt_len:completion_end], layers, aggregate)
+                )
+                z_agg_list.append(
+                    np.full(scores_agg.shape, np.nan, dtype=np.float32) if standardized is None else standardized[1]
+                )
 
             scores_agg_stack = np.stack(scores_agg_list, axis=0)
+            scores_agg_z_stack = np.stack(z_agg_list, axis=0)
             probe_names = [probe.concept.name for probe in probes]
             score_mean_by_probe: Dict[str, float] = {}
+            score_mean_z_by_probe: Dict[str, Optional[float]] = {}
             for idx, name in enumerate(probe_names):
-                row = scores_agg_stack[idx]
-                completion_span = row[prompt_len:]
+                completion_span = scores_agg_stack[idx][prompt_len:completion_end]
                 score_mean_by_probe[name] = float(np.mean(completion_span)) if completion_span.size else float("nan")
+                score_mean_z_by_probe[name] = item_z[idx]
 
             alpha_label = _alpha_label(float(alpha), alpha_unit)
             base = f"prompt_{i:03d}_{prompt_slug}_{alpha_label}"
@@ -422,7 +445,9 @@ def multi_probe_score_prompts(
                 npz_payload: Dict[str, Any] = dict(
                     token_ids=token_ids,
                     prompt_len=np.array([prompt_len], dtype=np.int32),
+                    completion_end=np.array([completion_end], dtype=np.int32),
                     scores_agg=scores_agg_stack,
+                    scores_agg_z=scores_agg_z_stack,
                     probe_names=np.array(probe_names),
                 )
                 npz_payload.update(generation_logits_payload)
@@ -432,9 +457,13 @@ def multi_probe_score_prompts(
 
             if save_html:
                 html_path = os.path.join(out_dir, f"{base}.html")
-                scores_by_probe = {
-                    name: scores_agg_stack[idx].tolist() for idx, name in enumerate(probe_names)
-                }
+                # Standardized scores (0 = midpoint of the eval poles) where the probe has them, raw otherwise.
+                scores_by_probe = {}
+                for idx, name in enumerate(probe_names):
+                    if np.all(np.isfinite(scores_agg_z_stack[idx])):
+                        scores_by_probe[f"{name} (z)"] = scores_agg_z_stack[idx].tolist()
+                    else:
+                        scores_by_probe[f"{name} (raw)"] = scores_agg_stack[idx].tolist()
                 title = f"prompt {i:03d} | {prompt_slug} | {alpha_label}"
                 render_token_heatmap_multi(tokens, scores_by_probe, html_path, title=title)
                 batch_entries.append((title, tokens, scores_by_probe))
@@ -460,9 +489,11 @@ def multi_probe_score_prompts(
                 "prompt": prompt,
                 "system_prompt": sys_prompt,
                 "system_prompt_overridden": bool(used_prompt_system),
+                "prompt_text": tokenizer.decode(token_ids[:prompt_len].tolist(), skip_special_tokens=False),
                 "alpha": float(alpha),
                 "alpha_unit": alpha_unit,
                 "alpha_value": float(alpha_val),
+                "steer_layer_scales": layer_scales,
                 "steer_probe": None if steer_probe_obj is None else steer_probe_obj.concept.name,
                 "steer_layers": steer_layer_list,
                 "random_scoring_vector": bool(random_scoring_vector),
@@ -471,11 +502,13 @@ def multi_probe_score_prompts(
                 "random_steering_vector_seed": steering_seed,
                 "completion": completion_text,
                 "prompt_len": prompt_len,
+                "completion_end": completion_end,
                 "probe_names": probe_names,
                 "npz_path": npz_path,
                 "html_path": html_path,
                 "segments_path": segments_path,
                 "score_mean_by_probe": score_mean_by_probe,
+                "score_mean_z_by_probe": score_mean_z_by_probe,
                 "generation_logits_saved": bool(generation_logits_payload),
                 "generation_logits_top_k": (
                     int(generation_logits_payload["generation_logits_topk_k"][0])

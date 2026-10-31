@@ -22,11 +22,16 @@ def train_concept_from_json(
     json_path: str,
     alphas: Optional[Sequence[float]] = None,
     *,
+    alpha_unit: str = "sigma",
     model_id: Optional[str] = None,
     root_dir: Optional[str] = None,
     config_overrides: Optional[Dict[str, Any]] = None,
 ) -> ConceptProbe:
-    """Train a concept probe from a JSON spec and score eval prompts."""
+    """Train a concept probe from a JSON spec and score its eval prompts.
+
+    The scoring generations follow the config's ``steering`` section (layers, window,
+    distribution, sampling), like ``score_prompts`` does; ``alphas`` are in ``alpha_unit``.
+    """
     data = _load_concept_json(json_path)
     concept = ConceptSpec.from_config(data)
 
@@ -53,13 +58,5 @@ def train_concept_from_json(
 
     eval_prompts = workspace.config["prompts"]["eval_questions"]
     alpha_values = list(alphas) if alphas is not None else [0.0]
-    probe.score_prompts(
-        prompts=eval_prompts,
-        system_prompt=workspace.config["prompts"]["neutral_system"],
-        alphas=alpha_values,
-        alpha_unit="sigma",
-        steer_layers="window",
-        steer_window_radius=2,
-        steer_distribute=True,
-    )
+    probe.score_prompts(prompts=eval_prompts, alphas=alpha_values, alpha_unit=alpha_unit)
     return probe

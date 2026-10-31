@@ -37,11 +37,17 @@ class EvalRunResult:
     analysis_dir: Optional[str]
 
 
+def _completion_slice(data: Any) -> slice:
+    """The completion's tokens in a score npz: from prompt_len to completion_end (exclusive)."""
+    prompt_len = int(data["prompt_len"][0]) if "prompt_len" in data else 0
+    end = int(data["completion_end"][0]) if "completion_end" in data else None
+    return slice(prompt_len, end)
+
+
 def _mean_completion_score(npz_path: str) -> float:
     data = np.load(npz_path)
     scores = data["scores_agg"]
-    prompt_len = int(data["prompt_len"][0]) if "prompt_len" in data else 0
-    span = scores[prompt_len:]
+    span = scores[_completion_slice(data)]
     if span.size == 0:
         return float("nan")
     return float(np.mean(span))
@@ -77,10 +83,10 @@ def _decode_probe_names(raw: Any) -> List[str]:
 def _mean_completion_score_multi(npz_path: str) -> Dict[str, float]:
     data = np.load(npz_path)
     scores = data["scores_agg"]
-    prompt_len = int(data["prompt_len"][0]) if "prompt_len" in data else 0
+    completion = _completion_slice(data)
 
     if scores.ndim == 1:
-        span = scores[prompt_len:]
+        span = scores[completion]
         mean_val = float(np.mean(span)) if span.size else float("nan")
         return {"_probe_0": mean_val}
 
@@ -94,8 +100,7 @@ def _mean_completion_score_multi(npz_path: str) -> Dict[str, float]:
 
     score_map: Dict[str, float] = {}
     for idx, name in enumerate(probe_names):
-        row = scores[idx]
-        span = row[prompt_len:]
+        span = scores[idx][completion]
         mean_val = float(np.mean(span)) if span.size else float("nan")
         score_map[name] = mean_val
     return score_map
@@ -145,19 +150,90 @@ def _is_bool(value: Any) -> bool:
     return isinstance(value, (bool, np.bool_))
 
 
+def _wilson_interval(successes: int, n: int, z: float = 1.959964) -> Tuple[float, float]:
+    """95% Wilson score interval of a proportion (stays inside [0, 1], unlike the normal one)."""
+    if n <= 0:
+        return float("nan"), float("nan")
+    p = successes / n
+    denom = 1.0 + z * z / n
+    center = (p + z * z / (2 * n)) / denom
+    half = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+    return float(max(0.0, center - half)), float(min(1.0, center + half))
+
+
+def _correctness_gee(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Logistic GEE of correctness on the probe score, adjusting for alpha, clustered by item.
+
+    Steering moves both the score and the accuracy, so alpha enters as a categorical
+    covariate; each item appears once per alpha, so rows are clustered by item (robust
+    standard errors). The score is standardized across rows: the coefficient is per 1 SD.
+    """
+    usable = [
+        r for r in rows
+        if _is_bool(r.get("correct")) and np.isfinite(_finite_float(r.get("score_mean")))
+        and r.get("item_index") is not None and "alpha" in r
+    ]
+    out: Dict[str, Any] = {
+        "model": "logit P(correct) ~ score_z + C(alpha); GEE, exchangeable within item, robust SE",
+        "n_rows": len(usable),
+        "n_items": len({r["item_index"] for r in usable}),
+        "note": None,
+    }
+    y = np.array([1.0 if r["correct"] else 0.0 for r in usable])
+    if len(usable) < 4 or y.min() == y.max():
+        out["note"] = "Needs at least 4 labelled rows with both correct and incorrect answers."
+        return out
+    try:
+        import statsmodels.api as sm
+    except Exception:
+        out["note"] = "statsmodels not available; model not fit."
+        return out
+    score = np.array([_finite_float(r["score_mean"]) for r in usable])
+    sd = float(score.std())
+    if sd == 0:
+        out["note"] = "The score is constant across rows."
+        return out
+    alphas = sorted({float(r["alpha"]) for r in usable})
+    columns = [np.ones(len(usable)), (score - score.mean()) / sd]
+    columns += [np.array([1.0 if float(r["alpha"]) == a else 0.0 for r in usable]) for a in alphas[1:]]
+    X = np.column_stack(columns)
+    groups = np.array([r["item_index"] for r in usable])
+    try:
+        fit = sm.GEE(y, X, groups=groups, family=sm.families.Binomial(),
+                     cov_struct=sm.cov_struct.Exchangeable()).fit()
+    except Exception as exc:  # e.g. perfect separation
+        out["note"] = f"GEE fit failed: {exc}"
+        return out
+    ci = np.asarray(fit.conf_int())
+    out.update({
+        "score_sd": sd,
+        "coef_per_sd": float(fit.params[1]),
+        "odds_ratio_per_sd": float(np.exp(fit.params[1])),
+        "ci95": [float(ci[1, 0]), float(ci[1, 1])],
+        "p_value": float(fit.pvalues[1]),
+        "reference_alpha": alphas[0],
+    })
+    return out
+
+
 def _alpha_label(alpha: float) -> str:
     return f"{alpha:+g}"
 
 
-def _plot_accuracy_by_alpha(alpha_vals: List[float], acc_vals: List[float], n_vals: List[int], out_path: str) -> None:
+def _plot_accuracy_by_alpha(
+    alpha_vals: List[float], acc_vals: List[float], ci_low: List[float], ci_high: List[float], out_path: str
+) -> None:
     if plt is None:
         return
-    se = [np.sqrt(a * (1 - a) / n) if n > 0 else float("nan") for a, n in zip(acc_vals, n_vals)]
+    yerr = [
+        [a - lo if np.isfinite(lo) else 0.0 for a, lo in zip(acc_vals, ci_low)],
+        [hi - a if np.isfinite(hi) else 0.0 for a, hi in zip(acc_vals, ci_high)],
+    ]
     fig, ax = plt.subplots(figsize=(6, 4))
-    ax.errorbar(alpha_vals, acc_vals, yerr=se, marker="o", color="#2b6aa6", linewidth=2)
+    ax.errorbar(alpha_vals, acc_vals, yerr=yerr, marker="o", color="#2b6aa6", linewidth=2)
     ax.set_ylim(0.0, 1.0)
     ax.set_xlabel("Steering alpha")
-    ax.set_ylabel("Accuracy")
+    ax.set_ylabel("Accuracy (95% Wilson interval)")
     ax.set_title("Accuracy vs steering alpha")
     ax.grid(True, alpha=0.25)
     fig.tight_layout()
@@ -176,26 +252,6 @@ def _plot_score_by_alpha(
     ax.set_ylabel("Mean probe score")
     ax.set_title("Mean probe score vs steering alpha")
     ax.grid(True, alpha=0.25)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=160)
-    plt.close(fig)
-
-
-def _plot_score_by_correctness(
-    mean_correct: float,
-    mean_incorrect: float,
-    sem_correct: float,
-    sem_incorrect: float,
-    out_path: str,
-) -> None:
-    if plt is None:
-        return
-    fig, ax = plt.subplots(figsize=(5, 4))
-    ax.bar([0, 1], [mean_correct, mean_incorrect], yerr=[sem_correct, sem_incorrect], color=["#2c8d5b", "#b24a3b"])
-    ax.set_xticks([0, 1], ["correct", "incorrect"])
-    ax.set_ylabel("Mean probe score")
-    ax.set_title("Probe score by correctness")
-    ax.grid(True, axis="y", alpha=0.25)
     fig.tight_layout()
     fig.savefig(out_path, dpi=160)
     plt.close(fig)
@@ -418,7 +474,7 @@ def run_scored_eval(
     alpha_unit: str = "raw",
     analysis_name: str = "analysis",
     analyze: bool = True,
-    rate_coherence: bool = True,
+    rate_coherence: bool = False,
     coherence_model: Optional[str] = None,
     coherence_max_per_request: int = 8,
     coherence_env_path: Optional[str] = None,
@@ -586,7 +642,7 @@ def run_multi_scored_eval(
     alpha_unit: str = "raw",
     analysis_name: str = "analysis",
     analyze: bool = True,
-    rate_coherence: bool = True,
+    rate_coherence: bool = False,
     coherence_model: Optional[str] = None,
     coherence_max_per_request: int = 8,
     coherence_env_path: Optional[str] = None,
@@ -778,7 +834,29 @@ def _is_multi_probe_per_sample(per_sample: List[Dict[str, Any]]) -> bool:
     return False
 
 
+def _accuracy_by_alpha(by_alpha: Dict[float, List[Dict[str, Any]]], alpha_vals: List[float]) -> List[Dict[str, Any]]:
+    out = []
+    for alpha in alpha_vals:
+        rows = [r for r in by_alpha.get(alpha, []) if _is_bool(r.get("correct"))]
+        k = sum(1 for r in rows if r.get("correct") is True)
+        lo, hi = _wilson_interval(k, len(rows))
+        out.append({
+            "alpha": float(alpha),
+            "accuracy": float(k / len(rows)) if rows else float("nan"),
+            "n": int(len(rows)),
+            "ci_low": lo,
+            "ci_high": hi,
+        })
+    return out
+
+
 def _compute_stats(per_sample: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], List[float]]:
+    """Accuracy and probe score per alpha, correct vs incorrect within each alpha, and a GEE of
+    correctness on score across alphas (alpha as covariate, rows clustered by item).
+
+    Correct and incorrect rows are never pooled across alphas: steering moves both the score
+    and the accuracy, and the same item recurs at every alpha.
+    """
     alpha_vals = sorted({float(item["alpha"]) for item in per_sample if "alpha" in item})
     by_alpha: Dict[float, List[Dict[str, Any]]] = {}
     for row in per_sample:
@@ -786,108 +864,42 @@ def _compute_stats(per_sample: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], Li
             continue
         by_alpha.setdefault(float(row["alpha"]), []).append(row)
 
-    accuracy_vals: List[float] = []
-    mean_score_vals: List[float] = []
-    sem_score_vals: List[float] = []
-    counts: List[int] = []
-    score_counts: List[int] = []
-    for alpha in alpha_vals:
-        all_rows = by_alpha.get(alpha, [])
-        rows = [r for r in all_rows if _is_bool(r.get("correct"))]
-        counts.append(len(rows))
-        if rows:
-            acc = sum(1 for r in rows if r.get("correct") is True) / len(rows)
-        else:
-            acc = float("nan")
-        accuracy_vals.append(float(acc))
-        # Score stats use every row with a finite score, independent of correctness labels:
-        # a custom evaluator that emits no "correct" field must not blank the score analysis.
-        scores = [
-            s for s in (_finite_float(r.get("score_mean")) for r in all_rows) if np.isfinite(s)
-        ]
-        score_counts.append(len(scores))
-        mean_score_vals.append(float(np.mean(scores)) if scores else float("nan"))
-        sem_score_vals.append(_sem(scores))
-
-    correct_scores = np.array(
-        [
-            s
-            for s in (
-                _finite_float(r.get("score_mean")) for r in per_sample if r.get("correct") is True
-            )
-            if np.isfinite(s)
-        ],
-        dtype=np.float32,
-    )
-    incorrect_scores = np.array(
-        [
-            s
-            for s in (
-                _finite_float(r.get("score_mean")) for r in per_sample if r.get("correct") is False
-            )
-            if np.isfinite(s)
-        ],
-        dtype=np.float32,
-    )
-    mean_correct = float(np.mean(correct_scores)) if correct_scores.size else float("nan")
-    mean_incorrect = float(np.mean(incorrect_scores)) if incorrect_scores.size else float("nan")
-    sem_correct = _sem(correct_scores.tolist())
-    sem_incorrect = _sem(incorrect_scores.tolist())
-
-    mean_correct_by_alpha: List[float] = []
-    mean_incorrect_by_alpha: List[float] = []
-    sem_correct_by_alpha: List[float] = []
-    sem_incorrect_by_alpha: List[float] = []
+    score_by_alpha: List[Dict[str, Any]] = []
     per_alpha_correctness: List[Dict[str, Any]] = []
     for alpha in alpha_vals:
-        rows = [r for r in by_alpha.get(alpha, []) if _is_bool(r.get("correct"))]
-        correct_scores_alpha = [
-            s
-            for s in (_finite_float(r.get("score_mean")) for r in rows if r.get("correct") is True)
-            if np.isfinite(s)
-        ]
-        incorrect_scores_alpha = [
-            s
-            for s in (_finite_float(r.get("score_mean")) for r in rows if r.get("correct") is False)
-            if np.isfinite(s)
-        ]
-        mean_c = float(np.mean(correct_scores_alpha)) if correct_scores_alpha else float("nan")
-        mean_i = float(np.mean(incorrect_scores_alpha)) if incorrect_scores_alpha else float("nan")
-        sem_c = _sem(correct_scores_alpha)
-        sem_i = _sem(incorrect_scores_alpha)
-        mean_correct_by_alpha.append(mean_c)
-        mean_incorrect_by_alpha.append(mean_i)
-        sem_correct_by_alpha.append(sem_c)
-        sem_incorrect_by_alpha.append(sem_i)
-        per_alpha_correctness.append(
-            {
-                "alpha": float(alpha),
-                "mean_correct": mean_c,
-                "mean_incorrect": mean_i,
-                "sem_correct": sem_c,
-                "sem_incorrect": sem_i,
-                "n_correct": int(len(correct_scores_alpha)),
-                "n_incorrect": int(len(incorrect_scores_alpha)),
-            }
-        )
+        all_rows = by_alpha.get(alpha, [])
+        # Score stats use every row with a finite score, independent of correctness labels:
+        # a custom evaluator that emits no "correct" field must not blank the score analysis.
+        scores = [s for s in (_finite_float(r.get("score_mean")) for r in all_rows) if np.isfinite(s)]
+        score_by_alpha.append({
+            "alpha": float(alpha),
+            "mean_score": float(np.mean(scores)) if scores else float("nan"),
+            "sem": _sem(scores),
+            "n": int(len(scores)),
+        })
+        labelled = [r for r in all_rows if _is_bool(r.get("correct"))]
+        groups = {}
+        for flag in (True, False):
+            groups[flag] = [
+                s for s in (_finite_float(r.get("score_mean")) for r in labelled if r.get("correct") is flag)
+                if np.isfinite(s)
+            ]
+        per_alpha_correctness.append({
+            "alpha": float(alpha),
+            "mean_correct": float(np.mean(groups[True])) if groups[True] else float("nan"),
+            "mean_incorrect": float(np.mean(groups[False])) if groups[False] else float("nan"),
+            "sem_correct": _sem(groups[True]),
+            "sem_incorrect": _sem(groups[False]),
+            "cohen_d": _cohen_d(np.array(groups[True]), np.array(groups[False])),
+            "n_correct": int(len(groups[True])),
+            "n_incorrect": int(len(groups[False])),
+        })
 
     stats = {
-        "accuracy_by_alpha": [
-            {"alpha": float(a), "accuracy": float(acc), "n": int(n)}
-            for a, acc, n in zip(alpha_vals, accuracy_vals, counts)
-        ],
-        "score_by_alpha": [
-            {"alpha": float(a), "mean_score": float(m), "sem": float(s), "n": int(n)}
-            for a, m, s, n in zip(alpha_vals, mean_score_vals, sem_score_vals, score_counts)
-        ],
-        "correct_vs_incorrect": {
-            "mean_correct": mean_correct,
-            "mean_incorrect": mean_incorrect,
-            "sem_correct": sem_correct,
-            "sem_incorrect": sem_incorrect,
-            "cohen_d": _cohen_d(correct_scores, incorrect_scores),
-        },
+        "accuracy_by_alpha": _accuracy_by_alpha(by_alpha, alpha_vals),
+        "score_by_alpha": score_by_alpha,
         "correct_vs_incorrect_by_alpha": per_alpha_correctness,
+        "correctness_gee": _correctness_gee(per_sample),
     }
     return stats, alpha_vals
 
@@ -899,23 +911,7 @@ def _compute_accuracy_stats(per_sample: List[Dict[str, Any]]) -> Tuple[List[Dict
         if "alpha" not in row:
             continue
         by_alpha.setdefault(float(row["alpha"]), []).append(row)
-
-    accuracy_vals: List[float] = []
-    counts: List[int] = []
-    for alpha in alpha_vals:
-        rows = [r for r in by_alpha.get(alpha, []) if _is_bool(r.get("correct"))]
-        counts.append(len(rows))
-        if rows:
-            acc = sum(1 for r in rows if r.get("correct") is True) / len(rows)
-        else:
-            acc = float("nan")
-        accuracy_vals.append(float(acc))
-
-    stats = [
-        {"alpha": float(a), "accuracy": float(acc), "n": int(n)}
-        for a, acc, n in zip(alpha_vals, accuracy_vals, counts)
-    ]
-    return stats, alpha_vals
+    return _accuracy_by_alpha(by_alpha, alpha_vals), alpha_vals
 
 
 def _compute_coherence(
@@ -968,7 +964,8 @@ def _write_analysis(
     _plot_accuracy_by_alpha(
         alpha_vals,
         [r["accuracy"] for r in stats["accuracy_by_alpha"]],
-        [r["n"] for r in stats["accuracy_by_alpha"]],
+        [r["ci_low"] for r in stats["accuracy_by_alpha"]],
+        [r["ci_high"] for r in stats["accuracy_by_alpha"]],
         str(plots_dir / "accuracy_vs_alpha.png"),
     )
     _plot_score_by_alpha(
@@ -978,14 +975,6 @@ def _write_analysis(
         str(plots_dir / "score_vs_alpha.png"),
     )
 
-    correct_stats = stats["correct_vs_incorrect"]
-    _plot_score_by_correctness(
-        correct_stats["mean_correct"],
-        correct_stats["mean_incorrect"],
-        correct_stats["sem_correct"],
-        correct_stats["sem_incorrect"],
-        str(plots_dir / "score_by_correctness.png"),
-    )
     per_alpha_correctness = stats["correct_vs_incorrect_by_alpha"]
     _plot_score_by_correctness_by_alpha(
         alpha_vals,
@@ -1046,7 +1035,8 @@ def _write_analysis_multi(
         _plot_accuracy_by_alpha(
             alpha_vals_master,
             [r["accuracy"] for r in accuracy_by_alpha],
-            [r["n"] for r in accuracy_by_alpha],
+            [r["ci_low"] for r in accuracy_by_alpha],
+            [r["ci_high"] for r in accuracy_by_alpha],
             str(plots_dir / "accuracy_vs_alpha.png"),
         )
 
@@ -1061,6 +1051,7 @@ def _write_analysis_multi(
             probe_rows.append(
                 {
                     "alpha": row.get("alpha"),
+                    "item_index": row.get("item_index"),
                     "correct": row.get("correct"),
                     "score_mean": score_map.get(probe),
                 }
@@ -1070,8 +1061,8 @@ def _write_analysis_multi(
         stats, alpha_vals = _compute_stats(probe_rows)
         per_probe_stats[probe] = {
             "score_by_alpha": stats["score_by_alpha"],
-            "correct_vs_incorrect": stats["correct_vs_incorrect"],
             "correct_vs_incorrect_by_alpha": stats["correct_vs_incorrect_by_alpha"],
+            "correctness_gee": stats["correctness_gee"],
         }
         if not alpha_vals_master:
             alpha_vals_master = alpha_vals
@@ -1085,14 +1076,6 @@ def _write_analysis_multi(
             [r["mean_score"] for r in stats["score_by_alpha"]],
             [r["sem"] for r in stats["score_by_alpha"]],
             str(probe_plot_dir / "score_vs_alpha.png"),
-        )
-        correct_stats = stats["correct_vs_incorrect"]
-        _plot_score_by_correctness(
-            correct_stats["mean_correct"],
-            correct_stats["mean_incorrect"],
-            correct_stats["sem_correct"],
-            correct_stats["sem_incorrect"],
-            str(probe_plot_dir / "score_by_correctness.png"),
         )
         per_alpha_correctness = stats["correct_vs_incorrect_by_alpha"]
         _plot_score_by_correctness_by_alpha(
@@ -1159,7 +1142,7 @@ def rehydrate_batch_analysis(
     batch_dir: str,
     *,
     analysis_name: str = "analysis",
-    rate_coherence: bool = True,
+    rate_coherence: bool = False,
     coherence_model: Optional[str] = None,
     coherence_max_per_request: int = 8,
     coherence_env_path: Optional[str] = None,

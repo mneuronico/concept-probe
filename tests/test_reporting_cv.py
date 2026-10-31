@@ -43,3 +43,22 @@ def test_fit_model_stratified_cv():
     coef = {c["feature"]: c for c in result["coefficients"]}
     assert coef["focus"]["coef"] > 0
     assert coef["focus"]["ci_low"] <= coef["focus"]["coef"] <= coef["focus"]["ci_high"]
+
+
+def _rows_with_items(n_items=20, seed=0):
+    rng = np.random.default_rng(seed)
+    rows = []
+    for item in range(n_items):
+        for alpha in (0.0, 2.0):
+            signal = rng.normal()
+            rows.append({"correct": bool(signal > 0), "alpha": alpha, "item_index": item,
+                         "scores": {"focus": signal + rng.normal(scale=0.5)}})
+    return rows
+
+
+def test_cv_keeps_each_item_in_one_fold_and_adjusts_for_alpha():
+    pytest.importorskip("statsmodels")
+    result = _fit_model(_rows_with_items(), ["focus"], seed=3)
+    assert result["cv_grouped_by_item"] and result["se_clustered_by_item"] and result["alpha_covariate"]
+    assert result["n_items"] == 20
+    assert [c["feature"] for c in result["coefficients"]] == ["(intercept)", "focus", "alpha=2"]

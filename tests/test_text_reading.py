@@ -24,13 +24,13 @@ class _Tok:
 
 
 def test_raw_is_bos_then_the_text():
-    ids, plen = _encode_text_for_read(_Tok(), "one two three", "sys", role="raw")
-    assert ids.tolist() == [[1, 7, 7, 7]] and plen == 1
+    ids, start, end = _encode_text_for_read(_Tok(), "one two three", "sys", role="raw")
+    assert ids.tolist() == [[1, 7, 7, 7]] and (start, end) == (1, 4)
 
 
 def test_raw_without_bos():
-    ids, plen = _encode_text_for_read(_Tok(bos=None), "one two", "", role="raw")
-    assert ids.tolist() == [[7, 7]] and plen == 0
+    ids, start, end = _encode_text_for_read(_Tok(bos=None), "one two", "", role="raw")
+    assert ids.tolist() == [[7, 7]] and (start, end) == (0, 2)
 
 
 def test_raw_warns_that_system_and_prompt_are_ignored():

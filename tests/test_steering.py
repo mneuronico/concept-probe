@@ -79,3 +79,12 @@ def test_tuple_outputs_preserved():
         out = _run_layer(model, 1)
     assert isinstance(out, tuple) and out[1] == "aux"
     np.testing.assert_allclose(out[0].numpy()[0, 0], [0, 3, 0, 0])
+
+
+def test_layer_scales_multiply_each_layers_alpha():
+    model = _FakeModel()
+    with MultiLayerSteererLayerwise(model, [0, 1], VECS, alpha=2.0, distribute=True, layer_scales={0: 3.0, 1: 0.5}):
+        out0 = _run_layer(model, 0)
+        out1 = _run_layer(model, 1)
+    np.testing.assert_allclose(out0.numpy()[0, 0], [3, 0, 0, 0])    # alpha/2 * 3 * e0
+    np.testing.assert_allclose(out1.numpy()[0, 0], [0, 0.5, 0, 0])  # alpha/2 * 0.5 * e1

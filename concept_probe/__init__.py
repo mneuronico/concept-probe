@@ -1,5 +1,13 @@
 from .config import ConceptSpec, load_defaults, resolve_config
-from .probe import ConceptProbe, ProbeWorkspace, concept_direction, score_text_tokens, extract_completion_reps, extract_text_reps
+from .probe import (
+    ConceptProbe,
+    ProbeWorkspace,
+    concept_direction,
+    extract_completion_reps,
+    extract_text_reps,
+    preview_input,
+    score_text_tokens,
+)
 from .multi_probe import multi_probe_score_prompts
 from .patching import (
     ActivationPatch,
@@ -38,6 +46,7 @@ __all__ = [
     "extract_completion_reps",
     "concept_direction",
     "extract_text_reps",
+    "preview_input",
     "multi_probe_score_prompts",
     "ActivationPatch",
     "ResidualStreamEditor",

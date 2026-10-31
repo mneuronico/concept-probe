@@ -146,3 +146,36 @@ def test_patch_reflected_at_layer_and_downstream_not_before():
     np.testing.assert_allclose(hs[3][1].numpy(), (val + 4).numpy())
     # an unpatched position at layer 2 is the clean value
     np.testing.assert_allclose(hs[2][0].numpy(), (emb[0] + 1 + 2 + 3).numpy())
+
+
+# ------------------------------- patch layer indices -------------------------
+def test_negative_patch_layer_counts_from_the_end():
+    model = _ChainModel(n_layers=4)
+    val = torch.full((DIM,), 99.0)
+    hs = patched_forward_hidden_states(model, _ids([1, 2, 3]), [ActivationPatch(layer=-1, positions=[0], values=val)])
+    np.testing.assert_allclose(hs[3][0].numpy(), val.numpy())
+
+
+@pytest.mark.parametrize("layer", [4, -5])
+def test_patch_layer_outside_the_model_raises(layer):
+    model = _ChainModel(n_layers=4)
+    with pytest.raises(ValueError, match="out of range"):
+        patched_forward_hidden_states(model, _ids([1]), [ActivationPatch(layer=layer, positions=[0], values=torch.ones(DIM))])
+
+
+def test_edit_fn_needs_num_layers_for_negative_patch_layers():
+    patches = [ActivationPatch(layer=-1, positions=[0], values=torch.ones(DIM))]
+    with pytest.raises(ValueError, match="num_layers"):
+        build_patch_edit_fn(patches)
+    out = build_patch_edit_fn(patches, num_layers=4)(3, torch.zeros(1, 2, DIM))
+    np.testing.assert_allclose(out[0, 0].numpy(), np.ones(DIM))
+
+
+def test_editor_and_patch_agree_on_negative_layers():
+    model = _ChainModel(n_layers=4)
+    edit = build_patch_edit_fn(
+        [ActivationPatch(layer=-1, positions=[0], values=torch.full((DIM,), 99.0))], num_layers=4
+    )
+    with ResidualStreamEditor(model, edit, layers=[-1]):
+        out = model(input_ids=_ids([1, 2])).logits
+    assert float(out[0, 0, 0]) == 99.0

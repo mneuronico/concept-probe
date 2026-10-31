@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import torch
 
@@ -33,12 +33,28 @@ class LayerSteerer:
 
 
 class MultiLayerSteererLayerwise:
-    def __init__(self, model, layer_indices: List[int], concept_vectors, alpha: float, distribute: bool):
+    """Add ``alpha * v_l`` to the output of each block ``l`` in ``layer_indices``.
+
+    ``distribute`` divides alpha by the number of layers. ``layer_scales`` (optional, one
+    factor per steered layer) multiplies each layer's alpha, e.g. by that layer's mean
+    residual norm for ``alpha_unit="resid_norm"``.
+    """
+
+    def __init__(
+        self,
+        model,
+        layer_indices: List[int],
+        concept_vectors,
+        alpha: float,
+        distribute: bool,
+        layer_scales: Optional[Dict[int, float]] = None,
+    ):
         self.model = model
         self.layer_indices = list(map(int, layer_indices))
         self.alpha = float(alpha)
         self.distribute = bool(distribute)
         self.concept_vectors = concept_vectors
+        self.layer_scales = layer_scales
         self.steerers: List[LayerSteerer] = []
 
     def __enter__(self):
@@ -47,11 +63,12 @@ class MultiLayerSteererLayerwise:
         per = self.alpha / len(self.layer_indices) if self.distribute else self.alpha
         for li in self.layer_indices:
             v_li = self.concept_vectors[li]
+            scale = 1.0 if self.layer_scales is None else float(self.layer_scales[li])
             s = LayerSteerer(
                 model=self.model,
                 layer_idx=li,
                 direction_cpu=torch.tensor(v_li, dtype=torch.float32),
-                alpha=float(per),
+                alpha=float(per * scale),
             )
             s.__enter__()
             self.steerers.append(s)

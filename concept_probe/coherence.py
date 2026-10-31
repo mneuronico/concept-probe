@@ -1,6 +1,7 @@
 import json
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -29,19 +30,21 @@ SYSTEM_PROMPT = (
 )
 
 
-def _load_env(env_path: Optional[Path] = None) -> None:
-    path = env_path or Path(".env")
+def _read_env_file(env_path: Optional[str]) -> Dict[str, str]:
+    """KEY=VALUE pairs of ``env_path`` (none without a path). The process environment is not modified."""
+    if not env_path:
+        return {}
+    path = Path(env_path)
     if not path.exists():
-        return
+        raise FileNotFoundError(f"env file not found: {env_path}")
+    values: Dict[str, str] = {}
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if key and key not in os.environ:
-            os.environ[key] = value
+        values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
 
 
 def _find_log_jsonl(start_dir: Path, max_levels: int = 6) -> Path:
@@ -181,23 +184,27 @@ def rate_batch_coherence(
     """
     Rate completion coherence for a score batch directory.
 
-    NOTE: this sends the batch's completions to the external Groq API. Do not enable it
-    for data that must not leave the machine.
+    NOTE: this sends the batch's completions to the external Groq API. Do not use it for
+    data that must not leave the machine.
 
-    model: explicit model id; when None, falls back to the GROQ_MODEL env var, then to
-    the package default. (An explicitly passed model is never overridden by the env.)
+    api_key: explicit key; when None, GROQ_API_KEY from the environment, then from the file
+    ``env_path`` if one is given (no .env file is read otherwise).
+    model: explicit model id; when None, GROQ_MODEL from the environment or ``env_path``, then
+    the package default. (An explicitly passed model is never overridden.)
 
-    Saves output to <batch_dir>/coherence_rating.json and returns the list.
+    Saves output to <batch_dir>/coherence_rating.json and returns the list. Each entry records
+    the judge model and when it rated: the ratings are labels from another model, not ground
+    truth.
     """
     if max_elements_per_request <= 0:
         raise ValueError("max_elements_per_request must be positive.")
 
-    _load_env(Path(env_path) if env_path else None)
-    api_key = api_key or os.environ.get("GROQ_API_KEY")
+    env_file = _read_env_file(env_path)
+    api_key = api_key or os.environ.get("GROQ_API_KEY") or env_file.get("GROQ_API_KEY")
     if not api_key:
-        raise EnvironmentError("Missing GROQ_API_KEY (set it in .env or environment).")
+        raise EnvironmentError("Missing GROQ_API_KEY (set it in the environment, or pass api_key or env_path).")
     if model is None:
-        model = os.environ.get("GROQ_MODEL") or DEFAULT_MODEL
+        model = os.environ.get("GROQ_MODEL") or env_file.get("GROQ_MODEL") or DEFAULT_MODEL
 
     batch_path = Path(batch_dir).resolve()
     if not batch_path.exists():
@@ -244,12 +251,13 @@ def rate_batch_coherence(
         ratings_by_id.update(_validate_ratings(parsed))
         time.sleep(0.1)
 
+    rated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     results: List[Dict[str, str]] = []
     for idx, npz_path, _ in records:
         rating = ratings_by_id.get(idx)
         if rating is None:
             raise RuntimeError(f"Missing rating for id {idx}.")
-        results.append({"example": npz_path.name, "rating": rating})
+        results.append({"example": npz_path.name, "rating": rating, "judge_model": model, "rated_at": rated_at})
 
     out_path = batch_path / "coherence_rating.json"
     out_path.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
