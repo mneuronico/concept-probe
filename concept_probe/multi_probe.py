@@ -8,6 +8,7 @@ import numpy as np
 from .logger import JsonlLogger
 from .modeling import apply_chat, attention_mask_from_ids
 from .probe import (
+    GENERATED_CONTEXT,
     _MODEL_IDENTITY_KEYS,
     ConceptProbe,
     PromptLike,
@@ -163,7 +164,8 @@ def multi_probe_score_prompts(
     # Every probe is scored on the activations of probes[0]'s model, so all of them must have been
     # trained on that model, with the same settings that shape the activations.
     model_bundle = probes[0].model_bundle
-    for probe in probes[1:]:
+
+    def check_same_model(probe: ConceptProbe) -> None:
         mismatched = [
             k for k in _MODEL_IDENTITY_KEYS
             if probe.config.get("model", {}).get(k) != probes[0].config.get("model", {}).get(k)
@@ -175,7 +177,13 @@ def multi_probe_score_prompts(
                 "runs one model for all probes."
             )
 
+    for probe in probes[1:]:
+        check_same_model(probe)
+
     steer_probe_obj = _resolve_steer_probe(probes, steer_probe)
+    if steer_probe_obj is not None and all(steer_probe_obj is not p for p in probes):
+        steer_probe_obj._require_trained()
+        check_same_model(steer_probe_obj)
 
     if alphas is None or len(alphas) == 0:
         alphas = [0.0]
@@ -358,7 +366,7 @@ def multi_probe_score_prompts(
     progress_every = 1
     for i, prompt in enumerate(prompts):
         prompt_slug = _prompt_slug_any(prompt)
-        for alpha in alphas:
+        for j, alpha in enumerate(alphas):
             alpha_val, layer_scales = float(alpha), None
             if steer_probe_obj is not None:
                 alpha_val, layer_scales = steer_probe_obj._steering_alpha(alpha, alpha_unit, steer_layer_list)
@@ -448,10 +456,12 @@ def multi_probe_score_prompts(
                     hs_layers, scoring_vectors, layers, aggregate=aggregate
                 )
                 scores_agg_list.append(scores_agg.astype(np.float32))
-                standardized = None if random_scoring_vector else probe._token_z(scores_per_layer, layers, aggregate)
+                standardized = None if random_scoring_vector else probe._token_z(
+                    scores_per_layer, layers, aggregate, GENERATED_CONTEXT
+                )
                 item_z.append(
                     None if random_scoring_vector
-                    else probe._item_z(scores_per_layer[prompt_len:completion_end], layers, aggregate)
+                    else probe._item_z(scores_per_layer[prompt_len:completion_end], layers, aggregate, GENERATED_CONTEXT)
                 )
                 z_agg_list.append(
                     np.full(scores_agg.shape, np.nan, dtype=np.float32) if standardized is None else standardized[1]
@@ -468,7 +478,7 @@ def multi_probe_score_prompts(
                 score_mean_z_by_probe[name] = item_z[idx]
 
             alpha_label = _alpha_label(float(alpha), alpha_unit)
-            base = f"prompt_{i:03d}_{prompt_slug}_{alpha_label}"
+            base = f"prompt_{i:03d}_{prompt_slug}_a{j:02d}_{alpha_label}"
             if save_token_scores_npz:
                 npz_path = os.path.join(out_dir, f"{base}.npz")
                 npz_payload: Dict[str, Any] = dict(

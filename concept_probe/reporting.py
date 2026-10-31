@@ -4,7 +4,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .eval_system import item_key
+from .eval_system import correctness_label, item_key
 
 
 def _load_items(path: Path) -> Tuple[List[Dict[str, object]], Path]:
@@ -38,8 +38,8 @@ def _extract_probe_names(items: List[Dict[str, object]]) -> List[str]:
 def _build_rows(items: List[Dict[str, object]], probe_names: List[str]) -> List[Dict[str, object]]:
     rows = []
     for item in items:
-        correct = item.get("correct")
-        if correct not in (True, False):
+        correct = correctness_label(item.get("correct"))
+        if correct is None:
             continue
         scores = item.get("score_mean_by_probe", {})
         if not isinstance(scores, dict):
@@ -94,6 +94,32 @@ def _compute_summary(rows: List[Dict[str, object]], probe_names: List[str]) -> D
             "incorrect": {p: _mean([r["scores"][p] for r in sub if not r["correct"]]) for p in probe_names},
         }
     return summary
+
+
+def _oof_metrics(y: np.ndarray, probs: np.ndarray) -> Dict[str, float]:
+    """Accuracy, F1, ROC AUC and log loss of out-of-fold probabilities (rows of failed folds left out)."""
+    valid = np.isfinite(probs)
+    metrics: Dict[str, float] = {}
+    if not valid.any():
+        return metrics
+    y_v = y[valid]
+    p_v = probs[valid]
+    preds = (p_v >= 0.5).astype(int)
+    metrics["accuracy"] = float((preds == y_v).mean())
+    tp = int(((preds == 1) & (y_v == 1)).sum())
+    fp = int(((preds == 1) & (y_v == 0)).sum())
+    fn = int(((preds == 0) & (y_v == 1)).sum())
+    if (2 * tp + fp + fn) > 0:
+        metrics["f1"] = float(2 * tp / (2 * tp + fp + fn))
+    try:
+        from sklearn.metrics import log_loss, roc_auc_score
+
+        if np.unique(y_v).size >= 2:
+            metrics["roc_auc"] = float(roc_auc_score(y_v, p_v))
+        metrics["log_loss"] = float(log_loss(y_v, np.clip(p_v, 1e-12, 1 - 1e-12), labels=[0, 1]))
+    except Exception:
+        pass
+    return metrics
 
 
 def _fit_model(rows: List[Dict[str, object]], probe_names: List[str], seed: int = 123, n_folds: int = 5):
@@ -165,67 +191,71 @@ def _fit_model(rows: List[Dict[str, object]], probe_names: List[str], seed: int 
     result["cv_folds"] = k
 
     n_scores = len(probe_names)
+    alpha_of = np.array([np.nan if r.get("alpha") is None else float(r["alpha"]) for r in rows])
 
-    def design(train_mask: np.ndarray, rows_mask: np.ndarray) -> np.ndarray:
-        # z-score the probe scores with the training rows' moments; alpha dummies stay 0/1
-        mean = X[train_mask, :n_scores].mean(axis=0)
-        std = X[train_mask, :n_scores].std(axis=0)
-        std[std == 0] = 1.0
-        Z = np.concatenate([(X[rows_mask, :n_scores] - mean) / std, X[rows_mask, n_scores:]], axis=1)
-        return sm.add_constant(Z, has_constant="add")
+    def design(train_mask: np.ndarray, rows_mask: np.ndarray, with_scores: bool = True) -> np.ndarray:
+        # Probe scores are centred and divided by their SD within an alpha (on the training rows):
+        # the SD across alphas would include the steering shift. Alpha dummies stay 0/1.
+        columns = [X[rows_mask, n_scores:]]
+        if with_scores:
+            scores = X[train_mask, :n_scores]
+            alphas_tr = alpha_of[train_mask]
+            if len(alphas) > 1:
+                within = scores - np.stack([scores[alphas_tr == a].mean(axis=0) for a in alphas_tr])
+                std = np.sqrt((within ** 2).sum(axis=0) / max(1, len(scores) - len(alphas)))
+            else:
+                std = scores.std(axis=0)
+            std[std == 0] = 1.0
+            columns.insert(0, (X[rows_mask, :n_scores] - scores.mean(axis=0)) / std)
+        return sm.add_constant(np.concatenate(columns, axis=1), has_constant="add")
 
-    oof_probs = np.full(len(y), np.nan, dtype=np.float64)
-    failed_folds = 0
-    for f in range(k):
-        tr = folds != f
-        te = folds == f
-        try:
-            if len(np.unique(y[tr])) < 2:
-                raise ValueError("one class only in the training split")
-            fold_model = sm.Logit(y[tr], design(tr, tr)).fit(disp=False)
-            oof_probs[te] = np.asarray(fold_model.predict(design(tr, te)), dtype=np.float64)
-        except Exception:
-            failed_folds += 1
+    def out_of_fold(with_scores: bool) -> Tuple[np.ndarray, int]:
+        probs = np.full(len(y), np.nan, dtype=np.float64)
+        failed = 0
+        for f in range(k):
+            tr = folds != f
+            te = folds == f
+            try:
+                if len(np.unique(y[tr])) < 2:
+                    raise ValueError("one class only in the training split")
+                fold_model = sm.Logit(y[tr], design(tr, tr, with_scores)).fit(disp=False)
+                probs[te] = np.asarray(fold_model.predict(design(tr, te, with_scores)), dtype=np.float64)
+            except Exception:
+                failed += 1
+        return probs, failed
+
+    oof_probs, failed_folds = out_of_fold(with_scores=True)
     if failed_folds:
         result["note"] = (
             f"{failed_folds}/{k} CV folds failed to fit (e.g. perfect separation); "
             "metrics use the remaining folds."
         )
-
-    valid = np.isfinite(oof_probs)
-    metrics: Dict[str, float] = {}
-    if valid.any():
-        y_v = y[valid]
-        p_v = oof_probs[valid]
-        preds = (p_v >= 0.5).astype(int)
-        metrics["accuracy"] = float((preds == y_v).mean())
-        tp = int(((preds == 1) & (y_v == 1)).sum())
-        fp = int(((preds == 1) & (y_v == 0)).sum())
-        fn = int(((preds == 0) & (y_v == 1)).sum())
-        if (2 * tp + fp + fn) > 0:
-            metrics["f1"] = float(2 * tp / (2 * tp + fp + fn))
-        try:
-            from sklearn.metrics import log_loss, roc_auc_score
-
-            if np.unique(y_v).size >= 2:
-                metrics["roc_auc"] = float(roc_auc_score(y_v, p_v))
-            metrics["log_loss"] = float(
-                log_loss(y_v, np.clip(p_v, 1e-12, 1 - 1e-12), labels=[0, 1])
-            )
-        except Exception:
-            pass
-    result["metrics"] = metrics
+    result["metrics"] = _oof_metrics(y, oof_probs)
+    if len(alphas) > 1:
+        # What the steering condition alone predicts: the probe scores add only what beats this.
+        baseline_probs, _ = out_of_fold(with_scores=False)
+        result["baseline_metrics"] = _oof_metrics(y, baseline_probs)
+        result["baseline"] = "alpha only"
 
     # Coefficients and p-values from a fit on all rows (metrics above are out-of-fold).
     everything = np.ones(len(y), dtype=bool)
+    import warnings as _warnings
+    from statsmodels.tools.sm_exceptions import ConvergenceWarning
     try:
-        if clustered:
-            codes = {g: i for i, g in enumerate(sorted(set(groups.tolist()), key=str))}
-            full_model = sm.Logit(y, design(everything, everything)).fit(
-                disp=False, cov_type="cluster", cov_kwds={"groups": np.array([codes[g] for g in groups.tolist()])}
-            )
-        else:
-            full_model = sm.Logit(y, design(everything, everything)).fit(disp=False)
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always", ConvergenceWarning)
+            if clustered:
+                codes = {g: i for i, g in enumerate(sorted(set(groups.tolist()), key=str))}
+                full_model = sm.Logit(y, design(everything, everything)).fit(
+                    disp=False, cov_type="cluster", cov_kwds={"groups": np.array([codes[g] for g in groups.tolist()])}
+                )
+            else:
+                full_model = sm.Logit(y, design(everything, everything)).fit(disp=False)
+        if any(issubclass(w.category, ConvergenceWarning) for w in caught) or not full_model.mle_retvals.get("converged", True):
+            result["note"] = (
+                f"{result['note']} The full-data fit did not converge (often an alpha with all answers right or "
+                "all wrong): its coefficients and p-values are unreliable."
+            ).strip()
     except Exception as exc:
         extra = f"Full-data coefficient fit failed: {exc}"
         result["note"] = f"{result['note']} {extra}".strip()
@@ -356,7 +386,9 @@ def generate_multi_probe_report(
     </div>
   </div>
 
-  <h2>Predicting correctness from probe scores</h2>
+  <h2>Predicting correctness from probe scores and alpha</h2>
+  <p class="note">The alpha-only figures show what the steering condition predicts by itself; the probe
+  scores add only the difference.</p>
   <div id="model-metrics"></div>
   <div id="model-coefs"></div>
 
@@ -502,8 +534,10 @@ def generate_multi_probe_report(
       }}
       if (model.metrics) {{
         const src = model.metrics_source ? ` (${{model.metrics_source}})` : "";
+        const base = model.baseline_metrics || {{}};
         for (const [k, v] of Object.entries(model.metrics)) {{
-          metricsHtml += `<tr><td>${{k}}${{src}}</td><td>${{v.toFixed(4)}}</td></tr>`;
+          const b = base[k] !== undefined ? ` (alpha only: ${{base[k].toFixed(4)}})` : "";
+          metricsHtml += `<tr><td>${{k}}${{src}}</td><td>${{v.toFixed(4)}}${{b}}</td></tr>`;
         }}
       }}
       metricsHtml += "</table>";

@@ -28,9 +28,12 @@ def test_raw_is_bos_then_the_text():
     assert ids.tolist() == [[1, 7, 7, 7]] and (start, end) == (1, 4)
 
 
-def test_raw_without_bos():
-    ids, start, end = _encode_text_for_read(_Tok(bos=None), "one two", "", role="raw")
-    assert ids.tolist() == [[7, 7]] and (start, end) == (0, 2)
+def test_raw_without_bos_leaves_the_sink_token_out():
+    # without a BOS, the text's first token is the attention sink: it is read but not pooled
+    seen = []
+    ids, start, end = _encode_text_for_read(_Tok(bos=None), "one two", "", role="raw", warn=seen.append)
+    assert ids.tolist() == [[7, 7]] and (start, end) == (1, 2)
+    assert any("attention sink" in w for w in seen)
 
 
 def test_raw_warns_that_system_and_prompt_are_ignored():

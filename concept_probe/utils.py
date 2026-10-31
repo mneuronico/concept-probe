@@ -31,11 +31,18 @@ def ensure_dir(path: str) -> None:
 
 
 def _json_sanitize(obj: Any) -> Any:
-    """Map NaN/Inf to None (and numpy scalars to Python) so emitted files are valid strict JSON."""
+    """Map NaN/Inf to None, and numpy scalars/arrays and sets to Python values and lists, so emitted
+    files are valid strict JSON."""
     if isinstance(obj, dict):
         return {k: _json_sanitize(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_json_sanitize(v) for v in obj]
+    if isinstance(obj, (set, frozenset)):
+        return [_json_sanitize(v) for v in sorted(obj, key=repr)]
+    if isinstance(obj, np.ndarray):
+        return _json_sanitize(obj.tolist())
+    if isinstance(obj, np.bool_):
+        return bool(obj)
     if isinstance(obj, np.integer):
         return int(obj)
     if isinstance(obj, np.floating):

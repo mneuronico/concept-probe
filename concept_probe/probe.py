@@ -27,9 +27,9 @@ from .visuals import plot_score_hist, plot_sweep, render_batch_heatmap, render_t
 from .console import ConsoleLogger
 
 try:
-    from scipy.stats import ttest_ind
+    from scipy.stats import ttest_ind, ttest_rel
 except Exception:
-    ttest_ind = None
+    ttest_ind = ttest_rel = None
 
 
 def normed_np(v: np.ndarray) -> np.ndarray:
@@ -86,21 +86,22 @@ def _mix_random_control_seed(base_seed: int, salt: int) -> int:
 
 
 def _random_vectors_same_norm(base_vectors: np.ndarray, seed: int) -> np.ndarray:
+    """A random-direction control for ``base_vectors``: one random direction, used at every layer
+    with that layer's norm.
+
+    One shared direction keeps the control comparable to the concept vectors, which point nearly
+    the same way at adjacent layers: independent directions per layer would partly cancel when
+    steering several layers, so the control would push the residual stream about half as far.
+    """
     src = np.asarray(base_vectors, dtype=np.float32)
     if src.ndim != 2:
         raise ValueError(f"base_vectors must be 2D [num_layers, hidden_dim], got shape={src.shape}")
     rng = np.random.default_rng(int(seed))
-    out = np.zeros_like(src, dtype=np.float32)
-    for li in range(src.shape[0]):
-        target_norm = float(np.linalg.norm(src[li]))
-        if not np.isfinite(target_norm) or target_norm <= 0.0:
-            continue
-        rv = rng.standard_normal(src.shape[1]).astype(np.float32)
-        rv_norm = float(np.linalg.norm(rv))
-        if not np.isfinite(rv_norm) or rv_norm <= 0.0:
-            continue
-        out[li] = (rv / rv_norm) * target_norm
-    return out
+    direction = rng.standard_normal(src.shape[1])
+    direction = (direction / np.linalg.norm(direction)).astype(np.float32)
+    norms = np.linalg.norm(src, axis=1)
+    norms = np.where(np.isfinite(norms), norms, 0.0)
+    return (norms[:, None] * direction[None, :]).astype(np.float32)
 
 
 def _render_progress(current: int, total: int, *, width: int = 28) -> str:
@@ -157,12 +158,18 @@ def _pooled_sd_columns(x: np.ndarray, y: np.ndarray) -> np.ndarray:
     return np.sqrt(((nx - 1) * x.var(axis=0, ddof=1) + (ny - 1) * y.var(axis=0, ddof=1)) / (nx + ny - 2))
 
 
-def _welch_p_columns(x: np.ndarray, y: np.ndarray) -> np.ndarray:
-    """Two-sided Welch t-test p-value of each column (NaN without scipy or with < 2 per group)."""
+def _welch_p_columns(x: np.ndarray, y: np.ndarray, paired: bool = False) -> np.ndarray:
+    """Two-sided t-test p-value of each column (NaN without scipy or with < 2 per group).
+
+    Welch's test for independent groups; with ``paired`` (row i of ``x`` and of ``y`` come from
+    the same question), the paired t-test.
+    """
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
     if ttest_ind is None or x.shape[0] < 2 or y.shape[0] < 2:
         return np.full(x.shape[1], np.nan)
+    if paired:
+        return np.asarray(ttest_rel(x, y, axis=0).pvalue, dtype=np.float64)
     return np.asarray(ttest_ind(x, y, axis=0, equal_var=False).pvalue, dtype=np.float64)
 
 
@@ -174,12 +181,14 @@ def _split_indices(n: int, frac: float, rng: np.random.Generator) -> Tuple[np.nd
 
 
 def _max_d_permutation_p(
-    pos: np.ndarray, neg: np.ndarray, n_permutations: int, rng: np.random.Generator
+    pos: np.ndarray, neg: np.ndarray, n_permutations: int, rng: np.random.Generator, paired: bool = False
 ) -> Tuple[float, float]:
     """Largest Cohen's d over the columns (layers), and its permutation p-value.
 
-    Each permutation shuffles the pos/neg labels and takes the largest d over the same
-    columns, so the p-value accounts for having searched over all of them.
+    Each permutation reassigns the pos/neg labels and takes the largest d over the same columns,
+    so the p-value accounts for having searched over all of them. Independent items are shuffled
+    across poles; ``paired`` items (row i of both poles comes from one question) swap poles within
+    each pair, which is what is exchangeable under the null.
     """
     pos = np.asarray(pos, dtype=np.float64)
     neg = np.asarray(neg, dtype=np.float64)
@@ -188,20 +197,33 @@ def _max_d_permutation_p(
     n_pos = pos.shape[0]
     exceed = 0
     for _ in range(int(n_permutations)):
-        order = rng.permutation(pooled.shape[0])
-        exceed += np.nanmax(_cohen_d_columns(pooled[order[:n_pos]], pooled[order[n_pos:]])) >= observed
+        if paired:
+            swap = rng.random(n_pos) < 0.5
+            a = np.where(swap[:, None], neg, pos)
+            b = np.where(swap[:, None], pos, neg)
+        else:
+            order = rng.permutation(pooled.shape[0])
+            a, b = pooled[order[:n_pos]], pooled[order[n_pos:]]
+        exceed += np.nanmax(_cohen_d_columns(a, b)) >= observed
     return observed, (exceed + 1) / (int(n_permutations) + 1)
 
 
 def _bootstrap_d_ci(
-    pos: np.ndarray, neg: np.ndarray, n_bootstrap: int, rng: np.random.Generator
+    pos: np.ndarray, neg: np.ndarray, n_bootstrap: int, rng: np.random.Generator, paired: bool = False
 ) -> Optional[List[float]]:
-    """95% percentile bootstrap interval of Cohen's d, resampling each group with replacement."""
+    """95% percentile bootstrap interval of Cohen's d. Independent items are resampled within each
+    pole; ``paired`` items are resampled by pair, so both poles of a question stay together."""
     pos = np.asarray(pos, dtype=np.float64)
     neg = np.asarray(neg, dtype=np.float64)
     if not n_bootstrap or pos.size < 2 or neg.size < 2:
         return None
-    ds = [cohen_d_np(rng.choice(pos, pos.size), rng.choice(neg, neg.size)) for _ in range(int(n_bootstrap))]
+    ds = []
+    for _ in range(int(n_bootstrap)):
+        if paired:
+            idx = rng.integers(0, pos.size, pos.size)
+            ds.append(cohen_d_np(pos[idx], neg[idx]))
+        else:
+            ds.append(cohen_d_np(rng.choice(pos, pos.size), rng.choice(neg, neg.size)))
     lo, hi = np.nanpercentile(ds, [2.5, 97.5])
     return [float(lo), float(hi)]
 
@@ -402,6 +424,44 @@ def _select_best_layer(
     return int(candidates[order[0]])
 
 
+def _has_system_message(prompt: Any) -> bool:
+    return isinstance(prompt, list) and any(isinstance(m, dict) and m.get("role") == "system" for m in prompt)
+
+
+def _text_context(role: str, system: Optional[str], prompt: Optional[str], mode: str) -> Dict[str, Any]:
+    """How texts were read: the context a set of z references applies to."""
+    return {"kind": "text", "role": role, "system": system or None, "prompt": prompt, "mode": mode}
+
+
+GENERATED_CONTEXT = {"kind": "generated"}
+
+
+def _same_context(reference: Optional[Dict[str, Any]], context: Dict[str, Any]) -> bool:
+    if not reference or reference.get("kind") != context.get("kind"):
+        return False
+    if context["kind"] == "generated":
+        return True
+    return all((reference.get(k) or None) == (context.get(k) or None) for k in ("role", "system", "prompt"))
+
+
+def _prepare_batch_dir(out_dir: str, overwrite: bool) -> None:
+    """Create ``out_dir`` for a scoring batch. A directory that already holds files raises unless
+    ``overwrite`` (which deletes those files and the analysis folder): an earlier batch's files,
+    such as its coherence ratings, would otherwise be read together with the new ones."""
+    if os.path.isdir(out_dir):
+        existing = [f for f in os.listdir(out_dir) if os.path.isfile(os.path.join(out_dir, f))]
+        if existing and not overwrite:
+            raise FileExistsError(
+                f"{out_dir} already holds a scoring batch ({len(existing)} files); pass another batch_subdir, or "
+                "overwrite=True to replace it."
+            )
+        if existing:
+            for f in existing:
+                os.remove(os.path.join(out_dir, f))
+            shutil.rmtree(os.path.join(out_dir, "analysis"), ignore_errors=True)
+    ensure_dir(out_dir)
+
+
 def _decode_tokens(tokenizer, token_ids: Iterable[int]) -> List[str]:
     return [tokenizer.decode([int(t)], skip_special_tokens=False) for t in token_ids]
 
@@ -479,10 +539,12 @@ def _user_text_span(
     """
     total = int(input_ids.shape[-1])
     if not _has_chat_template(tokenizer):
-        bos = getattr(tokenizer, "bos_token_id", None)
-        start = 1 if bos is not None and total > 0 and int(input_ids[0, 0]) == int(bos) else 0
+        # Position 0 is the attention sink: the BOS, or else the first text token (left out).
         flat = text if isinstance(text, str) else _prompt_to_text(text)
-        return start, min(total, start + _token_count(tokenizer, flat)), False
+        bos = getattr(tokenizer, "bos_token_id", None)
+        has_bos = bos is not None and total > 0 and int(input_ids[0, 0]) == int(bos)
+        n_text = _token_count(tokenizer, flat)
+        return 1, min(total, (1 if has_bos else 0) + n_text), False
 
     messages, _ = _normalize_messages(text, system)
     content = messages[-1]["content"]
@@ -518,6 +580,23 @@ def _user_text_span(
 
 
 _TEMPLATE_TRIM_WARNED: set = set()
+_NO_BOS_WARNED: set = set()
+
+
+def _no_bos_sink_start(tokenizer, warn: Optional[Callable[[str], None]], warn_prefix: str) -> int:
+    """Where a raw text's own span starts when the tokenizer has no BOS token: after its first token.
+
+    The first position of an input is the attention sink, with activations far larger than other
+    tokens'; with a BOS it is the BOS, otherwise it is the text's first token, which is then left
+    out of pooling.
+    """
+    if warn is not None and id(tokenizer) not in _NO_BOS_WARNED:
+        warn(
+            f"{warn_prefix}: the tokenizer has no BOS token, so the first token of each text is the attention "
+            "sink (activations far larger than the rest); it is left out of pooling."
+        )
+        _NO_BOS_WARNED.add(id(tokenizer))
+    return 1
 
 
 def _encode_text_for_read(
@@ -538,6 +617,7 @@ def _encode_text_for_read(
 
     - ``role="raw"`` (default): the text alone, with no chat template and no system prompt: the
       BOS token (if the tokenizer has one) and the text. ``system`` and ``prompt`` are ignored.
+      Without a BOS, the text's first token is the attention sink and is left out of the span.
     - ``role="user"``: the text as a user turn of the chat template, after ``system`` if one is
       set. A message list is read as given. The span leaves out the template tokens around the
       text; it is None when it cannot be located (``sequence_*`` modes still work then).
@@ -569,7 +649,7 @@ def _encode_text_for_read(
             ids = ids.unsqueeze(0)
         bos = getattr(tokenizer, "bos_token_id", None)
         if bos is None:
-            return ids, 0, int(ids.shape[-1])
+            return ids, _no_bos_sink_start(tokenizer, warn, warn_prefix), int(ids.shape[-1])
         ids = torch.cat([torch.tensor([[bos]], dtype=ids.dtype), ids], dim=1)
         return ids, 1, int(ids.shape[-1])
     if not _has_chat_template(tokenizer):
@@ -1292,6 +1372,10 @@ class ConceptProbe:
     score_scale: Optional[np.ndarray] = None
     token_center: Optional[np.ndarray] = None
     token_scale: Optional[np.ndarray] = None
+    # The context the references above were measured in ({"kind": "generated"} or {"kind": "text",
+    # "role", "system", "prompt", "mode"}), and the transfer check's references for read texts.
+    reference_context: Optional[Dict[str, Any]] = None
+    transfer_references: Optional[Dict[str, Any]] = None
     # Per-layer mean residual norm of the training tokens: the unit of alpha_unit="resid_norm".
     resid_norm: Optional[np.ndarray] = None
     sweep_d: Optional[np.ndarray] = None
@@ -1328,6 +1412,20 @@ class ConceptProbe:
         selection_split = eval_cfg.get("selection_split", 0.5)
         if selection_split is not None and not 0.0 < float(selection_split) < 1.0:
             raise ValueError(f"evaluation.selection_split must be in (0, 1) or null; got {selection_split!r}")
+        generated_questions = {
+            "shared": {"prompts.train_questions": train_prompts},
+            "opposed": {"prompts.train_questions_pos": train_prompts_pos, "prompts.train_questions_neg": train_prompts_neg},
+            "texts": {},
+        }[train_prompt_mode]
+        if eval_cfg.get("do_eval", True) and (eval_mode == "generate" or (eval_mode == "auto" and train_prompt_mode != "texts")):
+            generated_questions["prompts.eval_questions"] = list(prompts_cfg.get("eval_questions", []))
+        for key, questions in generated_questions.items():
+            with_system = [i for i, q in enumerate(questions) if _has_system_message(q)]
+            if with_system:
+                raise ValueError(
+                    f"{key}{with_system} carry their own system message, which would replace pos_system/neg_system "
+                    "and make the two conditions identical. Pass the questions without a system message."
+                )
         if self.concept.pos_system == self.concept.neg_system and (
             train_prompt_mode in ("shared", "opposed") or (eval_cfg.get("do_eval", True) and eval_mode == "generate")
         ):
@@ -1430,7 +1528,8 @@ class ConceptProbe:
                 )
             if not reps:
                 raise ValueError(f"{label}: no item has tokens to pool (every completion or text is empty).")
-            return np.stack(reps, axis=0).astype(np.float32), np.stack(norms, axis=0), tokens
+            kept = [i for i in range(len(ids_list)) if i not in dropped_items.get(label, [])]
+            return np.stack(reps, axis=0).astype(np.float32), np.stack(norms, axis=0), tokens, kept
 
         self._status(f"Training concept '{self.concept.name}' with model {self.model_bundle.model_id}")
         phase1_action = "Reading training texts" if train_prompt_mode == "texts" else "Generating training completions"
@@ -1601,10 +1700,10 @@ class ConceptProbe:
                         self._status(f"Read {side} training texts {i + 1}/{len(texts)}")
 
         self._status("[Phase 2/4] Forward passes for training reps")
-        reps_pos, norms_pos, _ = pooled_reps(train_pos_ids, train_pos_starts, train_pos_ends,
-                                             train_readout_mode, train_readout_last_k, "train_pos")
-        reps_neg, norms_neg, _ = pooled_reps(train_neg_ids, train_neg_starts, train_neg_ends,
-                                             train_readout_mode, train_readout_last_k, "train_neg")
+        reps_pos, norms_pos, _, _ = pooled_reps(train_pos_ids, train_pos_starts, train_pos_ends,
+                                                train_readout_mode, train_readout_last_k, "train_pos")
+        reps_neg, norms_neg, _, _ = pooled_reps(train_neg_ids, train_neg_starts, train_neg_ends,
+                                                train_readout_mode, train_readout_last_k, "train_neg")
         if reps_pos.shape[1] != num_layers:
             raise ValueError("Layer count mismatch between model and reps.")
         # Mean residual norm of the training tokens per layer: the unit of alpha_unit="resid_norm".
@@ -1624,7 +1723,12 @@ class ConceptProbe:
         transfer_neg_scores_mat = np.zeros((0, num_layers), dtype=np.float32)
         eval_pos_tokens: List[np.ndarray] = []
         eval_neg_tokens: List[np.ndarray] = []
+        transfer_pos_tokens: List[np.ndarray] = []
+        transfer_neg_tokens: List[np.ndarray] = []
         eval_prompts = list(prompts_cfg["eval_questions"])
+        # Generated eval items are pairs: row i of both poles answers eval question eval_question_idx[i].
+        eval_paired = False
+        eval_question_idx: List[int] = []
         did_eval = False
         eval_readout: Optional[Dict[str, Any]] = None
         transfer_readout: Optional[Dict[str, Any]] = None
@@ -1657,8 +1761,8 @@ class ConceptProbe:
                     self.logger.log(
                         f"{event}_{side}", {"i": i, "text": tokenizer.decode(input_ids[0], skip_special_tokens=False)}
                     )
-                reps, _, tokens = pooled_reps(ids_list, starts, ends, train_readout_mode, train_readout_last_k,
-                                              f"{event.split('_')[0]}_{side}", vectors=concept_vectors)
+                reps, _, tokens, _ = pooled_reps(ids_list, starts, ends, train_readout_mode, train_readout_last_k,
+                                                 f"{event.split('_')[0]}_{side}", vectors=concept_vectors)
                 out[side] = (np.einsum("nld,ld->nl", reps, concept_vectors).astype(np.float32), tokens)
                 self._status(f"Read {len(texts)} eval {side} texts")
             return out
@@ -1741,7 +1845,7 @@ class ConceptProbe:
                                     "completion": tokenizer.decode(ids[plen:], skip_special_tokens=True),
                                 },
                             )
-                        reps, _, tokens = pooled_reps(
+                        reps, _, tokens, kept = pooled_reps(
                             [ids for ids, _ in results],
                             [plen for _, plen in results],
                             [_completion_end(ids, plen, eos_ids) for ids, plen in results],
@@ -1750,10 +1854,24 @@ class ConceptProbe:
                             f"eval_{side}",
                             vectors=concept_vectors,
                         )
-                        side_scores[side] = (np.einsum("nld,ld->nl", reps, concept_vectors).astype(np.float32), tokens)
-                    eval_pos_scores_mat, eval_pos_tokens = side_scores["pos"]
-                    eval_neg_scores_mat, eval_neg_tokens = side_scores["neg"]
-                    did_eval = True
+                        side_scores[side] = (np.einsum("nld,ld->nl", reps, concept_vectors).astype(np.float32), tokens, kept)
+                    # Keep the questions answered on both poles, so the two poles stay paired.
+                    eval_question_idx = sorted(set(side_scores["pos"][2]) & set(side_scores["neg"][2]))
+                    for side in ("pos", "neg"):
+                        unpaired = sorted(set(side_scores[side][2]) - set(eval_question_idx))
+                        if unpaired:
+                            dropped_items.setdefault(f"eval_{side}", []).extend(unpaired)
+                            self._warn(
+                                f"eval_{side}: questions {unpaired} are left out because the other pole's "
+                                "completion is empty; the poles are compared question by question."
+                            )
+                    rows = {side: [side_scores[side][2].index(q) for q in eval_question_idx] for side in ("pos", "neg")}
+                    eval_pos_scores_mat = side_scores["pos"][0][rows["pos"]]
+                    eval_neg_scores_mat = side_scores["neg"][0][rows["neg"]]
+                    eval_pos_tokens = [side_scores["pos"][1][r] for r in rows["pos"]]
+                    eval_neg_tokens = [side_scores["neg"][1][r] for r in rows["neg"]]
+                    eval_paired = True
+                    did_eval = len(eval_question_idx) > 0
                     eval_readout = {
                         "role": "assistant",
                         "source": "completions generated for eval_questions under pos_system/neg_system",
@@ -1763,7 +1881,9 @@ class ConceptProbe:
                 if eval_texts_given and train_prompt_mode != "texts":
                     self._status("Reading eval texts (transfer check)")
                     read = read_eval_texts("transfer_read")
-                    transfer_pos_scores_mat, transfer_neg_scores_mat = read["pos"][0], read["neg"][0]
+                    (transfer_pos_scores_mat, transfer_pos_tokens), (transfer_neg_scores_mat, transfer_neg_tokens) = (
+                        read["pos"], read["neg"]
+                    )
                     transfer_readout = dict(text_readout)
 
         n_eval_pos, n_eval_neg = eval_pos_scores_mat.shape[0], eval_neg_scores_mat.shape[0]
@@ -1795,7 +1915,7 @@ class ConceptProbe:
             eval_neg_std = N.std(axis=0, ddof=1) if n_eval_neg > 1 else nan_layers.copy()
             sweep_d = _cohen_d_columns(P, N)
             # float64: p-values of well-separated sets underflow to 0 in float32.
-            sweep_p = _welch_p_columns(P, N)
+            sweep_p = _welch_p_columns(P, N, paired=eval_paired)
             # Scores are raw projections with an arbitrary offset. The midpoint between the eval
             # poles and the pooled within-pole SD give each layer's zero and unit (scores_z).
             score_center = 0.5 * (eval_pos_mean + eval_neg_mean)
@@ -1827,7 +1947,12 @@ class ConceptProbe:
             if selection_split is not None:
                 split_rng = np.random.default_rng([seed, 1])
                 pos_sel, pos_est = _split_indices(n_eval_pos, selection_split, split_rng)
-                neg_sel, neg_est = _split_indices(n_eval_neg, selection_split, split_rng)
+                if eval_paired:
+                    # Both poles of a question go to the same side of the split; split independently,
+                    # a question can help pick the layer on one pole and then be measured on the other.
+                    neg_sel, neg_est = pos_sel, pos_est
+                else:
+                    neg_sel, neg_est = _split_indices(n_eval_neg, selection_split, split_rng)
                 if min(len(pos_sel), len(pos_est), len(neg_sel), len(neg_est)) < 2:
                     self._warn(
                         "evaluation.selection_split needs at least 2 eval items per pole on each side of the "
@@ -1838,7 +1963,8 @@ class ConceptProbe:
                     selection = "split"
             if selection == "split":
                 sel_d = _cohen_d_columns(P[pos_sel], N[neg_sel])
-                best_layer = _select_best_layer(sel_d, _welch_p_columns(P[pos_sel], N[neg_sel]), search_layers, sweep_select)
+                sel_p = _welch_p_columns(P[pos_sel], N[neg_sel], paired=eval_paired)
+                best_layer = _select_best_layer(sel_d, sel_p, search_layers, sweep_select)
                 best_d_selection = float(sel_d[best_layer])
                 est_pos, est_neg = P[pos_est], N[neg_est]
             else:
@@ -1851,7 +1977,8 @@ class ConceptProbe:
             n_permutations = int(eval_cfg.get("n_permutations") or 0)
             if n_permutations > 0:
                 sweep_max_d, sweep_max_d_perm_p = _max_d_permutation_p(
-                    P[:, search_layers], N[:, search_layers], n_permutations, np.random.default_rng([seed, 2])
+                    P[:, search_layers], N[:, search_layers], n_permutations, np.random.default_rng([seed, 2]),
+                    paired=eval_paired,
                 )
         else:
             best_layer = pick_layer(num_layers, train_cfg.get("layer_idx"), train_cfg.get("layer_frac", 0.75))
@@ -1859,16 +1986,17 @@ class ConceptProbe:
                 selection = "fixed_layer"
         if did_eval:
             best_d = float(cohen_d_np(est_pos[:, best_layer], est_neg[:, best_layer]))
-            best_p_arr = _welch_p_columns(est_pos[:, [best_layer]], est_neg[:, [best_layer]])
+            best_p_arr = _welch_p_columns(est_pos[:, [best_layer]], est_neg[:, [best_layer]], paired=eval_paired)
             best_p = None if np.isnan(best_p_arr[0]) else float(best_p_arr[0])
             best_d_all_eval = float(sweep_d[best_layer])
             best_d_ci95 = _bootstrap_d_ci(
                 est_pos[:, best_layer], est_neg[:, best_layer],
-                int(eval_cfg.get("n_bootstrap") or 0), np.random.default_rng([seed, 3]),
+                int(eval_cfg.get("n_bootstrap") or 0), np.random.default_rng([seed, 3]), paired=eval_paired,
             )
         notes = {
             "split": "best_layer was chosen on the selection part of the eval items; best_d, best_p and "
-                     "best_d_ci95 are measured on the held-out rest.",
+                     "best_d_ci95 are measured on the held-out rest (split by question when the poles are "
+                     "paired by question).",
             "all_eval": "best_d/best_p are post-selection values: best_layer was chosen on the same eval items. "
                         "Set evaluation.selection_split for a held-out estimate.",
             "fixed_layer": "best_layer was fixed in advance (training.layer_idx / layer_frac); best_d/best_p use "
@@ -1901,6 +2029,26 @@ class ConceptProbe:
                         "that defines the concept is in context).",
             }
 
+        # z references only apply to inputs read in the context they were measured in: completions
+        # generated in a chat, or texts read with a given role and system prompt.
+        reference_context: Optional[Dict[str, Any]] = None
+        if did_eval:
+            reference_context = (
+                {"kind": "generated", "mode": readout["train_mode"]} if eval_mode == "generate"
+                else _text_context(text_role, eval_system, text_prompt, train_readout_mode)
+            )
+        transfer_refs: Optional[Dict[str, Any]] = None
+        if transfer_eval is not None:
+            t_token_center, t_token_scale = _token_references(transfer_pos_tokens, transfer_neg_tokens)
+            transfer_refs = {
+                "context": _text_context(text_role, eval_system, text_prompt, train_readout_mode),
+                "score_center": 0.5 * (TP.mean(axis=0) + TN.mean(axis=0)),
+                "score_scale": _pooled_sd_columns(TP, TN),
+                "token_center": t_token_center,
+                "token_scale": t_token_scale,
+            }
+            transfer_eval["reference_context"] = transfer_refs["context"]
+
         sigma = float(score_scale[best_layer])
 
         self.concept_vectors = concept_vectors
@@ -1910,6 +2058,8 @@ class ConceptProbe:
         self.score_scale = score_scale
         self.token_center = token_center
         self.token_scale = token_scale
+        self.reference_context = reference_context
+        self.transfer_references = transfer_refs
         self.resid_norm = resid_norm
         self.sweep_d = sweep_d
         self.sweep_p = sweep_p
@@ -1977,6 +2127,13 @@ class ConceptProbe:
             "score_scale": score_scale.astype(np.float64),
             "token_center": token_center.astype(np.float64),
             "token_scale": token_scale.astype(np.float64),
+            "reference_context": np.array([json.dumps(reference_context)]),
+            "transfer_references": np.array([json.dumps(
+                None if transfer_refs is None
+                else {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in transfer_refs.items()}
+            )]),
+            "eval_paired": np.array([eval_paired]),
+            "eval_question_idx": np.asarray(eval_question_idx, dtype=np.int32),
             "resid_norm": resid_norm.astype(np.float64),
             "transfer_pos_scores_mat": transfer_pos_scores_mat.astype(np.float32),
             "transfer_neg_scores_mat": transfer_neg_scores_mat.astype(np.float32),
@@ -2030,6 +2187,8 @@ class ConceptProbe:
             "n_eval_pos": n_eval_pos,
             "n_eval_neg": n_eval_neg,
             "eval_mode_used": eval_mode if did_eval else None,
+            "eval_paired": eval_paired,
+            "reference_context": reference_context,
             "eval_readout": eval_readout,
             "transfer_eval": transfer_eval,
             "dropped_items": dropped_items or None,
@@ -2084,29 +2243,52 @@ class ConceptProbe:
             return None
         return c, u
 
+    def _reference_set(self, context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """The references measured in ``context``: the evaluation's, or the transfer check's."""
+        if _same_context(self.reference_context, context):
+            return {
+                "context": self.reference_context,
+                "score_center": self.score_center,
+                "score_scale": self.score_scale,
+                "token_center": self.token_center,
+                "token_scale": self.token_scale,
+            }
+        if self.transfer_references and _same_context(self.transfer_references.get("context"), context):
+            return self.transfer_references
+        return None
+
     def _token_z(
-        self, scores_per_layer: np.ndarray, layers: List[int], aggregate: str
+        self, scores_per_layer: np.ndarray, layers: List[int], aggregate: str, context: Dict[str, Any]
     ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         """Standardized single-token scores per selected layer, and their aggregate over layers.
 
-        ``(score - token_center) / token_scale``: 0 is the midpoint between the mean token score of
-        the eval poles, 1 the pooled within-pole SD of single tokens. None without eval references.
+        ``(score - token_center) / token_scale``, with the references measured in ``context`` (how
+        the input was read): 0 is the midpoint between the mean token score of the poles, 1 the
+        pooled within-pole SD of single tokens. None when no references come from that context.
         """
-        refs = self._references(self.token_center, self.token_scale, layers)
-        if refs is None:
+        refs = self._reference_set(context)
+        pair = None if refs is None else self._references(refs["token_center"], refs["token_scale"], layers)
+        if pair is None:
             return None
-        z = ((np.asarray(scores_per_layer, dtype=np.float64) - refs[0]) / refs[1]).astype(np.float32)
+        z = ((np.asarray(scores_per_layer, dtype=np.float64) - pair[0]) / pair[1]).astype(np.float32)
         z_agg = z.mean(axis=1) if aggregate == "mean" else z.sum(axis=1)
         return z, z_agg.astype(np.float32)
 
-    def _item_z(self, span_scores_per_layer: np.ndarray, layers: List[int], aggregate: str) -> Optional[float]:
+    def _item_z(
+        self, span_scores_per_layer: np.ndarray, layers: List[int], aggregate: str, context: Dict[str, Any]
+    ) -> Optional[float]:
         """Standardized score of an item: its mean over the span, per selected layer, as
-        ``(mean - score_center) / score_scale`` (the per-item references), aggregated over layers."""
-        refs = self._references(self.score_center, self.score_scale, layers)
-        span = np.asarray(span_scores_per_layer, dtype=np.float64)
-        if refs is None or span.shape[0] == 0:
+        ``(mean - score_center) / score_scale`` with the per-item references measured in ``context``,
+        aggregated over layers. None when no such references exist, or when they were measured on
+        a pooling other than the mean (``assistant_all_mean``)."""
+        refs = self._reference_set(context)
+        if refs is None or (refs["context"].get("mode") or "assistant_all_mean") != "assistant_all_mean":
             return None
-        z = (span.mean(axis=0) - refs[0]) / refs[1]
+        pair = self._references(refs["score_center"], refs["score_scale"], layers)
+        span = np.asarray(span_scores_per_layer, dtype=np.float64)
+        if pair is None or span.shape[0] == 0:
+            return None
+        z = (span.mean(axis=0) - pair[0]) / pair[1]
         return float(z.mean() if aggregate == "mean" else z.sum())
 
     def _system_for(self, role: str, system_prompt: Optional[str], prompt: Optional[str]) -> Optional[str]:
@@ -2134,6 +2316,7 @@ class ConceptProbe:
         reference_layer: Optional[int] = None,
         role: str = "raw",
         prompt: Optional[str] = None,
+        overwrite: bool = False,
     ) -> List[Dict[str, Any]]:
         """Score every token of each text with the probe (token-level scores, no pooling).
 
@@ -2149,6 +2332,9 @@ class ConceptProbe:
         ``scores_agg_z``: 0 is the midpoint between the eval poles, 1 the within-pole SD of single
         tokens), which the heatmaps then show. Each record has the text's mean score over its own
         tokens, ``score_mean``, and ``score_mean_z``, standardized with the per-item references.
+        z scores need references measured on texts read the same way (role, system prompt, prompt):
+        the evaluation's in texts mode, the transfer check's (eval texts) in shared/opposed mode.
+        Otherwise only the raw projections are saved, with a warning.
         """
         self._require_trained()
         tokenizer = self.model_bundle.tokenizer
@@ -2156,6 +2342,7 @@ class ConceptProbe:
         aggregate = self.config["evaluation"]["score_aggregate"]
         layers = self._layer_selection(layer_selection)
         sys_prompt = self._system_for(role, system_prompt, prompt)
+        read_context = _text_context(role, sys_prompt, prompt, "assistant_all_mean")
         save_html = self.config["plots"].get("heatmap_html", True) if save_html is None else save_html
         save_token_scores_npz = self.config["output"].get("save_token_scores_npz", True)
         scoring_seed: Optional[int] = None
@@ -2165,13 +2352,19 @@ class ConceptProbe:
             self._warn(
                 f"score_texts using random scoring vector control (same-norm per layer, seed={scoring_seed})."
             )
+        elif reference_layer is None and self._reference_set(read_context) is None:
+            available = [r for r in (self.reference_context, (self.transfer_references or {}).get("context")) if r]
+            self._warn(
+                f"score_texts: no z references were measured on texts read like these ({read_context}); only raw "
+                f"projections are saved. References exist for: {available or 'nothing'}."
+            )
 
         base_dir = os.path.join(self.run_dir, output_subdir)
         ensure_dir(base_dir)
         if batch_subdir is None:
             batch_subdir = f"batch_{now_tag()}"
         out_dir = base_dir if batch_subdir == "" else os.path.join(base_dir, batch_subdir)
-        ensure_dir(out_dir)
+        _prepare_batch_dir(out_dir, overwrite)
         results = []
         batch_entries = []
         total_texts = len(texts)
@@ -2197,10 +2390,10 @@ class ConceptProbe:
                 reference_layer=reference_layer,
             )
             calibrated = not (random_scoring_vector or reference_layer is not None)
-            standardized = self._token_z(scores_per_layer, layers, aggregate) if calibrated else None
+            standardized = self._token_z(scores_per_layer, layers, aggregate, read_context) if calibrated else None
             span = slice(text_start, text_end) if text_start is not None else slice(0, 0)
             score_mean = float(np.mean(scores_agg[span])) if scores_agg[span].size else None
-            score_mean_z = self._item_z(scores_per_layer[span], layers, aggregate) if calibrated else None
+            score_mean_z = self._item_z(scores_per_layer[span], layers, aggregate, read_context) if calibrated else None
             token_ids = input_ids[0].detach().cpu().numpy().astype(np.int32)
             tokens = _decode_tokens(tokenizer, token_ids)
             text_span = None if text_start is None else [int(text_start), int(text_end)]
@@ -2303,6 +2496,7 @@ class ConceptProbe:
         random_steering_vector: bool = False,
         random_vector_seed: Optional[int] = None,
         seed: Optional[int] = None,
+        overwrite: bool = False,
     ) -> List[Dict[str, Any]]:
         """Generate (optionally steered) completions and score them with the probe.
 
@@ -2402,7 +2596,7 @@ class ConceptProbe:
         if batch_subdir is None:
             batch_subdir = f"batch_{now_tag()}"
         out_dir = base_dir if batch_subdir == "" else os.path.join(base_dir, batch_subdir)
-        ensure_dir(out_dir)
+        _prepare_batch_dir(out_dir, overwrite)
         results = []
         batch_entries = []
         total_prompts = len(prompts)
@@ -2505,14 +2699,17 @@ class ConceptProbe:
                 completion_text = tokenizer.decode(token_ids[prompt_len:completion_end], skip_special_tokens=True)
                 completion_scores = scores_agg[prompt_len:completion_end]
                 score_mean = float(np.mean(completion_scores)) if completion_scores.size else float("nan")
-                standardized = None if random_scoring_vector else self._token_z(scores_per_layer, layers, aggregate)
+                standardized = None if random_scoring_vector else self._token_z(
+                    scores_per_layer, layers, aggregate, GENERATED_CONTEXT
+                )
                 score_mean_z = (
                     None if random_scoring_vector
-                    else self._item_z(scores_per_layer[prompt_len:completion_end], layers, aggregate)
+                    else self._item_z(scores_per_layer[prompt_len:completion_end], layers, aggregate, GENERATED_CONTEXT)
                 )
 
                 alpha_label = _alpha_label(float(alpha), alpha_unit)
-                base = f"prompt_{i:03d}_{prompt_slug}_{alpha_label}"
+                # j keeps repeated alphas (several samples of one prompt) in separate files
+                base = f"prompt_{i:03d}_{prompt_slug}_a{j:02d}_{alpha_label}"
                 if save_token_scores_npz:
                     npz_path = os.path.join(out_dir, f"{base}.npz")
                     npz_payload: Dict[str, Any] = dict(
@@ -2653,6 +2850,11 @@ class ConceptProbe:
         obj.score_scale = tensors["score_scale"]
         obj.token_center = tensors["token_center"]
         obj.token_scale = tensors["token_scale"]
+        obj.reference_context = json.loads(str(tensors["reference_context"][0]))
+        transfer = json.loads(str(tensors["transfer_references"][0]))
+        if transfer is not None:
+            transfer = {k: (np.asarray(v, dtype=np.float64) if k != "context" else v) for k, v in transfer.items()}
+        obj.transfer_references = transfer
         obj.resid_norm = tensors["resid_norm"]
         sigma = float(obj.score_scale[obj.best_layer])
         obj.sigma_best_layer = sigma if np.isfinite(sigma) else None

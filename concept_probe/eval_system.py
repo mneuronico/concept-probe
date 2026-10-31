@@ -146,8 +146,23 @@ def _cohen_d(x: np.ndarray, y: np.ndarray) -> float:
     return float((x.mean() - y.mean()) / (np.sqrt(pooled) + 1e-12))
 
 
-def _is_bool(value: Any) -> bool:
-    return isinstance(value, (bool, np.bool_))
+def correctness_label(value: Any, where: str = "correct") -> Optional[bool]:
+    """A correctness label as True/False, or None for an unlabelled row.
+
+    Bools (Python or numpy) and the numbers 0 and 1 are labels; anything else raises, so that
+    a label is never silently dropped or miscounted.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, float, np.integer, np.floating)) and float(value) in (0.0, 1.0):
+        return bool(value)
+    raise ValueError(f"{where}={value!r}: a correctness label must be a bool, 0/1 or None.")
+
+
+def _label(row: Dict[str, Any]) -> Optional[bool]:
+    return correctness_label(row.get("correct"))
 
 
 def _wilson_interval(successes: int, n: int, z: float = 1.959964) -> Tuple[float, float]:
@@ -158,7 +173,8 @@ def _wilson_interval(successes: int, n: int, z: float = 1.959964) -> Tuple[float
     denom = 1.0 + z * z / n
     center = (p + z * z / (2 * n)) / denom
     half = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
-    return float(max(0.0, center - half)), float(min(1.0, center + half))
+    # rounding can leave a bound a hair past p (e.g. 0.9999999999999999 at p = 1)
+    return float(max(0.0, min(p, center - half))), float(min(1.0, max(p, center + half)))
 
 
 def item_key(row: Dict[str, Any]) -> Optional[str]:
@@ -180,21 +196,24 @@ def _correctness_gee(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Logistic GEE of correctness on the probe score, adjusting for alpha, clustered by item.
 
     Steering moves both the score and the accuracy, so alpha enters as a categorical
-    covariate; each item appears once per alpha, so rows are clustered by item (robust
-    standard errors). The score is standardized across rows: the coefficient is per 1 SD.
+    covariate; each item appears once per alpha, so rows are clustered by item, with robust
+    standard errors corrected for few clusters (Mancl-DeRouen, ``bias_reduced``). The
+    coefficient is per 1 SD of the score within an alpha: the SD across all rows would include
+    the steering shift itself, making the effect size depend on which alphas were run.
     """
     usable = [
         r for r in rows
-        if _is_bool(r.get("correct")) and np.isfinite(_finite_float(r.get("score_mean")))
+        if _label(r) is not None and np.isfinite(_finite_float(r.get("score_mean")))
         and item_key(r) is not None and "alpha" in r
     ]
     out: Dict[str, Any] = {
-        "model": "logit P(correct) ~ score_z + C(alpha); GEE, exchangeable within item, robust SE",
+        "model": "logit P(correct) ~ score / within-alpha SD + C(alpha); GEE, exchangeable within item, "
+                 "bias-reduced robust SE",
         "n_rows": len(usable),
         "n_items": len({item_key(r) for r in usable}),
         "note": None,
     }
-    y = np.array([1.0 if r["correct"] else 0.0 for r in usable])
+    y = np.array([1.0 if _label(r) else 0.0 for r in usable])
     if len(usable) < 4 or y.min() == y.max():
         out["note"] = "Needs at least 4 labelled rows with both correct and incorrect answers."
         return out
@@ -204,11 +223,14 @@ def _correctness_gee(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         out["note"] = "statsmodels not available; model not fit."
         return out
     score = np.array([_finite_float(r["score_mean"]) for r in usable])
-    sd = float(score.std())
-    if sd == 0:
-        out["note"] = "The score is constant across rows."
-        return out
     alphas = sorted({float(r["alpha"]) for r in usable})
+    alpha_of = np.array([float(r["alpha"]) for r in usable])
+    within = score - np.array([score[alpha_of == a].mean() for a in alpha_of])
+    dof = len(usable) - len(alphas)
+    sd = float(np.sqrt((within ** 2).sum() / dof)) if dof > 0 else 0.0
+    if sd == 0:
+        out["note"] = "The score does not vary within an alpha."
+        return out
     columns = [np.ones(len(usable)), (score - score.mean()) / sd]
     columns += [np.array([1.0 if float(r["alpha"]) == a else 0.0 for r in usable]) for a in alphas[1:]]
     X = np.column_stack(columns)
@@ -216,13 +238,13 @@ def _correctness_gee(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     groups = np.array([keys.index(item_key(r)) for r in usable])
     try:
         fit = sm.GEE(y, X, groups=groups, family=sm.families.Binomial(),
-                     cov_struct=sm.cov_struct.Exchangeable()).fit()
+                     cov_struct=sm.cov_struct.Exchangeable()).fit(cov_type="bias_reduced")
     except Exception as exc:  # e.g. perfect separation
         out["note"] = f"GEE fit failed: {exc}"
         return out
     ci = np.asarray(fit.conf_int())
     out.update({
-        "score_sd": sd,
+        "score_sd_within_alpha": sd,
         "coef_per_sd": float(fit.params[1]),
         "odds_ratio_per_sd": float(np.exp(fit.params[1])),
         "ci95": [float(ci[1, 0]), float(ci[1, 1])],
@@ -242,8 +264,8 @@ def _plot_accuracy_by_alpha(
     if plt is None:
         return
     yerr = [
-        [a - lo if np.isfinite(lo) else 0.0 for a, lo in zip(acc_vals, ci_low)],
-        [hi - a if np.isfinite(hi) else 0.0 for a, hi in zip(acc_vals, ci_high)],
+        [max(0.0, a - lo) if np.isfinite(lo) else 0.0 for a, lo in zip(acc_vals, ci_low)],
+        [max(0.0, hi - a) if np.isfinite(hi) else 0.0 for a, hi in zip(acc_vals, ci_high)],
     ]
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.errorbar(alpha_vals, acc_vals, yerr=yerr, marker="o", color="#2b6aa6", linewidth=2)
@@ -413,15 +435,31 @@ def _build_prompt_from_item(
     prompt_key: str,
     variable_key: str,
 ) -> PromptLike:
+    """The prompt of an eval item.
+
+    At most one of ``prompt_builder`` (called with the item), ``prompt_template`` (formatted with
+    the item's fields; a string item is ``{"prompt": text}``) and ``prompt_prefix`` (prepended to
+    ``item[variable_key]``) may be given, and it is always applied. Without any of them the
+    prompt is ``item[prompt_key]``.
+    """
+    given = [name for name, value in (("prompt_builder", prompt_builder), ("prompt_template", prompt_template),
+                                      ("prompt_prefix", prompt_prefix)) if value is not None]
+    if len(given) > 1:
+        raise ValueError(f"Pass only one of {given}.")
     if prompt_builder is not None:
         return prompt_builder(item)
+    if prompt_template is not None:
+        try:
+            return prompt_template.format(**item)
+        except KeyError as exc:
+            raise ValueError(f"prompt_template needs the item field {exc}; the item has {sorted(item)}.") from None
+    if prompt_prefix is not None:
+        if variable_key not in item:
+            raise ValueError(f"prompt_prefix needs item[{variable_key!r}]; the item has {sorted(item)}.")
+        return f"{prompt_prefix}{item[variable_key]}"
     if prompt_key in item:
         return item[prompt_key]
-    if prompt_template is not None:
-        return prompt_template.format(**item)
-    if prompt_prefix is not None and variable_key in item:
-        return f"{prompt_prefix}{item[variable_key]}"
-    raise ValueError("Unable to build prompt: provide prompt_builder, prompt_template, prompt_prefix, or prompt_key.")
+    raise ValueError(f"The item has no {prompt_key!r}; provide prompt_builder, prompt_template or prompt_prefix.")
 
 
 def _extract_with_marker(
@@ -591,6 +629,8 @@ def run_scored_eval(
             "prompt": rec.get("prompt"),
             "completion": completion,
             "score_mean": _score_mean_from_result(rec),
+            "alpha_unit": rec.get("alpha_unit"),
+            "alpha_value": rec.get("alpha_value"),
             "npz_path": rec.get("npz_path"),
             "html_path": rec.get("html_path"),
         }
@@ -600,6 +640,8 @@ def run_scored_eval(
             record["item"] = item
         if isinstance(eval_result, dict):
             record.update(eval_result)
+            if "correct" in eval_result:
+                record["correct"] = correctness_label(eval_result["correct"], f"items[{item_idx}] correct")
         per_sample.append(record)
         if total_eval and ((idx + 1) % progress_every == 0 or (idx + 1) == total_eval):
             _progress_print(
@@ -777,6 +819,8 @@ def run_multi_scored_eval(
             "prompt": rec.get("prompt"),
             "completion": completion,
             "score_mean_by_probe": score_map,
+            "alpha_unit": rec.get("alpha_unit"),
+            "alpha_value": rec.get("alpha_value"),
             "npz_path": rec.get("npz_path"),
             "html_path": rec.get("html_path"),
             "probe_names": rec.get("probe_names"),
@@ -787,6 +831,8 @@ def run_multi_scored_eval(
             record["item"] = item
         if isinstance(eval_result, dict):
             record.update(eval_result)
+            if "correct" in eval_result:
+                record["correct"] = correctness_label(eval_result["correct"], f"items[{item_idx}] correct")
         per_sample.append(record)
         if total_eval and ((idx + 1) % progress_every == 0 or (idx + 1) == total_eval):
             _progress_print(
@@ -865,8 +911,8 @@ def _is_multi_probe_per_sample(per_sample: List[Dict[str, Any]]) -> bool:
 def _accuracy_by_alpha(by_alpha: Dict[float, List[Dict[str, Any]]], alpha_vals: List[float]) -> List[Dict[str, Any]]:
     out = []
     for alpha in alpha_vals:
-        rows = [r for r in by_alpha.get(alpha, []) if _is_bool(r.get("correct"))]
-        k = sum(1 for r in rows if r.get("correct") is True)
+        rows = [r for r in by_alpha.get(alpha, []) if _label(r) is not None]
+        k = sum(1 for r in rows if _label(r))
         lo, hi = _wilson_interval(k, len(rows))
         out.append({
             "alpha": float(alpha),
@@ -905,11 +951,11 @@ def _compute_stats(per_sample: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], Li
             "sem": _sem(scores),
             "n": int(len(scores)),
         })
-        labelled = [r for r in all_rows if _is_bool(r.get("correct"))]
+        labelled = [r for r in all_rows if _label(r) is not None]
         groups = {}
         for flag in (True, False):
             groups[flag] = [
-                s for s in (_finite_float(r.get("score_mean")) for r in labelled if r.get("correct") is flag)
+                s for s in (_finite_float(r.get("score_mean")) for r in labelled if _label(r) is flag)
                 if np.isfinite(s)
             ]
         per_alpha_correctness.append({
@@ -954,7 +1000,7 @@ def _compute_coherence(
         by_alpha.setdefault(float(row["alpha"]), []).append(row)
 
     for i, alpha in enumerate(alpha_vals):
-        rows = [r for r in by_alpha.get(alpha, []) if _is_bool(r.get("correct"))]
+        rows = [r for r in by_alpha.get(alpha, []) if _label(r) is not None]
         for rating in RATING_COLORS:
             rated_rows = []
             for item in rows:
@@ -969,7 +1015,7 @@ def _compute_coherence(
                     rated_rows.append(item)
             counts_by_rating[rating][i] = len(rated_rows)
             if rated_rows:
-                accuracy_by_rating[rating][i] = sum(1 for r in rated_rows if r.get("correct") is True) / len(rated_rows)
+                accuracy_by_rating[rating][i] = sum(1 for r in rated_rows if _label(r)) / len(rated_rows)
     return counts_by_rating, accuracy_by_rating
 
 
@@ -1057,16 +1103,8 @@ def _write_analysis_multi(
 
     probe_names = _collect_probe_names(per_sample)
     per_probe_stats: Dict[str, Any] = {}
+    per_probe_alphas: Dict[str, List[float]] = {}
     accuracy_by_alpha, alpha_vals_master = _compute_accuracy_stats(per_sample)
-
-    if accuracy_by_alpha:
-        _plot_accuracy_by_alpha(
-            alpha_vals_master,
-            [r["accuracy"] for r in accuracy_by_alpha],
-            [r["ci_low"] for r in accuracy_by_alpha],
-            [r["ci_high"] for r in accuracy_by_alpha],
-            str(plots_dir / "accuracy_vs_alpha.png"),
-        )
 
     for probe in probe_names:
         probe_rows: List[Dict[str, Any]] = []
@@ -1094,20 +1132,37 @@ def _write_analysis_multi(
             "correct_vs_incorrect_by_alpha": stats["correct_vs_incorrect_by_alpha"],
             "correctness_gee": stats["correctness_gee"],
         }
+        per_probe_alphas[probe] = alpha_vals
         if not alpha_vals_master:
             alpha_vals_master = alpha_vals
 
-        probe_slug = safe_slug(probe) or f"probe_{len(per_probe_stats)}"
-        probe_plot_dir = plots_dir / probe_slug
-        ensure_dir(str(probe_plot_dir))
+    # The statistics are written before any plot, so a plotting failure cannot lose them.
+    stats_out = {
+        "probe_names": probe_names,
+        "accuracy_by_alpha": accuracy_by_alpha,
+        "per_probe": per_probe_stats,
+    }
+    json_dump(str(analysis_dir / "stats.json"), stats_out)
 
+    if accuracy_by_alpha:
+        _plot_accuracy_by_alpha(
+            alpha_vals_master,
+            [r["accuracy"] for r in accuracy_by_alpha],
+            [r["ci_low"] for r in accuracy_by_alpha],
+            [r["ci_high"] for r in accuracy_by_alpha],
+            str(plots_dir / "accuracy_vs_alpha.png"),
+        )
+    for probe, probe_stats in per_probe_stats.items():
+        alpha_vals = per_probe_alphas[probe]
+        probe_plot_dir = plots_dir / (safe_slug(probe) or "probe")
+        ensure_dir(str(probe_plot_dir))
         _plot_score_by_alpha(
             alpha_vals,
-            [r["mean_score"] for r in stats["score_by_alpha"]],
-            [r["sem"] for r in stats["score_by_alpha"]],
+            [r["mean_score"] for r in probe_stats["score_by_alpha"]],
+            [r["sem"] for r in probe_stats["score_by_alpha"]],
             str(probe_plot_dir / "score_vs_alpha.png"),
         )
-        per_alpha_correctness = stats["correct_vs_incorrect_by_alpha"]
+        per_alpha_correctness = probe_stats["correct_vs_incorrect_by_alpha"]
         _plot_score_by_correctness_by_alpha(
             alpha_vals,
             [r["mean_correct"] for r in per_alpha_correctness],
@@ -1116,13 +1171,6 @@ def _write_analysis_multi(
             [r["sem_incorrect"] for r in per_alpha_correctness],
             str(probe_plot_dir / "score_by_correctness_by_alpha.png"),
         )
-
-    stats_out = {
-        "probe_names": probe_names,
-        "accuracy_by_alpha": accuracy_by_alpha,
-        "per_probe": per_probe_stats,
-    }
-    json_dump(str(analysis_dir / "stats.json"), stats_out)
 
     if coherence_ratings is None:
         coherence_ratings = _load_coherence_ratings(batch_dir)
@@ -1197,6 +1245,24 @@ def rehydrate_batch_analysis(
     return _write_analysis(batch_path, per_sample, analysis_name=analysis_name)
 
 
+def _check_same_alpha_conditions(per_sample: List[Dict[str, Any]]) -> None:
+    """Raise if rows that share an alpha come from different steering conditions: another alpha
+    unit, or another injected offset (alpha_value) for the same alpha."""
+    units = sorted({str(r["alpha_unit"]) for r in per_sample if r.get("alpha_unit") is not None})
+    if len(units) > 1:
+        raise ValueError(f"The batches use different alpha units {units}; aggregate batches of one unit.")
+    values: Dict[float, set] = {}
+    for r in per_sample:
+        if "alpha" in r and r.get("alpha_value") is not None:
+            values.setdefault(float(r["alpha"]), set()).add(round(float(r["alpha_value"]), 9))
+    conflicting = {a: sorted(v) for a, v in values.items() if len(v) > 1}
+    if conflicting:
+        raise ValueError(
+            f"Rows with the same alpha injected different offsets across batches {conflicting} (e.g. sigma "
+            "units of different probes); they are not the same condition."
+        )
+
+
 def aggregate_eval_batches(
     eval_dir: str,
     *,
@@ -1240,6 +1306,7 @@ def aggregate_eval_batches(
     if not per_sample:
         print(f"Warning: no per-sample items found under {eval_path}")
         return None
+    _check_same_alpha_conditions(per_sample)
 
     if _is_multi_probe_per_sample(per_sample):
         return _write_analysis_multi(

@@ -76,6 +76,8 @@ def _saved_run(tmp_path, model_cfg):
         eval_pos_std=np.array([1.0, 2.0]), eval_neg_std=np.array([1.0, 2.0]),
         score_center=np.array([0.0, 1.0]), score_scale=np.array([1.0, 2.0]),
         token_center=np.array([0.0, 1.0]), token_scale=np.array([3.0, 4.0]), resid_norm=np.ones(2),
+        reference_context=np.array([json.dumps({"kind": "generated", "mode": "assistant_all_mean"})]),
+        transfer_references=np.array([json.dumps(None)]),
     )
     np.savez(run / "tensors.npz", **tensors)
     (run / "metrics.json").write_text(json.dumps({"eval_mode_used": "read", "n_eval_pos": 4, "n_eval_neg": 4}))

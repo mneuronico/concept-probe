@@ -102,6 +102,9 @@ By default the library adds nothing to your text that you did not ask for:
 
 - **Texts to read** (`score_texts`, `extract_text_reps`, texts-mode training, eval texts) are
   read raw: the tokenizer's BOS token and the text, with no chat template and no system prompt.
+  The first position of any input is the attention sink, with activations far larger than other
+  tokens'. With a BOS it is the BOS; with tokenizers that have none (Qwen, for instance) it is
+  the text's first token, which is then left out of pooling, with a warning.
 - **Prompts to generate from** (`score_prompts`, `multi_probe_score_prompts`, training
   questions) are a user turn of the chat template, which generation needs. No system prompt is
   added unless you set one: `prompts.neutral_system` (default null), or `system_prompt=` in the
@@ -240,11 +243,20 @@ config_overrides = {"training": {"best_layer_search": {"frac": [0.2, 0.8]}}}  # 
 ## Layer selection and its statistics
 
 `best_layer` is chosen by a sweep over `training.best_layer_search` on the eval items, by
-largest Cohen's d (`sweep_select = "effect_size"`) or smallest Welch p among layers with d > 0
+largest Cohen's d (`sweep_select = "effect_size"`) or smallest p among layers with d > 0
 (`"p_value"`). Choosing the layer and measuring its effect on the same items overstates the
 effect, so by default (`evaluation.selection_split = 0.5`) the layer is chosen on half of the
 eval items and `best_d`, `best_p` and `best_d_ci95` (bootstrap, `evaluation.n_bootstrap`) are
-measured on the other half. `metrics.json` also reports:
+measured on the other half.
+
+Generated eval items are paired: both poles answer the same `eval_questions`, and a question
+moves both of its answers the same way. So in shared and opposed modes (`eval_paired` in
+`metrics.json`) the split, the bootstrap and the permutations keep each question's two answers
+together, and p-values come from the paired t-test; a question whose answer is empty on one pole
+is left out on both. Splitting the poles independently would let a question help pick the layer
+on one pole and then be measured on the other, which biases the held-out d (toward negative
+values when there is no effect). Eval texts, which are independent items, use Welch's test and
+independent resampling. `metrics.json` also reports:
 
 - `selection`: `"split"`, `"all_eval"` (too few items to split, or `selection_split = null`:
   `best_d` is then post-selection and a warning says so) or `"fixed_layer"`.
@@ -265,10 +277,19 @@ Each probe stores two references per layer, both from the evaluation items:
 
 A single token spreads much more than a mean over a text's tokens, which averages most of the
 token-to-token variation away, so the two scales differ (by 1.9-3.4x across layers in a 1B
-Llama on ~16-token texts). Scoring functions save standardized scores next to the raw ones, each with its own
-reference: per-token z (`scores_z_per_layer`, `scores_agg_z`, shown in the heatmaps) and the z of
-an item's mean (`score_mean_z`). In both, 0 is the midpoint between the poles, so positive leans
-toward the positive pole, and 1 is a within-pole SD.
+Llama on ~16-token texts). Scoring functions save standardized scores next to the raw ones, each
+with its own reference: per-token z (`scores_z_per_layer`, `scores_agg_z`, shown in the heatmaps)
+and the z of an item's mean (`score_mean_z`). In both, 0 is the midpoint between the poles, so
+positive leans toward the positive pole, and 1 is a within-pole SD.
+
+References only apply to inputs read the way they were measured (`reference_context` in
+`metrics.json`). In shared and opposed modes the evaluation's references come from completions
+generated in a chat, and they standardize `score_prompts`; texts read raw sit elsewhere entirely
+(in a 1B Llama, the eval texts of the negative pole came out on the positive side of the
+generated-completion midpoint). `score_texts` therefore standardizes only with references
+measured on texts read with the same role, system prompt and prompt: the evaluation's in texts
+mode, the transfer check's (the concept's eval texts) in shared and opposed modes. Without them it
+saves only raw projections, with a warning.
 
 Steering adds `alpha * v_l` to every token position of each steered layer. `alpha_unit`:
 
@@ -280,7 +301,13 @@ Steering adds `alpha * v_l` to every token position of each steered layer. `alph
 
 With `steer_distribute = true` (default) alpha is split across the steered layers.
 `random_scoring_vector` / `random_steering_vector` use one random direction per probe, derived
-from its name and run directory, so the control is the same vector in every function.
+from its name and run directory, so the control is the same vector in every function. It is the
+same direction at every layer (with each layer's norm): concept vectors of adjacent layers point
+nearly the same way, so independent random directions would partly cancel and push the residual
+stream about half as far as the concept.
+
+Each prompt and alpha gets its own files, so repeated alphas (several samples) do not overwrite
+each other. A `batch_subdir` that already holds files raises unless `overwrite=True`.
 
 ## Variance-normalized directions
 
@@ -311,12 +338,21 @@ correctness. Their analysis never pools correct and incorrect answers across alp
 moves both the scores and the accuracy, and each item recurs at every alpha):
 
 - per alpha: accuracy with 95% Wilson intervals, mean score, and correct vs incorrect scores;
-- across alphas: a logistic GEE of correctness on the standardized score with alpha as a
-  covariate, clustered by item (`correctness_gee` in `stats.json`).
+- across alphas: a logistic GEE of correctness on the score with alpha as a covariate, clustered
+  by item, with standard errors corrected for few items (`correctness_gee` in `stats.json`). The
+  coefficient is per SD of the score within an alpha: the SD across alphas would include the
+  steering shift, and the effect size would grow with the range of alphas run.
+
+A correctness label is a bool (Python or numpy), 0/1, or None for an unlabelled row; anything
+else raises. Prompts come from at most one of `prompt_builder`, `prompt_template` (formatted with
+the item's fields; a string item is `{"prompt": text}`) and `prompt_prefix`, which is always
+applied; without them the prompt is `item["prompt"]`. `aggregate_eval_batches` refuses batches
+whose rows share an alpha but not the steering unit or the injected offset.
 
 `generate_multi_probe_report` shows one alpha at a time. Its correctness model has alpha as a
 covariate, cross-validation folds that keep all rows of an item together, and standard errors
-clustered by item. Items are identified by their prompt, so `aggregate_eval_batches` treats the
+clustered by item. Next to each out-of-fold metric it shows what alpha alone predicts, since
+steering can drive accuracy by itself: the probe scores add only the difference. Items are identified by their prompt, so `aggregate_eval_batches` treats the
 same prompt in two batches as one item and different prompts that share an index as two.
 
 With the default evaluator (exact match against `expected`), `marker` / `marker_position` pick
@@ -454,6 +490,20 @@ GitHub Actions CI runs the same lightweight checks and also builds source and wh
 - **Statistics**: eval analyses no longer pool correct vs incorrect across alphas (per-alpha
   stats plus a GEE clustered by item), accuracy uses Wilson intervals, and the multi-probe report
   groups its CV folds and standard errors by item, adjusts for alpha and shows one alpha at a time.
+- **Statistics that respect the design**: generated eval items stay paired by question in the
+  split, the bootstrap, the permutations and the p-values (independent splits biased the
+  held-out d downward); the GEE effect size is per within-alpha SD and its SEs are corrected for
+  few items; the report shows an alpha-only baseline next to its correctness model.
+- **z references by context**: `score_texts` standardizes only with references measured on texts
+  read the same way (the transfer check's in shared/opposed modes), instead of with the
+  generated-completion references, which put raw texts on the wrong side of the midpoint.
+- **More safeguards**: tokenizers without a BOS leave the first text token (the attention sink)
+  out of pooling; the random control is one direction at every layer (independent directions
+  pushed about half as far); a null system prompt means none (it became the text "None");
+  questions carrying their own system message raise; repeated alphas get their own files; a
+  reused batch directory raises unless `overwrite=True`; a steering probe outside `probes` is
+  checked against the model; correctness labels are normalized (numpy bools counted as wrong);
+  the eval analysis no longer crashes at 0% or 100% accuracy, or on set / numpy values.
 - **No silent stand-ins**: an item with no tokens of its own is left out (it used to be pooled
   over the whole prompt, system prompt included); fewer than 10 eval items per pole warns, and
   there are 20 default `eval_questions` instead of 5; eval items are clustered by their prompt

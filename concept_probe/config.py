@@ -63,12 +63,16 @@ class ConceptSpec:
         unknown = sorted(set(base) - fields)
         if unknown:
             raise ValueError(f"Unknown concept keys: {', '.join(unknown)}; expected some of {sorted(fields)}.")
+        for key in ("name", "pos_label", "neg_label"):
+            if key in base and base[key] is None:
+                raise ValueError(f"concept.{key} must be a string, not null.")
         return cls(
             name=str(base.get("name", "concept")),
             pos_label=str(base.get("pos_label", "positive")),
             neg_label=str(base.get("neg_label", "negative")),
-            pos_system=str(base.get("pos_system", "")),
-            neg_system=str(base.get("neg_system", "")),
+            # null means no system prompt, like "" (str(None) would make it the text "None")
+            pos_system=str(base.get("pos_system") or ""),
+            neg_system=str(base.get("neg_system") or ""),
             eval_pos_texts=list(base.get("eval_pos_texts", [])),
             eval_neg_texts=list(base.get("eval_neg_texts", [])),
             train_pos_texts=list(base.get("train_pos_texts", [])),
