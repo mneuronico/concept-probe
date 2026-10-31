@@ -311,3 +311,54 @@ def test_without_eval_the_metrics_are_null_not_zero(tmp_path, monkeypatch):
     _, metrics, t, _ = _train(tmp_path, monkeypatch, "texts", concept=_concept(eval_pos_texts=[], eval_neg_texts=[]))
     assert metrics["best_d"] is None and metrics["best_p"] is None and metrics["selection"] is None
     assert np.all(np.isnan(t["sweep_d"])) and np.all(np.isnan(t["token_scale"]))
+
+
+def test_few_eval_items_warn(tmp_path, monkeypatch):
+    _, _, _, events = _train(tmp_path, monkeypatch, "shared")  # 2 eval questions per pole
+    assert any("Only 2 positive and 2 negative eval items" in w for w in _warnings(events))
+
+
+def test_default_eval_questions_are_many_and_held_out():
+    prompts = resolve_config()["prompts"]
+    assert len(prompts["eval_questions"]) >= probe_mod.MIN_EVAL_ITEMS_PER_POLE
+    assert not set(prompts["eval_questions"]) & set(prompts["train_questions"])
+
+
+def _generate_with_an_empty_reply(empty_question):
+    def generate(model, tokenizer, system, prompts, *args, **kwargs):
+        out = _fake_generate_batch(model, tokenizer, system, prompts, *args, **kwargs)
+        for i, p in enumerate(prompts):
+            if p == empty_question and system == "POS":
+                ids, plen = out[i]
+                out[i] = (torch.cat([ids[:plen], torch.tensor([ord("$")])]), plen)  # EOS right away
+        return out
+    return generate
+
+
+def test_an_empty_completion_is_left_out_instead_of_pooling_the_prompt(tmp_path, monkeypatch):
+    monkeypatch.setattr(probe_mod, "forward_hidden_states_all_layers", _fake_forward)
+    monkeypatch.setattr(probe_mod, "generate_batch", _generate_with_an_empty_reply("q2"))
+    cfg = resolve_config({
+        "prompts": {"train_questions": ["q1", "q2", "q3"], "eval_questions": ["e1", "e2+"]},
+        "evaluation": {"n_permutations": 10, "n_bootstrap": 10},
+        "plots": {"enabled": False}, "output": {"console": False, "pretty_json_log": False},
+    })
+    bundle = SimpleNamespace(model_id="fake", tokenizer=_CharChatTok(), model=object(), num_layers=2)
+    ConceptProbe(model_bundle=bundle, config=cfg, concept=_concept(), run_dir=str(tmp_path),
+                 logger=JsonlLogger(str(tmp_path / "log.jsonl"))).train()
+    metrics = json.loads((tmp_path / "metrics.json").read_text())
+    t = np.load(tmp_path / "tensors.npz")
+    assert metrics["dropped_items"] == {"train_pos": [1]}
+    assert (metrics["n_train_pos"], metrics["n_train_neg"]) == (3, 3)  # generated; one left out of pooling
+    np.testing.assert_allclose(t["train_pos_reps"][:, 0, 0], [1.0, 1.0])  # only real completions
+
+
+def test_a_side_with_no_tokens_at_all_raises(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="no item has tokens"):
+        _train(tmp_path, monkeypatch, "texts", concept=_concept(train_pos_texts=["", ""]))
+
+
+def test_extract_text_reps_names_an_empty_text(monkeypatch):
+    monkeypatch.setattr(probe_mod, "forward_hidden_states_all_layers", _fake_forward)
+    with pytest.raises(probe_mod.EmptySpanError, match=r"texts\[1\]"):
+        probe_mod.extract_text_reps(object(), _CharChatTok(), ["pp", ""])

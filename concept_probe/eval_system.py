@@ -161,6 +161,21 @@ def _wilson_interval(successes: int, n: int, z: float = 1.959964) -> Tuple[float
     return float(max(0.0, center - half)), float(min(1.0, center + half))
 
 
+def item_key(row: Dict[str, Any]) -> Optional[str]:
+    """Identity of an eval item, for clustering its rows (one per alpha).
+
+    The prompt identifies the item, so the same item run in several batches is one cluster and
+    different items that share an index in different batches are not. Rows without a prompt fall
+    back to their batch and index.
+    """
+    prompt = row.get("prompt")
+    if prompt is not None:
+        return json.dumps(prompt, sort_keys=True, ensure_ascii=False)
+    if row.get("item_index") is None:
+        return None
+    return f"{row.get('batch_name', '')}#{row['item_index']}"
+
+
 def _correctness_gee(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Logistic GEE of correctness on the probe score, adjusting for alpha, clustered by item.
 
@@ -171,12 +186,12 @@ def _correctness_gee(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     usable = [
         r for r in rows
         if _is_bool(r.get("correct")) and np.isfinite(_finite_float(r.get("score_mean")))
-        and r.get("item_index") is not None and "alpha" in r
+        and item_key(r) is not None and "alpha" in r
     ]
     out: Dict[str, Any] = {
         "model": "logit P(correct) ~ score_z + C(alpha); GEE, exchangeable within item, robust SE",
         "n_rows": len(usable),
-        "n_items": len({r["item_index"] for r in usable}),
+        "n_items": len({item_key(r) for r in usable}),
         "note": None,
     }
     y = np.array([1.0 if r["correct"] else 0.0 for r in usable])
@@ -197,7 +212,8 @@ def _correctness_gee(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     columns = [np.ones(len(usable)), (score - score.mean()) / sd]
     columns += [np.array([1.0 if float(r["alpha"]) == a else 0.0 for r in usable]) for a in alphas[1:]]
     X = np.column_stack(columns)
-    groups = np.array([r["item_index"] for r in usable])
+    keys = sorted({item_key(r) for r in usable})
+    groups = np.array([keys.index(item_key(r)) for r in usable])
     try:
         fit = sm.GEE(y, X, groups=groups, family=sm.families.Binomial(),
                      cov_struct=sm.cov_struct.Exchangeable()).fit()
@@ -513,6 +529,10 @@ def run_scored_eval(
         for item in normalized_items
     ]
 
+    if evaluator is not None and marker is not None:
+        raise ValueError(
+            "marker only applies to the default evaluator; pass it to your evaluator through evaluator_kwargs."
+        )
     if evaluator is None:
         missing_expected = [
             i for i, item in enumerate(normalized_items) if expected_key not in item
@@ -646,6 +666,8 @@ def run_multi_scored_eval(
     coherence_model: Optional[str] = None,
     coherence_max_per_request: int = 8,
     coherence_env_path: Optional[str] = None,
+    marker: Optional[str] = None,
+    marker_position: str = "after",
     **score_kwargs: Any,
 ) -> EvalRunResult:
     from .multi_probe import multi_probe_score_prompts
@@ -681,6 +703,10 @@ def run_multi_scored_eval(
         for item in normalized_items
     ]
 
+    if evaluator is not None and marker is not None:
+        raise ValueError(
+            "marker only applies to the default evaluator; pass it to your evaluator through evaluator_kwargs."
+        )
     if evaluator is None:
         missing_expected = [
             i for i, item in enumerate(normalized_items) if expected_key not in item
@@ -696,6 +722,8 @@ def run_multi_scored_eval(
                 completion,
                 item,
                 expected_key=expected_key,
+                marker=marker,
+                marker_position=marker_position,
             )
 
         evaluator = _default_eval
@@ -1051,7 +1079,9 @@ def _write_analysis_multi(
             probe_rows.append(
                 {
                     "alpha": row.get("alpha"),
+                    "prompt": row.get("prompt"),
                     "item_index": row.get("item_index"),
+                    "batch_name": row.get("batch_name"),
                     "correct": row.get("correct"),
                     "score_mean": score_map.get(probe),
                 }

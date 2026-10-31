@@ -1,4 +1,5 @@
 """Model-free tests of what the library feeds the model, and of what score_texts/score_prompts return."""
+import os
 from types import SimpleNamespace
 
 import numpy as np
@@ -149,3 +150,61 @@ def test_a_repeated_run_name_does_not_mix_runs(tmp_path, monkeypatch):
     with pytest.raises(FileExistsError):
         multi_probe_score_prompts([probe], ["hi"], **kwargs)
     multi_probe_score_prompts([probe], ["hi"], overwrite=True, **kwargs)
+
+
+# ------------------------------------------------------------- multi-probe settings
+def _cfg(**sections):
+    base = {"output": {"console": False}, "plots": {"heatmap_html": False}}
+    base.update(sections)
+    return base
+
+
+def test_multi_probe_refuses_probes_from_different_model_settings(tmp_path, monkeypatch):
+    a = _probe(tmp_path, monkeypatch, "a")
+    b = _probe(tmp_path, monkeypatch, "b", config=_cfg(model={"dtype": "float32"}))
+    with pytest.raises(ValueError, match="dtype"):
+        multi_probe_score_prompts([a, b], ["hi"], output_root=str(tmp_path / "m"))
+
+
+def test_multi_probe_generation_settings_must_agree_or_be_passed(tmp_path, monkeypatch):
+    a = _probe(tmp_path, monkeypatch, "a")
+    b = _probe(tmp_path, monkeypatch, "b", config=_cfg(steering={"steer_temperature": 0.2}))
+    with pytest.raises(ValueError, match="steer_temperature"):
+        multi_probe_score_prompts([a, b], ["hi"], output_root=str(tmp_path / "m"))
+    out = multi_probe_score_prompts([a, b], ["hi"], temperature=0.5, output_root=str(tmp_path / "m"))
+    assert out["results"][0]["completion"] == "pp"
+
+
+def test_multi_probe_steers_with_the_steering_probe_settings(tmp_path, monkeypatch):
+    import json
+
+    a = _probe(tmp_path, monkeypatch, "a")
+    b = _probe(tmp_path, monkeypatch, "b", config=_cfg(steering={"steer_distribute": False}))
+    out = multi_probe_score_prompts([a, b], ["hi"], alphas=[1.0], steer_probe=1, steer_layers=[0],
+                                    output_root=str(tmp_path / "m"))
+    config = json.load(open(os.path.join(out["run_dir"], "config.json")))
+    assert config["steering"]["steer_distribute"] is False
+
+
+# ------------------------------------------------------------- marker
+def test_the_multi_probe_eval_applies_the_marker(tmp_path, monkeypatch):
+    from concept_probe import run_multi_scored_eval
+
+    probe = _probe(tmp_path, monkeypatch, "a")
+    items = [{"prompt": "hi", "expected": "pp"}]
+    kwargs = dict(analyze=False, output_root=str(tmp_path / "m"))
+    assert run_multi_scored_eval([probe], items, **kwargs).per_sample[0]["correct"] is True
+    # the completion 'pp' has no ':', so with the marker it cannot match
+    assert run_multi_scored_eval([probe], items, marker=":", **kwargs).per_sample[0]["correct"] is False
+
+
+def test_a_marker_with_a_custom_evaluator_raises():
+    from concept_probe import run_multi_scored_eval, run_scored_eval
+
+    fake = SimpleNamespace(console=None, concept=SimpleNamespace(name="x"))
+    custom = lambda completion, item: {"correct": True}  # noqa: E731
+    with pytest.raises(ValueError, match="marker"):
+        run_scored_eval(fake, [{"prompt": "hi"}], evaluator=custom, marker=":")
+    with pytest.raises(ValueError, match="marker"):
+        run_multi_scored_eval([fake], [{"prompt": "hi"}], evaluator=custom, marker=":")
+

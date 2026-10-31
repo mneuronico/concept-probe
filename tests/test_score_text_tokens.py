@@ -83,3 +83,25 @@ def test_layer_mismatch_raises(monkeypatch):
         assert "Layer mismatch" in str(e)
     else:
         raise AssertionError("expected ValueError on layer mismatch")
+
+
+class _BosTokenizer(_FakeTokenizer):
+    bos_token_id = 1
+
+    def __call__(self, text, return_tensors=None, return_offsets_mapping=False, add_special_tokens=True):
+        assert not add_special_tokens  # only the BOS is added, as role="raw" does everywhere
+        return super().__call__(text, return_tensors, return_offsets_mapping, add_special_tokens)
+
+
+def _fake_forward_3(model, input_ids, **kwargs):
+    base = torch.tensor([[9.0, 9, 9, 9], [1, 2, 3, 4], [5, 6, 7, 8]])
+    return [base.clone(), base.clone(), base.clone()]
+
+
+def test_the_text_is_read_like_role_raw(monkeypatch):
+    monkeypatch.setattr(probe_mod, "forward_hidden_states_all_layers", _fake_forward_3)
+    r = concept_probe.score_text_tokens(object(), _BosTokenizer(), CV, "siete car")
+    assert r["token_ids"].tolist() == [1, 10, 11]
+    assert r["offset_mapping"] == [[0, 0], [0, 3], [3, 7]]
+    monkeypatch.setattr(probe_mod, "forward_hidden_states_all_layers", _fake_forward)
+    assert concept_probe.score_text_tokens(object(), _BosTokenizer(), CV, "x", add_bos=False)["token_ids"].tolist() == [10, 11]

@@ -4,6 +4,8 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+from .eval_system import item_key
+
 
 def _load_items(path: Path) -> Tuple[List[Dict[str, object]], Path]:
     if path.is_dir():
@@ -46,7 +48,7 @@ def _build_rows(items: List[Dict[str, object]], probe_names: List[str]) -> List[
         row = {
             "correct": bool(correct),
             "alpha": None if alpha is None else float(alpha),
-            "item_index": item.get("item_index"),
+            "item_key": item_key(item),
             "scores": {},
         }
         ok = True
@@ -98,8 +100,9 @@ def _fit_model(rows: List[Dict[str, object]], probe_names: List[str], seed: int 
     """Logistic model of correctness from probe scores, with alpha as a categorical covariate.
 
     Metrics are pooled out-of-fold predictions from K-fold CV in which all rows of an item
-    (one per alpha) fall in the same fold, so no item is both trained and tested on; rows
-    without an item index are stratified by class instead. Coefficients and p-values come
+    (one per alpha; items are identified by their prompt, see ``eval_system.item_key``) fall in
+    the same fold, so no item is both trained and tested on; rows without an item identity are
+    stratified by class instead. Coefficients and p-values come
     from a single fit on all rows, with standard errors clustered by item when items repeat.
     """
     if not rows:
@@ -112,7 +115,7 @@ def _fit_model(rows: List[Dict[str, object]], probe_names: List[str], seed: int 
     )
     y = np.array([1 if r["correct"] else 0 for r in rows], dtype=np.int32)
     groups = np.array(
-        [r["item_index"] if r.get("item_index") is not None else f"row{i}" for i, r in enumerate(rows)],
+        [r["item_key"] if r.get("item_key") is not None else f"row{i}" for i, r in enumerate(rows)],
         dtype=object,
     )
     clustered = len(set(groups.tolist())) < len(rows)

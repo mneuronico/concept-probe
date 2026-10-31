@@ -127,7 +127,9 @@ The chat template itself can add or change things, and it differs by model:
   once when that happens to a text.
 
 `model.chat_template` (a Jinja string) replaces the tokenizer's template for everything the
-bundle does. To see exactly what goes into the model, before running anything:
+bundle does. `score_text_tokens`, the low-level per-token scorer, reads its text raw too (BOS +
+text; `add_bos=False` drops the BOS). To see exactly what goes into the model, before running
+anything:
 
 ```python
 from concept_probe import preview_input
@@ -204,7 +206,13 @@ training, read the same way:
   (null by default) overrides the system prompt, with a warning.
 - **Shared and opposed modes**: completions generated for `prompts.eval_questions` under
   `pos_system` / `neg_system`, pooled with `readout.train_mode`, like the training completions.
-  `eval_questions` should not repeat the training questions; training warns if they do.
+  `eval_questions` (20 by default) should not repeat the training questions; training warns if
+  they do.
+
+With fewer than 10 eval items per pole, training warns that the layer choice and `best_d` rest
+on very few items. An item with no tokens of its own (a completion that ends right away, or an
+empty text) is left out with a warning and listed under `dropped_items` in `metrics.json`; it is
+never pooled over the prompt in its place, which would put the system prompt into the vector.
 
 In shared and opposed modes, eval texts given with the concept are a **transfer check**: they are
 read with `training.train_text_role` (raw by default), scored at the chosen layer and reported
@@ -308,7 +316,18 @@ moves both the scores and the accuracy, and each item recurs at every alpha):
 
 `generate_multi_probe_report` shows one alpha at a time. Its correctness model has alpha as a
 covariate, cross-validation folds that keep all rows of an item together, and standard errors
-clustered by item.
+clustered by item. Items are identified by their prompt, so `aggregate_eval_batches` treats the
+same prompt in two batches as one item and different prompts that share an index as two.
+
+With the default evaluator (exact match against `expected`), `marker` / `marker_position` pick
+the part of the completion to compare in both `run_scored_eval` and `run_multi_scored_eval`; a
+`marker` together with your own `evaluator` raises, since it would not be used.
+
+`multi_probe_score_prompts` runs one model for every probe, so the probes must come from the same
+model settings (`model_id`, `dtype`, `use_4bit`, chat template and its date). The generation
+settings (system prompt, `max_new_tokens`, sampling, `temperature`, `top_p`) come from the
+arguments or, when not passed, from the probes' configs, which must then agree. The steering
+layers and their distribution come from the steering probe's config.
 
 Coherence rating sends completions to the external Groq API, so it is off by default
 (`rate_coherence=False`). The key comes from `GROQ_API_KEY` in the environment, or from a file
@@ -435,6 +454,12 @@ GitHub Actions CI runs the same lightweight checks and also builds source and wh
 - **Statistics**: eval analyses no longer pool correct vs incorrect across alphas (per-alpha
   stats plus a GEE clustered by item), accuracy uses Wilson intervals, and the multi-probe report
   groups its CV folds and standard errors by item, adjusts for alpha and shows one alpha at a time.
+- **No silent stand-ins**: an item with no tokens of its own is left out (it used to be pooled
+  over the whole prompt, system prompt included); fewer than 10 eval items per pole warns, and
+  there are 20 default `eval_questions` instead of 5; eval items are clustered by their prompt
+  across batches; multi-probe scoring requires one model and agreeing generation settings
+  instead of taking the first probe's; `run_multi_scored_eval` takes `marker`, and a `marker`
+  with a custom evaluator raises; `score_text_tokens` adds only the BOS, like every raw read.
 - **Other defaults**: `use_4bit` false (NF4 when on); coherence rating off, and no `.env` read
   unless passed; `train_concept_from_json` follows the config's steering settings; the random
   control vector is the same for a probe in every function; `metrics.json` reports null instead

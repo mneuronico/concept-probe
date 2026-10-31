@@ -8,6 +8,7 @@ import numpy as np
 from .logger import JsonlLogger
 from .modeling import apply_chat, attention_mask_from_ids
 from .probe import (
+    _MODEL_IDENTITY_KEYS,
     ConceptProbe,
     PromptLike,
     _pack_generation_logits_arrays,
@@ -44,6 +45,20 @@ def _resolve_steer_probe(
         if safe_slug(str(probe.concept.name)) == target:
             return probe
     raise ValueError(f"steer_probe '{steer_probe}' not found in probes.")
+
+
+def _shared_setting(probes: List[ConceptProbe], section: str, key: str, explicit: Any, argument: str) -> Any:
+    """A setting the whole run uses: ``explicit`` if given, else the probes' common config value.
+
+    Probes whose configs disagree raise, instead of the first probe's value being used silently.
+    """
+    if explicit is not None:
+        return explicit
+    values = [probe.config.get(section, {}).get(key) for probe in probes]
+    if any(v != values[0] for v in values[1:]):
+        named = ", ".join(f"{p.concept.name}={v!r}" for p, v in zip(probes, values))
+        raise ValueError(f"The probes disagree on {section}.{key} ({named}); pass {argument}= to choose one.")
+    return values[0]
 
 
 def _render_progress(current: int, total: int, *, width: int = 28) -> str:
@@ -118,8 +133,11 @@ def multi_probe_score_prompts(
 ) -> Dict[str, Any]:
     """Generate (optionally steered by one probe) completions and score them with every probe.
 
-    Prompts follow :meth:`ConceptProbe.score_prompts`: a user turn after ``system_prompt`` (or
-    the first probe's ``prompts.neutral_system``) if one is set, and ``score_mean_by_probe``
+    All probes must come from the same model and model settings. Prompts follow
+    :meth:`ConceptProbe.score_prompts`: a user turn after the system prompt, if one is set.
+    Generation settings (system prompt, max_new_tokens, sampling, temperature, top_p) come
+    from the arguments, or else from the probes' configs, which must then agree; the steering
+    layers and distribution come from the steering probe's config. ``score_mean_by_probe``
     averages the completion's tokens up to and not including the end-of-sequence token. A
     ``run_name`` whose directory already holds files raises unless ``overwrite=True``.
     """
@@ -142,10 +160,20 @@ def multi_probe_score_prompts(
     for probe in probes:
         probe._require_trained()
 
+    # Every probe is scored on the activations of probes[0]'s model, so all of them must have been
+    # trained on that model, with the same settings that shape the activations.
     model_bundle = probes[0].model_bundle
     for probe in probes[1:]:
-        if probe.model_bundle.model_id != model_bundle.model_id:
-            raise ValueError("All probes must use the same model_id for multi-probe scoring.")
+        mismatched = [
+            k for k in _MODEL_IDENTITY_KEYS
+            if probe.config.get("model", {}).get(k) != probes[0].config.get("model", {}).get(k)
+        ]
+        if probe.model_bundle.model_id != model_bundle.model_id or mismatched:
+            raise ValueError(
+                f"Probe {probe.concept.name!r} was trained with other model settings than "
+                f"{probes[0].concept.name!r} ({', '.join(mismatched) or 'model_id'}); multi-probe scoring "
+                "runs one model for all probes."
+            )
 
     steer_probe_obj = _resolve_steer_probe(probes, steer_probe)
 
@@ -161,15 +189,15 @@ def multi_probe_score_prompts(
         alphas = [0.0]
         nonzero_alpha_requested = False
 
-    sys_prompt = probes[0].config["prompts"].get("neutral_system") if system_prompt is None else system_prompt
-    steer_cfg = probes[0].config.get("steering", {})
-    max_new_tokens = max_new_tokens if max_new_tokens is not None else steer_cfg.get("steer_max_new_tokens", 128)
-    greedy = greedy if greedy is not None else (not steer_cfg.get("steer_sampling", False))
-    temperature = temperature if temperature is not None else steer_cfg.get("steer_temperature", 0.7)
-    top_p = top_p if top_p is not None else steer_cfg.get("steer_top_p", 0.9)
+    # Settings of the generation itself: an explicit argument, or the value all probes' configs share.
+    sys_prompt = _shared_setting(probes, "prompts", "neutral_system", system_prompt, "system_prompt")
+    max_new_tokens = _shared_setting(probes, "steering", "steer_max_new_tokens", max_new_tokens, "max_new_tokens")
+    greedy = greedy if greedy is not None else not _shared_setting(probes, "steering", "steer_sampling", None, "greedy")
+    temperature = _shared_setting(probes, "steering", "steer_temperature", temperature, "temperature")
+    top_p = _shared_setting(probes, "steering", "steer_top_p", top_p, "top_p")
     save_html = probes[0].config["plots"].get("heatmap_html", True) if save_html is None else save_html
     save_segments = False if save_segments is None else save_segments
-    do_steering = bool(steer_cfg.get("do_steering", True))
+    do_steering = bool(probes[0].config.get("steering", {}).get("do_steering", True))
     save_token_scores_npz = bool(probes[0].config.get("output", {}).get("save_token_scores_npz", True))
     if save_generation_logits is None:
         save_generation_logits = bool(probes[0].config.get("output", {}).get("save_generation_logits", False))
@@ -203,8 +231,6 @@ def multi_probe_score_prompts(
             scoring_vectors_by_probe.append(probe.concept_vectors)
     steering_seed: Optional[int] = None
     steering_vectors: Optional[np.ndarray] = None
-    if steer_distribute is None:
-        steer_distribute = steer_cfg.get("steer_distribute", True)
 
     if nonzero_alpha_requested and not do_steering:
         probes[0]._warn(
@@ -231,7 +257,10 @@ def multi_probe_score_prompts(
             f"(same-norm per layer, base_seed={base_random_seed})."
         )
     if steer_probe_obj is not None:
+        # How to steer comes from the steering probe's config (its layers, window and distribution).
         steer_layer_list = _steer_layer_list(steer_probe_obj, steer_layers, steer_window_radius)
+        if steer_distribute is None:
+            steer_distribute = steer_probe_obj.config["steering"]["steer_distribute"]
         if nonzero_alpha_requested:
             steer_probe_obj._check_alpha_unit(alpha_unit)
     else:

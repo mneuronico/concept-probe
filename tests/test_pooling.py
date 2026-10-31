@@ -3,7 +3,7 @@ import numpy as np
 import torch
 import pytest
 
-from concept_probe.probe import reps_from_hs_layers, token_scores_from_hs_layers
+from concept_probe.probe import EmptySpanError, reps_from_hs_layers, token_scores_from_hs_layers
 
 # 2 layers, 4 tokens, dim 2; token t has value (t+1) in both dims, layer 1 doubled.
 HS = [
@@ -31,14 +31,11 @@ def test_assistant_modes_use_completion_span():
     np.testing.assert_allclose(reps, [[4, 4], [8, 8]])
 
 
-def test_assistant_fallback_warns_once():
-    messages = []
-    reps = reps_from_hs_layers(
-        HS, prompt_len=4, mode="assistant_all_mean", last_k=2, warn=messages.append
-    )
-    np.testing.assert_allclose(reps, [[2.5, 2.5], [5, 5]])  # full-sequence fallback
-    assert len(messages) == 1
-    assert "no completion tokens" in messages[0]
+def test_an_empty_span_raises_instead_of_pooling_the_prompt():
+    # pooling the whole sequence instead would put the prompt (and its system prompt) in its place
+    for mode in ("assistant_all_mean", "assistant_last", "assistant_last_k_mean"):
+        with pytest.raises(EmptySpanError):
+            reps_from_hs_layers(HS, prompt_len=4, mode=mode, last_k=2)
 
 
 def test_unknown_mode_raises():

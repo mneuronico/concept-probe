@@ -341,6 +341,8 @@ def select_layers(selection: Dict[str, Any], best_layer: int, num_layers: int) -
 
 
 ALPHA_UNITS = ("raw", "sigma", "resid_norm")
+# Below this many eval items per pole, training warns that the layer choice and d are unreliable.
+MIN_EVAL_ITEMS_PER_POLE = 10
 SWEEP_SELECTS = ("effect_size", "p_value")
 
 
@@ -879,20 +881,24 @@ READ_MODES = (
 )
 
 
+class EmptySpanError(ValueError):
+    """An item has no tokens of its own to pool: an empty completion or an empty text."""
+
+
 def reps_from_hs_layers(
     hs_layers: List[torch.Tensor],
     prompt_len: Optional[int],
     mode: str,
     last_k: int,
-    warn: Optional[Callable[[str], None]] = None,
     span_end: Optional[int] = None,
 ) -> np.ndarray:
     """Pool each layer's hidden states ``(seq_len, dim)`` into one rep per layer.
 
     ``sequence_*`` modes read the whole sequence, template tokens included. ``assistant_*``
     modes read the span ``[prompt_len, span_end)`` (``span_end`` defaults to the end of the
-    sequence): a generated completion, or the own tokens of a read text. An empty span falls
-    back to the whole sequence, with a warning.
+    sequence): a generated completion, or the own tokens of a read text. An empty span raises
+    :class:`EmptySpanError` rather than pooling something else (the prompt and system prompt
+    would stand in for the missing text).
     """
     if mode not in READ_MODES:
         raise ValueError(f"Unknown mode: {mode}")
@@ -911,13 +917,7 @@ def reps_from_hs_layers(
         start = int(prompt_len)
         end = total if span_end is None else min(int(span_end), total)
         if start >= end:
-            if warn is not None:
-                warn(
-                    f"mode={mode}: no completion tokens (span [{start}, {end}) of seq_len={total}); "
-                    "falling back to full-sequence pooling, which includes prompt/system tokens and "
-                    "can leak the system-prompt difference into the concept vector."
-                )
-            start, end = 0, total
+            raise EmptySpanError(f"mode={mode}: no tokens to pool (span [{start}, {end}) of a {total}-token input)")
 
     for l in range(num_layers):
         hs = hs_layers[l]
@@ -972,7 +972,10 @@ def extract_completion_reps(
             messages = list(prompt)
         full_ids, plen = _completion_input_ids(tokenizer, messages, completion)
         hs_layers = forward_hidden_states_all_layers(model, full_ids)
-        out_reps.append(reps_from_hs_layers(hs_layers, prompt_len=plen, mode=pool, last_k=last_k))
+        try:
+            out_reps.append(reps_from_hs_layers(hs_layers, prompt_len=plen, mode=pool, last_k=last_k))
+        except EmptySpanError as exc:
+            raise EmptySpanError(f"pairs[{len(out_reps)}]: {exc}") from None
     return np.stack(out_reps, axis=0).astype(np.float32)
 
 
@@ -1004,7 +1007,10 @@ def extract_text_reps(
                                                 warn_prefix=f"texts[{i}]")
         hs_layers = forward_hidden_states_all_layers(model, ids)
         for p in pools:
-            out[p].append(reps_from_hs_layers(hs_layers, prompt_len=start, mode=p, last_k=last_k, span_end=end))
+            try:
+                out[p].append(reps_from_hs_layers(hs_layers, prompt_len=start, mode=p, last_k=last_k, span_end=end))
+            except EmptySpanError as exc:
+                raise EmptySpanError(f"texts[{i}]: {exc}") from None
     arrays = {p: np.stack(v, axis=0).astype(np.float32) for p, v in out.items()}
     return arrays[pool] if isinstance(pool, str) else arrays
 
@@ -1061,14 +1067,15 @@ def score_text_tokens(
     layer_indices: Optional[List[int]] = None,
     reference_layer: Optional[int] = None,
     unit_norm: bool = False,
-    add_special_tokens: bool = True,
+    add_bos: bool = True,
 ) -> Dict[str, Any]:
     """Score every token of a RAW text against the per-layer concept directions, in memory.
 
     Low-level read primitive for callers that need per-token, per-layer scores together with
-    character offsets (e.g. to target a specific word/subtoken), without the artifact-writing or
-    chat-template wrapping of ``ConceptProbe.score_texts``. The text is tokenized as-is (no chat
-    template); the forward pass uses the same all-layers capture as training (with the final-norm
+    character offsets (e.g. to target a specific word/subtoken), without the artifact-writing of
+    ``ConceptProbe.score_texts``. The text is read as ``role="raw"`` reads it everywhere else: the
+    BOS token (if the tokenizer has one) and the text, with no chat template and no other special
+    tokens. The forward pass uses the same all-layers capture as training (with the final-norm
     fix), so layer ``l`` of the result aligns with ``concept_vectors[l]`` (i.e. hidden_states[l+1]).
 
     Args:
@@ -1081,7 +1088,7 @@ def score_text_tokens(
             layer (logit-lens); see ``token_scores_from_hs_layers``.
         unit_norm: L2-normalize each concept vector before projecting (default False, to match
             ``token_scores_from_hs_layers`` semantics).
-        add_special_tokens: passed to the tokenizer (default True; BOS gets offset (0, 0)).
+        add_bos: put the BOS token first (default True; it gets offset (0, 0)).
 
     Returns:
         dict with ``token_ids`` (np.int32 [num_tokens]), ``tokens`` (List[str]),
@@ -1101,13 +1108,18 @@ def score_text_tokens(
         else _layer_list(list(layer_indices), num_layers, "layer_indices")
     )
 
-    enc = tokenizer(text, return_tensors="pt", return_offsets_mapping=True,
-                    add_special_tokens=add_special_tokens)
+    enc = tokenizer(text, return_tensors="pt", return_offsets_mapping=True, add_special_tokens=False)
     om = enc["offset_mapping"]
     if hasattr(om, "tolist"):
         om = om.tolist()
     offsets = [list(span) for span in om[0]]
     input_ids = enc["input_ids"]
+    if input_ids.dim() == 1:
+        input_ids = input_ids.unsqueeze(0)
+    bos = getattr(tokenizer, "bos_token_id", None)
+    if add_bos and bos is not None:
+        input_ids = torch.cat([torch.tensor([[bos]], dtype=input_ids.dtype), input_ids], dim=1)
+        offsets = [[0, 0]] + offsets
 
     hs_layers = forward_hidden_states_all_layers(model, input_ids)
     if len(hs_layers) != num_layers:
@@ -1391,19 +1403,33 @@ class ConceptProbe:
         eos_ids = _eos_token_ids(model, tokenizer)
         gen_bs = int(train_cfg.get("gen_batch_size", 16))
 
-        def pooled_reps(ids_list, starts, ends, mode, last_k, vectors=None):
+        dropped_items: Dict[str, List[int]] = {}
+
+        def pooled_reps(ids_list, starts, ends, mode, last_k, label, vectors=None):
             """Pooled reps ``(n, layers, dim)`` and mean token norms ``(n, layers)`` over each span, and,
-            given ``vectors``, each item's per-token projections ``(n_tokens, layers)``."""
+            given ``vectors``, each item's per-token projections ``(n_tokens, layers)``.
+
+            An item with no tokens of its own (an empty completion or text) is left out and listed
+            under ``dropped_items[label]``; a side left with no items raises.
+            """
             reps, norms, tokens = [], [], []
-            for ids, start, end in zip(ids_list, starts, ends):
+            for i, (ids, start, end) in enumerate(zip(ids_list, starts, ends)):
                 hs_layers = forward_hidden_states_all_layers(model, ids.reshape(1, -1))
-                reps.append(
-                    reps_from_hs_layers(hs_layers, prompt_len=start, mode=mode, last_k=last_k,
-                                        warn=self._warn, span_end=end)
-                )
+                try:
+                    reps.append(reps_from_hs_layers(hs_layers, prompt_len=start, mode=mode, last_k=last_k, span_end=end))
+                except EmptySpanError:
+                    dropped_items.setdefault(label, []).append(i)
+                    continue
                 norms.append(_mean_token_norms(hs_layers, start, end))
                 if vectors is not None:
                     tokens.append(_span_token_projections(hs_layers, vectors, start, end))
+            if label in dropped_items:
+                self._warn(
+                    f"{label}: items {dropped_items[label]} have no tokens to pool (an empty completion or text) "
+                    "and are left out."
+                )
+            if not reps:
+                raise ValueError(f"{label}: no item has tokens to pool (every completion or text is empty).")
             return np.stack(reps, axis=0).astype(np.float32), np.stack(norms, axis=0), tokens
 
         self._status(f"Training concept '{self.concept.name}' with model {self.model_bundle.model_id}")
@@ -1576,9 +1602,9 @@ class ConceptProbe:
 
         self._status("[Phase 2/4] Forward passes for training reps")
         reps_pos, norms_pos, _ = pooled_reps(train_pos_ids, train_pos_starts, train_pos_ends,
-                                             train_readout_mode, train_readout_last_k)
+                                             train_readout_mode, train_readout_last_k, "train_pos")
         reps_neg, norms_neg, _ = pooled_reps(train_neg_ids, train_neg_starts, train_neg_ends,
-                                             train_readout_mode, train_readout_last_k)
+                                             train_readout_mode, train_readout_last_k, "train_neg")
         if reps_pos.shape[1] != num_layers:
             raise ValueError("Layer count mismatch between model and reps.")
         # Mean residual norm of the training tokens per layer: the unit of alpha_unit="resid_norm".
@@ -1632,7 +1658,7 @@ class ConceptProbe:
                         f"{event}_{side}", {"i": i, "text": tokenizer.decode(input_ids[0], skip_special_tokens=False)}
                     )
                 reps, _, tokens = pooled_reps(ids_list, starts, ends, train_readout_mode, train_readout_last_k,
-                                              vectors=concept_vectors)
+                                              f"{event.split('_')[0]}_{side}", vectors=concept_vectors)
                 out[side] = (np.einsum("nld,ld->nl", reps, concept_vectors).astype(np.float32), tokens)
                 self._status(f"Read {len(texts)} eval {side} texts")
             return out
@@ -1721,6 +1747,7 @@ class ConceptProbe:
                             [_completion_end(ids, plen, eos_ids) for ids, plen in results],
                             readout["train_mode"],
                             readout["train_last_k"],
+                            f"eval_{side}",
                             vectors=concept_vectors,
                         )
                         side_scores[side] = (np.einsum("nld,ld->nl", reps, concept_vectors).astype(np.float32), tokens)
@@ -1740,6 +1767,12 @@ class ConceptProbe:
                     transfer_readout = dict(text_readout)
 
         n_eval_pos, n_eval_neg = eval_pos_scores_mat.shape[0], eval_neg_scores_mat.shape[0]
+        if did_eval and min(n_eval_pos, n_eval_neg) < MIN_EVAL_ITEMS_PER_POLE:
+            self._warn(
+                f"Only {n_eval_pos} positive and {n_eval_neg} negative eval items: the layer choice and best_d "
+                f"rest on very few items (with selection_split, about half of them each). Use at least "
+                f"{MIN_EVAL_ITEMS_PER_POLE} per pole."
+            )
         if not did_eval:
             reason = "evaluation disabled"
             if eval_cfg.get("do_eval", True):
@@ -1999,6 +2032,7 @@ class ConceptProbe:
             "eval_mode_used": eval_mode if did_eval else None,
             "eval_readout": eval_readout,
             "transfer_eval": transfer_eval,
+            "dropped_items": dropped_items or None,
         }
         json_dump(os.path.join(self.run_dir, "metrics.json"), metrics)
         self.logger.log("artifacts_saved", {"npz_path": npz_path})

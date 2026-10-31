@@ -98,3 +98,25 @@ def test_correctness_gee_adjusts_for_alpha_and_clusters_by_item():
     assert gee["n_rows"] == 60 and gee["n_items"] == 30
     assert gee["coef_per_sd"] > 0 and gee["ci95"][0] <= gee["coef_per_sd"] <= gee["ci95"][1]
     assert 0 <= gee["p_value"] <= 1 and gee["note"] is None
+
+
+def test_items_are_identified_by_their_prompt_across_batches():
+    from concept_probe.eval_system import item_key
+
+    # the same prompt in two batches is one item; the same index with different prompts is two
+    assert item_key({"prompt": "2+2?", "item_index": 0, "batch_name": "a"}) == item_key(
+        {"prompt": "2+2?", "item_index": 3, "batch_name": "b"})
+    assert item_key({"prompt": "2+2?", "item_index": 0}) != item_key({"prompt": "3+3?", "item_index": 0})
+    # without a prompt, the batch qualifies the index
+    assert item_key({"item_index": 0, "batch_name": "a"}) != item_key({"item_index": 0, "batch_name": "b"})
+
+
+def test_gee_clusters_rows_by_item_identity():
+    pytest.importorskip("statsmodels")
+    rows = _rows_with_alphas()
+    # two batches whose items share indices but not prompts: 60 distinct items
+    for batch in ("a", "b"):
+        for r in _rows_with_alphas(seed=1 if batch == "b" else 0):
+            rows.append(dict(r, prompt=f"{batch}:{r['item_index']}", batch_name=batch))
+    rows = [r for r in rows if "prompt" in r]
+    assert _compute_stats(rows)[0]["correctness_gee"]["n_items"] == 60

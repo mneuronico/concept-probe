@@ -51,7 +51,7 @@ def _rows_with_items(n_items=20, seed=0):
     for item in range(n_items):
         for alpha in (0.0, 2.0):
             signal = rng.normal()
-            rows.append({"correct": bool(signal > 0), "alpha": alpha, "item_index": item,
+            rows.append({"correct": bool(signal > 0), "alpha": alpha, "item_key": f"item {item}",
                          "scores": {"focus": signal + rng.normal(scale=0.5)}})
     return rows
 
