@@ -111,8 +111,9 @@ def _score_mean_by_probe_from_result(rec: Dict[str, Any]) -> Dict[str, float]:
     if isinstance(direct, dict):
         out: Dict[str, float] = {}
         for key, value in direct.items():
+            # None: an empty completion, which has no score
             try:
-                out[str(key)] = float(value)
+                out[str(key)] = float("nan") if value is None else float(value)
             except Exception:
                 continue
         if out:
@@ -462,20 +463,65 @@ def _build_prompt_from_item(
     raise ValueError(f"The item has no {prompt_key!r}; provide prompt_builder, prompt_template or prompt_prefix.")
 
 
+MARKER_POSITIONS = ("after", "before")
+
+
+# Fields of a per-sample record that come from the scoring run; an evaluator cannot replace them.
+CORE_RECORD_KEYS = frozenset({
+    "item_index", "alpha", "prompt", "completion", "score_mean", "score_mean_z", "score_mean_by_probe",
+    "score_mean_z_by_probe", "alpha_unit", "alpha_value", "generation", "npz_path", "html_path", "probe_names",
+})
+
+
+def _merge_eval_result(record: Dict[str, Any], eval_result: Any, item_idx: int) -> None:
+    if not isinstance(eval_result, dict):
+        return
+    clash = sorted(CORE_RECORD_KEYS & set(eval_result))
+    if clash:
+        raise ValueError(
+            f"The evaluator returned {clash} for items[{item_idx}]; these fields come from the scoring run. "
+            "Return them under other names."
+        )
+    record.update(eval_result)
+    if "correct" in eval_result:
+        record["correct"] = correctness_label(eval_result["correct"], f"items[{item_idx}] correct")
+
+
 def _extract_with_marker(
     completion: str,
     marker: str,
     *,
     marker_position: str = "after",
 ) -> Optional[str]:
+    """The answer next to ``marker``: the first line after it, or the last line before it.
+    None when the completion does not contain the marker."""
+    if marker_position not in MARKER_POSITIONS:
+        raise ValueError(f"marker_position must be one of {MARKER_POSITIONS}; got {marker_position!r}")
     if not marker:
         return completion.strip()
     idx = completion.find(marker)
     if idx == -1:
         return None
     if marker_position == "before":
-        return completion[:idx].strip()
-    return completion[idx + len(marker):].strip()
+        lines = completion[:idx].strip().splitlines()
+        return lines[-1].strip() if lines else ""
+    lines = completion[idx + len(marker):].strip().splitlines()
+    return lines[0].strip() if lines else ""
+
+
+def _answer_matches(candidate: str, expected: Any, case_sensitive: bool) -> bool:
+    """Whitespace and a trailing period are ignored; values that both read as numbers are
+    compared as numbers ("4" matches 4.0)."""
+    def norm(value: Any) -> str:
+        text = str(value).strip()
+        text = text[:-1].rstrip() if text.endswith(".") else text
+        return text if case_sensitive else text.casefold()
+
+    a, b = norm(candidate), norm(expected)
+    try:
+        return float(a) == float(b)
+    except ValueError:
+        return a == b
 
 
 def simple_equality_evaluator(
@@ -485,24 +531,32 @@ def simple_equality_evaluator(
     *,
     marker: Optional[str] = None,
     marker_position: str = "after",
+    case_sensitive: bool = True,
 ) -> Dict[str, Any]:
+    """Check ``completion`` against ``item[expected_key]`` (a value, or a list/set of accepted values).
+
+    The answer is the whole completion, or with ``marker`` the first line after it
+    (``marker_position="after"``) or the last line before it (``"before"``); a completion without
+    the marker is wrong, with ``extracted`` None. Answers match after stripping whitespace and a
+    trailing period, as numbers when both read as numbers, and case-sensitively unless
+    ``case_sensitive=False``. Under strong steering, format drift (a missing marker, extra words)
+    counts as a wrong answer: inspect ``extracted`` before reading accuracy as correctness.
+    """
+    if marker_position not in MARKER_POSITIONS:
+        raise ValueError(f"marker_position must be one of {MARKER_POSITIONS}; got {marker_position!r}")
     expected = item.get(expected_key)
     if expected is None:
         return {"correct": None, "expected": None}
 
     if marker:
-        extracted = _extract_with_marker(completion, marker, marker_position=marker_position)
-        if extracted is None:
+        candidate = _extract_with_marker(completion, marker, marker_position=marker_position)
+        if candidate is None:
             return {"correct": False, "expected": expected, "extracted": None}
-        candidate = extracted
     else:
         candidate = completion.strip()
 
-    if isinstance(expected, (list, tuple, set)):
-        expected_strs = [str(v).strip() for v in expected]
-        correct = candidate.strip() in expected_strs
-    else:
-        correct = candidate.strip() == str(expected).strip()
+    accepted = list(expected) if isinstance(expected, (list, tuple, set, frozenset)) else [expected]
+    correct = any(_answer_matches(candidate, value, case_sensitive) for value in accepted)
     return {"correct": bool(correct), "expected": expected, "extracted": candidate}
 
 
@@ -573,7 +627,7 @@ def run_scored_eval(
         )
     if evaluator is None:
         missing_expected = [
-            i for i, item in enumerate(normalized_items) if expected_key not in item
+            i for i, item in enumerate(normalized_items) if item.get(expected_key) is None
         ]
         if missing_expected:
             raise ValueError(
@@ -629,8 +683,10 @@ def run_scored_eval(
             "prompt": rec.get("prompt"),
             "completion": completion,
             "score_mean": _score_mean_from_result(rec),
+            "score_mean_z": rec.get("score_mean_z"),
             "alpha_unit": rec.get("alpha_unit"),
             "alpha_value": rec.get("alpha_value"),
+            "generation": rec.get("generation"),
             "npz_path": rec.get("npz_path"),
             "html_path": rec.get("html_path"),
         }
@@ -638,10 +694,7 @@ def run_scored_eval(
             record["expected"] = item.get(expected_key)
         if include_item:
             record["item"] = item
-        if isinstance(eval_result, dict):
-            record.update(eval_result)
-            if "correct" in eval_result:
-                record["correct"] = correctness_label(eval_result["correct"], f"items[{item_idx}] correct")
+        _merge_eval_result(record, eval_result, item_idx)
         per_sample.append(record)
         if total_eval and ((idx + 1) % progress_every == 0 or (idx + 1) == total_eval):
             _progress_print(
@@ -751,7 +804,7 @@ def run_multi_scored_eval(
         )
     if evaluator is None:
         missing_expected = [
-            i for i, item in enumerate(normalized_items) if expected_key not in item
+            i for i, item in enumerate(normalized_items) if item.get(expected_key) is None
         ]
         if missing_expected:
             raise ValueError(
@@ -819,8 +872,10 @@ def run_multi_scored_eval(
             "prompt": rec.get("prompt"),
             "completion": completion,
             "score_mean_by_probe": score_map,
+            "score_mean_z_by_probe": rec.get("score_mean_z_by_probe"),
             "alpha_unit": rec.get("alpha_unit"),
             "alpha_value": rec.get("alpha_value"),
+            "generation": rec.get("generation"),
             "npz_path": rec.get("npz_path"),
             "html_path": rec.get("html_path"),
             "probe_names": rec.get("probe_names"),
@@ -829,10 +884,7 @@ def run_multi_scored_eval(
             record["expected"] = item.get(expected_key)
         if include_item:
             record["item"] = item
-        if isinstance(eval_result, dict):
-            record.update(eval_result)
-            if "correct" in eval_result:
-                record["correct"] = correctness_label(eval_result["correct"], f"items[{item_idx}] correct")
+        _merge_eval_result(record, eval_result, item_idx)
         per_sample.append(record)
         if total_eval and ((idx + 1) % progress_every == 0 or (idx + 1) == total_eval):
             _progress_print(
@@ -1268,7 +1320,14 @@ def aggregate_eval_batches(
     *,
     output_name: str = "analysis_all",
     batch_dirs: Optional[Iterable[str]] = None,
+    analysis_name: str = "analysis",
 ) -> Optional[Dict[str, Any]]:
+    """Pool the per-sample results of several eval batches and analyze them together.
+
+    Batches are ``batch_dirs``, or else every subfolder of ``eval_dir`` that has
+    ``<analysis_name>/per_sample.json`` (whatever its name). The batches must share their
+    steering conditions (alpha unit, steered layers, ...).
+    """
     eval_path = Path(eval_dir).resolve()
     if not eval_path.exists():
         print(f"Warning: eval dir not found: {eval_path}")
@@ -1277,7 +1336,7 @@ def aggregate_eval_batches(
     batches: List[Path] = []
     if batch_dirs is None:
         batches = sorted(
-            [p for p in eval_path.iterdir() if p.is_dir() and p.name.startswith("batch_")],
+            [p for p in eval_path.iterdir() if p.is_dir() and (p / analysis_name / "per_sample.json").exists()],
             key=lambda p: p.name,
         )
     else:
@@ -1292,7 +1351,7 @@ def aggregate_eval_batches(
     per_sample: List[Dict[str, Any]] = []
     ratings: Dict[str, str] = {}
     for batch in batches:
-        per_sample_path = batch / "analysis" / "per_sample.json"
+        per_sample_path = batch / analysis_name / "per_sample.json"
         if not per_sample_path.exists():
             print(f"Warning: missing per_sample.json in {batch}")
             continue
@@ -1307,6 +1366,16 @@ def aggregate_eval_batches(
         print(f"Warning: no per-sample items found under {eval_path}")
         return None
     _check_same_alpha_conditions(per_sample)
+    rows_per_condition: Dict[Tuple[Optional[str], Any], int] = {}
+    for row in per_sample:
+        key = (item_key(row), row.get("alpha"))
+        rows_per_condition[key] = rows_per_condition.get(key, 0) + 1
+    repeated = sum(1 for n in rows_per_condition.values() if n > 1)
+    if repeated:
+        print(
+            f"Warning: {repeated} (item, alpha) pairs appear in more than one row across the batches. The "
+            "accuracy intervals count rows as independent; the correctness model clusters by item."
+        )
 
     if _is_multi_probe_per_sample(per_sample):
         return _write_analysis_multi(

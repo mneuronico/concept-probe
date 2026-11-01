@@ -35,18 +35,37 @@ def _extract_probe_names(items: List[Dict[str, object]]) -> List[str]:
     return []
 
 
-def _build_rows(items: List[Dict[str, object]], probe_names: List[str]) -> List[Dict[str, object]]:
+def _score_kind(items: List[Dict[str, object]], probe_names: List[str]) -> str:
+    """"z" when every item has a standardized score for every probe, else "raw".
+
+    Raw projections of different probes have arbitrary offsets and scales, so only z scores
+    (0 = midpoint between a probe's poles) can share an axis.
+    """
+    for item in items:
+        raw = item.get("score_mean_by_probe")
+        z = item.get("score_mean_z_by_probe")
+        for p in probe_names:
+            value = raw.get(p) if isinstance(raw, dict) else None
+            scored = value is not None and np.isfinite(float(value))  # empty completions have no score
+            if scored and (not isinstance(z, dict) or z.get(p) is None):
+                return "raw"
+    return "z" if items else "raw"
+
+
+def _build_rows(
+    items: List[Dict[str, object]], probe_names: List[str], score_kind: str = "raw", labelled_only: bool = True
+) -> List[Dict[str, object]]:
     rows = []
     for item in items:
         correct = correctness_label(item.get("correct"))
-        if correct is None:
+        if correct is None and labelled_only:
             continue
-        scores = item.get("score_mean_by_probe", {})
+        scores = item.get("score_mean_z_by_probe" if score_kind == "z" else "score_mean_by_probe", {})
         if not isinstance(scores, dict):
             continue
         alpha = item.get("alpha")
         row = {
-            "correct": bool(correct),
+            "correct": correct,
             "alpha": None if alpha is None else float(alpha),
             "item_key": item_key(item),
             "scores": {},
@@ -81,7 +100,8 @@ def _alpha_key(alpha: Optional[float]) -> str:
 
 
 def _compute_summary(rows: List[Dict[str, object]], probe_names: List[str]) -> Dict[str, Dict[str, Dict[str, float]]]:
-    """Mean score per probe, overall and by correctness, separately for each alpha.
+    """Mean score per probe, overall (every scored row, labelled or not) and by correctness,
+    separately for each alpha.
 
     Alphas are never pooled: steering moves both the scores and the accuracy.
     """
@@ -90,8 +110,8 @@ def _compute_summary(rows: List[Dict[str, object]], probe_names: List[str]) -> D
         sub = [r for r in rows if _alpha_key(r["alpha"]) == key]
         summary[key] = {
             "overall": {p: _mean([r["scores"][p] for r in sub]) for p in probe_names},
-            "correct": {p: _mean([r["scores"][p] for r in sub if r["correct"]]) for p in probe_names},
-            "incorrect": {p: _mean([r["scores"][p] for r in sub if not r["correct"]]) for p in probe_names},
+            "correct": {p: _mean([r["scores"][p] for r in sub if r["correct"] is True]) for p in probe_names},
+            "incorrect": {p: _mean([r["scores"][p] for r in sub if r["correct"] is False]) for p in probe_names},
         }
     return summary
 
@@ -313,11 +333,12 @@ def generate_multi_probe_report(
     probe_names = _extract_probe_names(items)
     if not probe_names:
         raise ValueError("No probe names found in per_sample.json.")
-    rows = _build_rows(items, probe_names)
+    score_kind = _score_kind(items, probe_names)
+    rows = _build_rows(items, probe_names, score_kind)
     if not rows:
         raise ValueError("No valid rows with correct labels and scores.")
 
-    summary = _compute_summary(rows, probe_names)
+    summary = _compute_summary(_build_rows(items, probe_names, score_kind, labelled_only=False), probe_names)
     model_result = _fit_model(rows, probe_names, seed=seed)
     alpha_keys = list(summary.keys())
     default_alpha = "0" if "0" in alpha_keys else alpha_keys[0]
@@ -328,6 +349,9 @@ def generate_multi_probe_report(
         "summary_by_alpha": summary,
         "alpha_keys": alpha_keys,
         "default_alpha": default_alpha,
+        "score_kind": score_kind,
+        "score_label": "Mean z score (0 = midpoint between the probe's poles)" if score_kind == "z"
+        else "Mean raw projection (offsets differ between probes; not comparable across probes)",
         "model": model_result,
     }
     # "</" would end the <script> block early if a probe name contained "</script>".
@@ -440,7 +464,7 @@ def generate_multi_probe_report(
       }};
       Plotly.newPlot("mean-bar", [meanTrace], {{
         margin: {{ t: 20 }},
-        yaxis: {{ title: "Mean score" }}
+        yaxis: {{ title: payload.score_label }}
       }});
 
       const correctTrace = {{
@@ -460,7 +484,7 @@ def generate_multi_probe_report(
       Plotly.newPlot("correct-bar", [correctTrace, incorrectTrace], {{
         barmode: "group",
         margin: {{ t: 20 }},
-        yaxis: {{ title: "Mean score" }}
+        yaxis: {{ title: payload.score_label }}
       }});
     }}
 

@@ -186,10 +186,11 @@ probe = workspace.train_concept(concept)
 read, with `training.train_text_system` (null: `prompts.neutral_system`) and, for the assistant
 role, `training.train_text_prompt`. The `assistant_*` readouts pool over the text's own tokens
 in every role: they leave out the BOS, the system block and role headers before the text, and
-the end-of-turn tokens after it. The `sequence_*` readouts pool over the whole input instead;
-the template part is identical in every input, so under mean pooling its weight is 1/length and
-scores and the direction partly track text length. Training warns when a `sequence_*` readout
-is used.
+the end-of-turn tokens after it. The `sequence_*` readouts pool from the start of the input to
+the end of the text, template included (the tokens after the text are left out, as in every
+readout); the template part is identical in every input, so under mean pooling its weight is
+1/length and scores and the direction partly track text length. Training warns when a
+`sequence_*` readout is used.
 
 To score other texts under the same readout, use `extract_text_reps` with the same `role`,
 `prompt` and `system` (its defaults are the training defaults). It can return several readouts
@@ -206,7 +207,9 @@ training, read the same way:
 
 - **Texts mode**: the concept's `eval_pos_texts` / `eval_neg_texts`, read with the training
   texts' role and system prompt and pooled with `readout.read_mode`. `evaluation.eval_system`
-  (null by default) overrides the system prompt, with a warning.
+  (null by default) overrides the system prompt, with a warning. With
+  `evaluation.eval_mode = "generate"` it evaluates on generated completions instead, also pooled
+  with `readout.read_mode`, the readout the vector was trained with.
 - **Shared and opposed modes**: completions generated for `prompts.eval_questions` under
   `pos_system` / `neg_system`, pooled with `readout.train_mode`, like the training completions.
   `eval_questions` (20 by default) should not repeat the training questions; training warns if
@@ -263,6 +266,11 @@ independent resampling. `metrics.json` also reports:
 - `best_d_all_eval`: d at that layer on all eval items (post-selection).
 - `sweep_max_d` and `sweep_max_d_perm_p`: the largest d over the searched layers and its
   permutation p-value (`evaluation.n_permutations`), which accounts for having searched them.
+  It is computed on all eval items: it tests whether any searched layer separates the poles, not
+  the held-out `best_d`.
+
+`plots/sweep.png` shows d per layer on all eval items and, dashed, on the selection half that
+chose the layer.
 
 Without evaluation, `best_d`/`best_p` are null and the sweep is NaN.
 
@@ -291,22 +299,40 @@ measured on texts read with the same role, system prompt and prompt: the evaluat
 mode, the transfer check's (the concept's eval texts) in shared and opposed modes. Without them it
 saves only raw projections, with a warning.
 
-Steering adds `alpha * v_l` to every token position of each steered layer. `alpha_unit`:
+### Steering
 
-- `"raw"`: alpha as is.
+By default steering touches one layer: the probe's `best_layer` (`steering.steer_layers =
+"probe"`). It adds `alpha_l * v_l` to every token position of each steered layer `l`, where `v_l`
+is the probe's own unit direction at that layer: with several layers, each uses the direction
+trained there, not the chosen layer's vector copied to the others. Several layers are steered
+with `steer_layers = "window"` (`best_layer` +/- `steer_window_radius`, clipped at the model's
+edges) or a list of layers. Then, with `steer_distribute = true` (default), alpha is divided by the
+number of layers actually steered (3 instead of 5 for a window at the first layer).
+
+`alpha_unit` sets what alpha is measured in:
+
+- `"raw"` (default everywhere): alpha as is.
 - `"sigma"`: alpha times `sigma_best_layer`, the pooled within-pole SD at the best layer. It is a
   scale knob, not "n standard deviations of behavior".
-- `"resid_norm"`: alpha times each layer's mean residual norm on the training tokens, so
-  `alpha=0.1` adds 10% of a typical token's norm at each steered layer.
+- `"resid_norm"`: alpha times each steered layer's mean residual norm on the training tokens.
+  With one steered layer, `alpha=0.1` adds 10% of a typical token's norm; distributed over n
+  layers, each adds `0.1 / n` of its own layer's norm.
 
-With `steer_distribute = true` (default) alpha is split across the steered layers.
+Each record has `steer_layers` and `steer_alpha_per_layer`, the alpha each layer applied after
+distribution and units.
+
+Generation is greedy by default (`steering.steer_sampling = false`), so a prompt at an alpha has
+one completion. With sampling, the RNGs are seeded with `seed`, or else `random.seed`, so the
+completions are reproducible (best effort: GPU kernels are not bit-deterministic). Each record
+has the settings it was generated with under `generation`. An empty completion has
+`score_mean` null.
 `random_scoring_vector` / `random_steering_vector` use one random direction per probe, derived
 from its name and run directory, so the control is the same vector in every function. It is the
 same direction at every layer (with each layer's norm): concept vectors of adjacent layers point
 nearly the same way, so independent random directions would partly cancel and push the residual
 stream about half as far as the concept.
 
-Each prompt and alpha gets its own files, so repeated alphas (several samples) do not overwrite
+Each prompt and alpha gets its own files, so repeated alphas (several samples, with sampling on) do not overwrite
 each other. A `batch_subdir` that already holds files raises unless `overwrite=True`.
 
 ## Variance-normalized directions
@@ -344,30 +370,49 @@ moves both the scores and the accuracy, and each item recurs at every alpha):
   steering shift, and the effect size would grow with the range of alphas run.
 
 A correctness label is a bool (Python or numpy), 0/1, or None for an unlabelled row; anything
-else raises. Prompts come from at most one of `prompt_builder`, `prompt_template` (formatted with
+else raises. An evaluator's fields are added to each row, but it cannot return the fields that
+come from the scoring run (`prompt`, `completion`, `alpha`, `score_mean`, `generation`, ...):
+that raises. Rows keep the raw and standardized means (`score_mean`, `score_mean_z`, or their
+`_by_probe` forms) and the generation settings. Prompts come from at most one of `prompt_builder`, `prompt_template` (formatted with
 the item's fields; a string item is `{"prompt": text}`) and `prompt_prefix`, which is always
-applied; without them the prompt is `item["prompt"]`. `aggregate_eval_batches` refuses batches
-whose rows share an alpha but not the steering unit or the injected offset.
+applied; without them the prompt is `item["prompt"]`. `aggregate_eval_batches` pools every
+subfolder with `<analysis_name>/per_sample.json` (or the `batch_dirs` given), refuses batches
+whose rows share an alpha but not the steering unit or the injected offset, and warns when an
+item appears more than once at an alpha: the accuracy intervals count rows as independent, while
+the correctness model clusters by item.
 
 `generate_multi_probe_report` shows one alpha at a time. Its correctness model has alpha as a
 covariate, cross-validation folds that keep all rows of an item together, and standard errors
 clustered by item. Next to each out-of-fold metric it shows what alpha alone predicts, since
-steering can drive accuracy by itself: the probe scores add only the difference. Items are identified by their prompt, so `aggregate_eval_batches` treats the
-same prompt in two batches as one item and different prompts that share an index as two.
+steering can drive accuracy by itself: the probe scores add only the difference. Items are
+identified by their prompt, so `aggregate_eval_batches` treats the same prompt in two batches as
+one item and different prompts that share an index as two. The report uses z scores when every
+scored item has them for every probe (0 = a probe's midpoint, so probes share an axis) and raw
+projections otherwise, and says which on its axes. Mean scores per alpha include unlabelled rows;
+correct vs incorrect means and the model use the labelled ones.
 
-With the default evaluator (exact match against `expected`), `marker` / `marker_position` pick
-the part of the completion to compare in both `run_scored_eval` and `run_multi_scored_eval`; a
+The default evaluator compares the completion with `item["expected"]` (a value, or a list of
+accepted values); items whose `expected` is missing or null raise. With `marker`, it compares the
+first line after the marker (`marker_position = "after"`) or the last line before it
+(`"before"`); a completion without the marker is wrong, with `extracted` null. Answers match after
+stripping whitespace and a trailing period, as numbers when both read as numbers (`"4."` matches
+`4`), and case-sensitively (`simple_equality_evaluator(..., case_sensitive=False)` otherwise).
+Under strong steering, format drift counts as a wrong answer, so check `extracted` before reading
+accuracy as correctness. `marker` works in both `run_scored_eval` and `run_multi_scored_eval`; a
 `marker` together with your own `evaluator` raises, since it would not be used.
 
 `multi_probe_score_prompts` runs one model for every probe, so the probes must come from the same
 model settings (`model_id`, `dtype`, `use_4bit`, chat template and its date). The generation
-settings (system prompt, `max_new_tokens`, sampling, `temperature`, `top_p`) come from the
-arguments or, when not passed, from the probes' configs, which must then agree. The steering
-layers and their distribution come from the steering probe's config.
+settings (system prompt, `max_new_tokens`, sampling and, when sampling, `temperature`, `top_p`
+and the seed) come from the arguments or, when not passed, from the probes' configs, which must
+then agree. Non-zero alphas need `steer_probe` (index, name or probe); the steering layers and
+their distribution come from its config. The npz of each prompt has every probe's per-layer
+scores (`scores_per_layer_<i>`, `layer_indices_<i>`, in the order of `probe_names`), and
+warnings go to the run's log as well as the console.
 
 Coherence rating sends completions to the external Groq API, so it is off by default
-(`rate_coherence=False`). The key comes from `GROQ_API_KEY` in the environment, or from a file
-you pass as `coherence_env_path`; no `.env` is read otherwise. Ratings record the judge model and
+(`rate_coherence=False`). The key is the `api_key` argument, else `GROQ_API_KEY` from a file you
+pass as `coherence_env_path`, else from the environment; no `.env` is read unless passed. Ratings record the judge model and
 date: they are labels from another model, not ground truth.
 
 ## Loading a trained probe
@@ -454,6 +499,13 @@ GitHub Actions CI runs the same lightweight checks and also builds source and wh
 
 ### Unreleased
 
+- **Steering touches only the probe's layer by default** (`steering.steer_layers = "probe"`).
+  It used to steer a window of 5 layers around it with alpha split among them. With several
+  layers, each adds its own probe direction (unchanged); records now say so and include
+  `steer_alpha_per_layer`. Generation is greedy by default (`steer_sampling = false`); sampled
+  runs are seeded from `random.seed` when no seed is passed, and records hold the settings under
+  `generation`. Every entry point uses `alpha_unit="raw"` by default
+  (`train_concept_from_json` used `"sigma"`).
 - **Nothing is added to your text by default.** Texts are read raw (BOS + text);
   `training.train_text_role` defaults to `"raw"`, `prompts.neutral_system` to null, and
   `score_texts` / `extract_text_reps` default to the raw text. Generation prompts are a user turn
@@ -510,6 +562,17 @@ GitHub Actions CI runs the same lightweight checks and also builds source and wh
   across batches; multi-probe scoring requires one model and agreeing generation settings
   instead of taking the first probe's; `run_multi_scored_eval` takes `marker`, and a `marker`
   with a custom evaluator raises; `score_text_tokens` adds only the BOS, like every raw read.
+- **Clearer semantics**: `sequence_*` readouts stop at the end of the item (they included the
+  EOS of generated completions); texts-mode probes evaluated on generations pool them with
+  `read_mode`; a custom defaults file is merged over the packaged defaults; `config.json` holds the
+  concept that was trained; `extract_completion_reps` adds `system` like every other path;
+  multi-probe scoring requires `steer_probe` for non-zero alphas (it used the first probe) and
+  logs its warnings; the default evaluator reads the first line after a marker, compares numbers
+  as numbers and raises on null `expected`; evaluators cannot overwrite scoring fields; the
+  report puts probes on a z axis when it can and its overall means include unlabelled rows;
+  `n_train_pos`/`n_train_neg` count the items in the vector; segment files use the heatmap's
+  scores; `aggregate_eval_batches` finds batches by their analysis folder; an explicit
+  coherence env file wins over the environment; the example concepts set no system prompt.
 - **Other defaults**: `use_4bit` false (NF4 when on); coherence rating off, and no `.env` read
   unless passed; `train_concept_from_json` follows the config's steering settings; the random
   control vector is the same for a probe in every function; `metrics.json` reports null instead

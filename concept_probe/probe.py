@@ -974,9 +974,11 @@ def reps_from_hs_layers(
 ) -> np.ndarray:
     """Pool each layer's hidden states ``(seq_len, dim)`` into one rep per layer.
 
-    ``sequence_*`` modes read the whole sequence, template tokens included. ``assistant_*``
-    modes read the span ``[prompt_len, span_end)`` (``span_end`` defaults to the end of the
-    sequence): a generated completion, or the own tokens of a read text. An empty span raises
+    ``assistant_*`` modes read the span ``[prompt_len, span_end)`` (``span_end`` defaults to the
+    end of the sequence): a generated completion, or the own tokens of a read text.
+    ``sequence_*`` modes read from the start of the input to ``span_end``: the prompt and
+    template tokens before the item are included, the tokens after it (an end-of-sequence or
+    end-of-turn token) are not, like in every other readout. An empty span raises
     :class:`EmptySpanError` rather than pooling something else (the prompt and system prompt
     would stand in for the missing text).
     """
@@ -999,12 +1001,13 @@ def reps_from_hs_layers(
         if start >= end:
             raise EmptySpanError(f"mode={mode}: no tokens to pool (span [{start}, {end}) of a {total}-token input)")
 
+    seq_end = total if span_end is None else min(int(span_end), total)
     for l in range(num_layers):
-        hs = hs_layers[l]
+        hs = hs_layers[l][:seq_end] if mode.startswith("sequence_") else hs_layers[l]
         if mode == "sequence_last":
             reps[l] = hs[-1].numpy()
         elif mode == "sequence_last_k_mean":
-            reps[l] = hs[-min(last_k, total):].mean(dim=0).numpy()
+            reps[l] = hs[-min(last_k, hs.shape[0]):].mean(dim=0).numpy()
         elif mode == "sequence_all_mean":
             reps[l] = hs.mean(dim=0).numpy()
         else:
@@ -1039,17 +1042,14 @@ def extract_completion_reps(
 
     Use it to score externally-provided text -- e.g. another model's generations -- against
     trained concept vectors, or to compare how different models represent the same text.
-    Pass ``system=None`` (default) to format prompts with no system message.
+    Prompts follow the rules of every other path: a string is a user turn, a message list is used
+    as given, and ``system`` (default None: no system message) is added unless the list has its own.
+    The completion is tokenized from its text, so its tokens can differ slightly from the ids a
+    generation produced.
     """
     out_reps: List[np.ndarray] = []
     for prompt, completion in pairs:
-        if isinstance(prompt, str):
-            messages: List[PromptMessage] = []
-            if system:
-                messages.append({"role": "system", "content": system})
-            messages.append({"role": "user", "content": prompt})
-        else:
-            messages = list(prompt)
+        messages, _ = _normalize_messages(prompt, system)
         full_ids, plen = _completion_input_ids(tokenizer, messages, completion)
         hs_layers = forward_hidden_states_all_layers(model, full_ids)
         try:
@@ -1436,8 +1436,9 @@ class ConceptProbe:
 
         # Labelled texts (the training texts in texts mode, the eval texts in every mode) are read
         # with training.train_text_role: by default the raw text, with no chat template and no
-        # system prompt. They are pooled like the vector's training data: with read_mode in texts
-        # mode, and with train_mode (the readout of the model's own completions) otherwise.
+        # system prompt. Every evaluation (texts or generated completions) is pooled like the
+        # vector's training data: with read_mode in texts mode, and with train_mode (the readout
+        # of the model's own completions) otherwise.
         if train_prompt_mode == "texts":
             train_readout_mode, train_readout_last_k = readout["read_mode"], readout["read_last_k"]
         else:
@@ -1491,6 +1492,8 @@ class ConceptProbe:
             )
         set_seed(seed)
         ensure_dir(self.run_dir)
+        # The saved config holds the concept actually trained, not the defaults' concept section.
+        self.config = {**self.config, "concept": self.concept.to_dict()}
         json_dump(os.path.join(self.run_dir, "config.json"), self.config)
         json_dump(os.path.join(self.run_dir, "concept.json"), self.concept.to_dict())
         self.logger.log("config", {"config": self.config, "concept": self.concept.to_dict()})
@@ -1849,8 +1852,8 @@ class ConceptProbe:
                             [ids for ids, _ in results],
                             [plen for _, plen in results],
                             [_completion_end(ids, plen, eos_ids) for ids, plen in results],
-                            readout["train_mode"],
-                            readout["train_last_k"],
+                            train_readout_mode,
+                            train_readout_last_k,
                             f"eval_{side}",
                             vectors=concept_vectors,
                         )
@@ -1875,8 +1878,8 @@ class ConceptProbe:
                     eval_readout = {
                         "role": "assistant",
                         "source": "completions generated for eval_questions under pos_system/neg_system",
-                        "mode": readout["train_mode"],
-                        "last_k": readout["train_last_k"],
+                        "mode": train_readout_mode,
+                        "last_k": train_readout_last_k,
                     }
                 if eval_texts_given and train_prompt_mode != "texts":
                     self._status("Reading eval texts (transfer check)")
@@ -1933,6 +1936,7 @@ class ConceptProbe:
         search_intervals_plot = None
         selection: Optional[str] = None
         best_d = best_p = best_d_selection = best_d_all_eval = sweep_max_d = sweep_max_d_perm_p = None
+        selection_d: Optional[np.ndarray] = None
         best_d_ci95: Optional[List[float]] = None
         pos_sel = neg_sel = np.zeros((0,), dtype=np.int64)
         est_pos, est_neg = P, N
@@ -1963,6 +1967,7 @@ class ConceptProbe:
                     selection = "split"
             if selection == "split":
                 sel_d = _cohen_d_columns(P[pos_sel], N[neg_sel])
+                selection_d = sel_d
                 sel_p = _welch_p_columns(P[pos_sel], N[neg_sel], paired=eval_paired)
                 best_layer = _select_best_layer(sel_d, sel_p, search_layers, sweep_select)
                 best_d_selection = float(sel_d[best_layer])
@@ -2034,7 +2039,7 @@ class ConceptProbe:
         reference_context: Optional[Dict[str, Any]] = None
         if did_eval:
             reference_context = (
-                {"kind": "generated", "mode": readout["train_mode"]} if eval_mode == "generate"
+                {"kind": "generated", "mode": train_readout_mode} if eval_mode == "generate"
                 else _text_context(text_role, eval_system, text_prompt, train_readout_mode)
             )
         transfer_refs: Optional[Dict[str, Any]] = None
@@ -2096,6 +2101,7 @@ class ConceptProbe:
                     os.path.join(plots_dir, "sweep.png"),
                     best_layer=best_layer,
                     search_intervals=search_intervals_plot,
+                    selection_d=selection_d,
                 )
                 self.logger.log("plot_sweep", {"ok": ok})
             if plot_cfg.get("score_hist", True):
@@ -2150,8 +2156,8 @@ class ConceptProbe:
         npz_path = os.path.join(self.run_dir, "tensors.npz")
         np.savez_compressed(npz_path, **tensors)
 
-        n_train_pos = len(train_pos_ids)
-        n_train_neg = len(train_neg_ids)
+        n_train_pos = int(reps_pos.shape[0])
+        n_train_neg = int(reps_neg.shape[0])
         if train_prompt_mode == "shared":
             n_train = n_train_pos
         else:
@@ -2517,14 +2523,19 @@ class ConceptProbe:
         (0 is the midpoint between the eval poles, 1 their pooled within-pole SD). The npz and the
         heatmaps carry single-token z scores, standardized with the per-token references.
 
-        seed: seeds python/numpy/torch RNGs before generation for reproducible
-        sampling. Note: GPU kernels are not bit-deterministic across
-        hardware/library versions, so reproducibility is best-effort.
+        Steering: by default only the probe's layer is steered (``steering.steer_layers =
+        "probe"``). With several layers (``"window"`` or a list), each layer adds its own probe
+        vector ``v_l``, and with ``steer_distribute`` alpha is divided by the number of layers
+        actually steered (fewer at the model's edges). Each record has the alpha applied at each
+        layer, ``steer_alpha_per_layer``.
+
+        Generation is greedy by default (``steering.steer_sampling``). When sampling, the RNGs
+        are seeded with ``seed``, or else ``random.seed``, so completions are reproducible
+        (best-effort: GPU kernels are not bit-deterministic across hardware/library versions);
+        each record has the generation settings under ``generation``.
         """
         self._require_trained()
         alpha_unit = _validate_alpha_unit(alpha_unit)
-        if seed is not None:
-            set_seed(int(seed))
         tokenizer = self.model_bundle.tokenizer
         model = self.model_bundle.model
         aggregate = self.config["evaluation"]["score_aggregate"]
@@ -2566,9 +2577,20 @@ class ConceptProbe:
         greedy = greedy if greedy is not None else (not self.config["steering"]["steer_sampling"])
         temperature = temperature if temperature is not None else self.config["steering"]["steer_temperature"]
         top_p = top_p if top_p is not None else self.config["steering"]["steer_top_p"]
+        if not greedy:
+            # Sampled completions are reproducible: without an explicit seed, random.seed is used.
+            seed = int(self.config.get("random", {}).get("seed", 0)) if seed is None else int(seed)
+            set_seed(seed)
+        elif seed is not None:
+            set_seed(int(seed))
+        generation = {"greedy": bool(greedy), "max_new_tokens": int(max_new_tokens),
+                      "temperature": None if greedy else temperature, "top_p": None if greedy else top_p,
+                      "seed": None if greedy else seed}
 
         if alphas is None:
             alphas = [0.0]
+        if len(alphas) == 0:
+            raise ValueError("alphas is empty; pass at least one alpha (0.0 for no steering).")
         nonzero_alpha_requested = any(abs(float(a)) > 1e-12 for a in alphas)
         if nonzero_alpha_requested and not do_steering:
             self._warn(
@@ -2633,8 +2655,10 @@ class ConceptProbe:
                         model, steer_layer_list, steering_vectors, alpha_val, distribute=steer_distribute,
                         layer_scales=layer_scales,
                     )
+                    steer_alpha_per_layer = context.per_layer_alpha()
                 else:
                     context = None
+                    steer_alpha_per_layer = {}
 
                 if context is not None:
                     with context:
@@ -2698,7 +2722,7 @@ class ConceptProbe:
                 completion_end = _completion_end(token_ids, prompt_len, eos_ids)
                 completion_text = tokenizer.decode(token_ids[prompt_len:completion_end], skip_special_tokens=True)
                 completion_scores = scores_agg[prompt_len:completion_end]
-                score_mean = float(np.mean(completion_scores)) if completion_scores.size else float("nan")
+                score_mean = float(np.mean(completion_scores)) if completion_scores.size else None
                 standardized = None if random_scoring_vector else self._token_z(
                     scores_per_layer, layers, aggregate, GENERATED_CONTEXT
                 )
@@ -2740,14 +2764,16 @@ class ConceptProbe:
                 segments_path = None
                 if save_segments:
                     segments_path = os.path.join(out_dir, f"{base}_segments.json")
+                    segment_scores = scores_agg if standardized is None else standardized[1]
                     segments = segment_token_scores(
                         tokens,
-                        scores_agg.tolist(),
+                        segment_scores.tolist(),
                         prompt_len=prompt_len,
                     )
                     with open(segments_path, "w", encoding="utf-8") as handle:
                         json.dump(
-                            {"prompt_len": prompt_len, "segments": segments},
+                            {"prompt_len": prompt_len, "score_kind": "raw" if standardized is None else "z",
+                             "segments": segments},
                             handle,
                             ensure_ascii=False,
                             indent=2,
@@ -2762,7 +2788,10 @@ class ConceptProbe:
                     "alpha_unit": alpha_unit,
                     "alpha_value": float(alpha_val),
                     "steer_layer_scales": layer_scales,
-                    "sampling_seed": seed,
+                    "steer_alpha_per_layer": steer_alpha_per_layer,
+                    "steer_vectors": "each steered layer's own probe vector",
+                    "generation": generation,
+                    "sampling_seed": generation["seed"],
                     "steer_layers": steer_layer_list,
                     "completion": completion_text,
                     "prompt_len": prompt_len,
@@ -2955,7 +2984,9 @@ class ProbeWorkspace:
                 + "). Load it with ProbeWorkspace(project_directory=run_dir) to use the run's own model "
                 "settings, or pass allow_model_mismatch=True."
             )
-        differences = [d for d in _dotted_differences(probe.config, self.config) if not d.startswith("output.")]
+        differences = [
+            d for d in _dotted_differences(probe.config, self.config) if not d.startswith(("output.", "concept."))
+        ]
         if differences:
             self.console.warn(
                 "Scoring uses the workspace config, which differs from the saved run config in: "

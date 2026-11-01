@@ -15,6 +15,11 @@ def _load_concept_json(path: str) -> Dict[str, Any]:
         raise ValueError(f"Concept JSON missing 'concept' section: {path}")
     if "prompts" not in data:
         raise ValueError(f"Concept JSON missing 'prompts' section: {path}")
+    unknown = sorted(set(data) - {"concept", "prompts", "config_overrides", "model_id"})
+    if unknown:
+        raise ValueError(
+            f"Unknown keys in concept JSON {path}: {unknown}; expected concept, prompts, config_overrides, model_id."
+        )
     return data
 
 
@@ -22,7 +27,7 @@ def train_concept_from_json(
     json_path: str,
     alphas: Optional[Sequence[float]] = None,
     *,
-    alpha_unit: str = "sigma",
+    alpha_unit: str = "raw",
     model_id: Optional[str] = None,
     root_dir: Optional[str] = None,
     config_overrides: Optional[Dict[str, Any]] = None,

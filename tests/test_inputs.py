@@ -176,10 +176,14 @@ def test_multi_probe_refuses_probes_from_different_model_settings(tmp_path, monk
 def test_multi_probe_generation_settings_must_agree_or_be_passed(tmp_path, monkeypatch):
     a = _probe(tmp_path, monkeypatch, "a")
     b = _probe(tmp_path, monkeypatch, "b", config=_cfg(steering={"steer_temperature": 0.2}))
+    # greedy (the default) does not use the temperature, so the disagreement does not matter
+    out = multi_probe_score_prompts([a, b], ["hi"], output_root=str(tmp_path / "g"))
+    assert out["results"][0]["generation"]["temperature"] is None
     with pytest.raises(ValueError, match="steer_temperature"):
-        multi_probe_score_prompts([a, b], ["hi"], output_root=str(tmp_path / "m"))
-    out = multi_probe_score_prompts([a, b], ["hi"], temperature=0.5, output_root=str(tmp_path / "m"))
+        multi_probe_score_prompts([a, b], ["hi"], greedy=False, output_root=str(tmp_path / "m"))
+    out = multi_probe_score_prompts([a, b], ["hi"], greedy=False, temperature=0.5, output_root=str(tmp_path / "m"))
     assert out["results"][0]["completion"] == "pp"
+    assert out["results"][0]["generation"]["temperature"] == 0.5
 
 
 def test_multi_probe_steers_with_the_steering_probe_settings(tmp_path, monkeypatch):

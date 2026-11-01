@@ -349,7 +349,7 @@ def test_an_empty_completion_is_left_out_instead_of_pooling_the_prompt(tmp_path,
     metrics = json.loads((tmp_path / "metrics.json").read_text())
     t = np.load(tmp_path / "tensors.npz")
     assert metrics["dropped_items"] == {"train_pos": [1]}
-    assert (metrics["n_train_pos"], metrics["n_train_neg"]) == (3, 3)  # generated; one left out of pooling
+    assert (metrics["n_train_pos"], metrics["n_train_neg"]) == (2, 3)  # the items in the vector
     np.testing.assert_allclose(t["train_pos_reps"][:, 0, 0], [1.0, 1.0])  # only real completions
 
 
@@ -362,3 +362,29 @@ def test_extract_text_reps_names_an_empty_text(monkeypatch):
     monkeypatch.setattr(probe_mod, "forward_hidden_states_all_layers", _fake_forward)
     with pytest.raises(probe_mod.EmptySpanError, match=r"texts\[1\]"):
         probe_mod.extract_text_reps(object(), _CharChatTok(), ["pp", ""])
+
+
+def test_texts_mode_evaluated_on_completions_pools_them_like_its_training_texts(tmp_path, monkeypatch):
+    _, metrics, t, _ = _train(tmp_path, monkeypatch, "texts", overrides={
+        "evaluation": {"eval_mode": "generate"},
+        "readout": {"read_mode": "assistant_last", "train_mode": "assistant_all_mean"},
+    })
+    assert metrics["eval_readout"]["mode"] == "assistant_last"
+    assert metrics["reference_context"] == {"kind": "generated", "mode": "assistant_last"}
+    # 'pp' and 'ppx': last tokens p, x (with train_mode's mean the second would be 2/3)
+    np.testing.assert_allclose(t["eval_pos_scores_mat"][:, 0], [1.0, 0.0], atol=1e-6)
+
+
+def test_the_saved_config_has_the_concept_that_was_trained(tmp_path, monkeypatch):
+    _train(tmp_path, monkeypatch, "shared")
+    config = json.loads((tmp_path / "config.json").read_text())
+    assert config["concept"]["name"] == "c" and config["concept"]["pos_system"] == "POS"
+
+
+def test_extract_completion_reps_formats_prompts_like_every_other_path(monkeypatch):
+    monkeypatch.setattr(probe_mod, "forward_hidden_states_all_layers", _fake_forward)
+    tok = _CharChatTok()
+    own = [{"role": "system", "content": "mine"}, {"role": "user", "content": "q"}]
+    probe_mod.extract_completion_reps(object(), tok, [("q", "pp"), (own, "pp")], system="S")
+    rendered = [r for r in tok.rendered if r.endswith("<a>")]
+    assert rendered == ["^<s>S|<u>q|<a>", "^<s>mine|<u>q|<a>"]  # a list's own system message is kept

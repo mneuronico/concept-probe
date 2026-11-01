@@ -187,10 +187,10 @@ def rate_batch_coherence(
     NOTE: this sends the batch's completions to the external Groq API. Do not use it for
     data that must not leave the machine.
 
-    api_key: explicit key; when None, GROQ_API_KEY from the environment, then from the file
-    ``env_path`` if one is given (no .env file is read otherwise).
-    model: explicit model id; when None, GROQ_MODEL from the environment or ``env_path``, then
-    the package default. (An explicitly passed model is never overridden.)
+    api_key: explicit key; when None, GROQ_API_KEY from the file ``env_path`` if one is given,
+    then from the environment (no .env file is read unless passed).
+    model: explicit model id; when None, GROQ_MODEL from ``env_path``, then from the environment,
+    then the package default. Explicit arguments win over the file, the file over the environment.
 
     Saves output to <batch_dir>/coherence_rating.json and returns the list. Each entry records
     the judge model and when it rated: the ratings are labels from another model, not ground
@@ -200,11 +200,11 @@ def rate_batch_coherence(
         raise ValueError("max_elements_per_request must be positive.")
 
     env_file = _read_env_file(env_path)
-    api_key = api_key or os.environ.get("GROQ_API_KEY") or env_file.get("GROQ_API_KEY")
+    api_key = api_key or env_file.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY")
     if not api_key:
         raise EnvironmentError("Missing GROQ_API_KEY (set it in the environment, or pass api_key or env_path).")
     if model is None:
-        model = os.environ.get("GROQ_MODEL") or env_file.get("GROQ_MODEL") or DEFAULT_MODEL
+        model = env_file.get("GROQ_MODEL") or os.environ.get("GROQ_MODEL") or DEFAULT_MODEL
 
     batch_path = Path(batch_dir).resolve()
     if not batch_path.exists():

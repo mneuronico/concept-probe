@@ -112,11 +112,11 @@
   },
   "steering": {
     "do_steering": true,
-    "steer_sampling": true,
+    "steer_sampling": false,
     "steer_temperature": 0.7,
     "steer_top_p": 0.9,
     "steer_max_new_tokens": 64,
-    "steer_layers": "window",
+    "steer_layers": "probe",
     "steer_window_radius": 2,
     "steer_distribute": true
   },

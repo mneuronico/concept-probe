@@ -27,7 +27,9 @@ def load_defaults(path: Optional[str] = None) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         custom = json.load(f)
     check_config_keys(custom, packaged, what=f"defaults file {path}")
-    return custom
+    # Merged over the packaged defaults: a setting the file leaves out keeps the library's
+    # default instead of falling back to whatever the code would assume.
+    return deep_merge(packaged, custom)
 
 
 def resolve_config(

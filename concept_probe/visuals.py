@@ -15,6 +15,10 @@ _SPECIAL_MARKERS = {
     "<|im_end|>",
     "<start_of_turn>",
     "<end_of_turn>",
+    "<bos>",
+    "<eos>",
+    "<pad>",
+    "<|endoftext|>",
 }
 
 _ROLE_ALIASES = {
@@ -568,7 +572,10 @@ def plot_sweep(
     *,
     best_layer: Optional[int] = None,
     search_intervals: Optional[Iterable[Tuple[int, int]]] = None,
+    selection_d: Optional[Iterable[float]] = None,
 ) -> bool:
+    """d and p per layer on all eval items. ``selection_d`` (the d on the selection half of the
+    eval items, which chose ``best_layer``) is drawn dashed when given."""
     try:
         import matplotlib.pyplot as plt
     except Exception:
@@ -583,7 +590,11 @@ def plot_sweep(
         for lo, hi in search_intervals:
             for axis in ax:
                 axis.axvspan(lo - 0.5, hi + 0.5, color="#f2e6b0", alpha=0.35, zorder=0)
-    ax[0].plot(layers, d, color="#cc3d3d")
+    ax[0].plot(layers, d, color="#cc3d3d", label="all eval items")
+    if selection_d is not None:
+        sel = np.array(list(selection_d), dtype=np.float32)
+        ax[0].plot(layers, sel, color="#cc3d3d", linestyle="--", alpha=0.6, label="selection half (chose the layer)")
+        ax[0].legend(fontsize=8)
     ax[0].set_ylabel("Cohen's d")
     ax[0].set_title("Layer sweep")
 

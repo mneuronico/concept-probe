@@ -33,11 +33,13 @@ class LayerSteerer:
 
 
 class MultiLayerSteererLayerwise:
-    """Add ``alpha * v_l`` to the output of each block ``l`` in ``layer_indices``.
+    """Add ``alpha_l * v_l`` to the output of each block ``l`` in ``layer_indices``.
 
-    ``distribute`` divides alpha by the number of layers. ``layer_scales`` (optional, one
-    factor per steered layer) multiplies each layer's alpha, e.g. by that layer's mean
-    residual norm for ``alpha_unit="resid_norm"``.
+    Each layer adds its own concept vector ``concept_vectors[l]`` (the probe trained at that
+    layer), not one layer's vector copied to the others. ``alpha_l`` is ``alpha``, divided by
+    the number of steered layers when ``distribute``, and multiplied by ``layer_scales[l]`` when
+    given (e.g. that layer's mean residual norm for ``alpha_unit="resid_norm"``);
+    :meth:`per_layer_alpha` returns them.
     """
 
     def __init__(
@@ -57,18 +59,25 @@ class MultiLayerSteererLayerwise:
         self.layer_scales = layer_scales
         self.steerers: List[LayerSteerer] = []
 
+    def per_layer_alpha(self) -> Dict[int, float]:
+        """The alpha each steered layer adds its vector with."""
+        if not self.layer_indices:
+            return {}
+        per = self.alpha / len(self.layer_indices) if self.distribute else self.alpha
+        return {
+            li: float(per * (1.0 if self.layer_scales is None else float(self.layer_scales[li])))
+            for li in self.layer_indices
+        }
+
     def __enter__(self):
         if self.alpha == 0.0 or len(self.layer_indices) == 0:
             return self
-        per = self.alpha / len(self.layer_indices) if self.distribute else self.alpha
-        for li in self.layer_indices:
-            v_li = self.concept_vectors[li]
-            scale = 1.0 if self.layer_scales is None else float(self.layer_scales[li])
+        for li, alpha_li in self.per_layer_alpha().items():
             s = LayerSteerer(
                 model=self.model,
                 layer_idx=li,
-                direction_cpu=torch.tensor(v_li, dtype=torch.float32),
-                alpha=float(per * scale),
+                direction_cpu=torch.tensor(self.concept_vectors[li], dtype=torch.float32),
+                alpha=alpha_li,
             )
             s.__enter__()
             self.steerers.append(s)
