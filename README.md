@@ -200,6 +200,12 @@ from one forward pass:
 reps = extract_text_reps(model, tokenizer, new_texts, pool=["assistant_all_mean", "assistant_last"])
 ```
 
+The probe learns whatever separates the two sets of texts, so if the poles also differ in
+length, negation, punctuation, topic or phrasing, the direction mixes the concept with that, and
+held-out accuracy does not show it. [docs/building_datasets.md](docs/building_datasets.md)
+describes how to write varied texts, audit them, and red-team the probe until it cannot be fooled
+by a confound in the data.
+
 ## Evaluation
 
 The evaluation that picks the layer and measures the effect uses the same kind of data as
@@ -452,6 +458,7 @@ repo.
 ```text
 concept-probe/
   concept_probe/          # library package
+  docs/                   # guides (building_datasets.md)
   examples/               # general examples only
   pyproject.toml
   README.md
