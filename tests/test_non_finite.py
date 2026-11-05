@@ -7,14 +7,17 @@ import numpy as np
 import pytest
 import torch
 
-from concept_probe import NonFiniteActivationsError, extract_text_reps
+from concept_probe import Encoded, NonFiniteActivationsError, Patch, extract_text_reps, intervene, read_encoded
 from concept_probe.modeling import get_transformer_layers
-from concept_probe.patching import ActivationPatch, patched_forward_hidden_states
-from concept_probe.probe import forward_hidden_states_all_layers
 from fakes import CharChatTok
 from tiny_model import TinyCausalLM
 
-IDS = torch.tensor([[ord(c) for c in "^pp nx"]])
+IDS = torch.tensor([ord(c) for c in "^pp nx"])
+
+
+def _every_token(model):
+    # (tokens, layers, dim): every token of the input at every layer
+    return read_encoded(model, CharChatTok(), [Encoded(IDS)], "sequence_tokens", cache=False).data
 
 
 def _overflow_from(model, layer):
@@ -25,8 +28,8 @@ def _overflow_from(model, layer):
 
 
 def test_finite_hidden_states_pass():
-    hs = forward_hidden_states_all_layers(TinyCausalLM(), IDS)
-    assert len(hs) == 4 and all(bool(torch.isfinite(h).all()) for h in hs)
+    hs = _every_token(TinyCausalLM())
+    assert hs.shape[:2] == (6, 4) and np.all(np.isfinite(hs))
 
 
 def test_non_finite_hidden_states_raise_naming_layers_and_dtype():
@@ -34,7 +37,7 @@ def test_non_finite_hidden_states_raise_naming_layers_and_dtype():
     handle = _overflow_from(model, 2)
     try:
         with pytest.raises(NonFiniteActivationsError, match=r"layers \[2, 3\] of 4.*torch\.float64"):
-            forward_hidden_states_all_layers(model, IDS)
+            _every_token(model)
     finally:
         handle.remove()
 
@@ -50,10 +53,11 @@ def test_reading_texts_stops_at_the_overflow():
 
 
 def test_a_patch_that_writes_nan_is_caught():
-    patch = ActivationPatch(layer=1, positions=[2], values=torch.full((16,), float("nan")))
-    with pytest.raises(NonFiniteActivationsError, match=r"layers \[1, 2, 3\]"):
-        patched_forward_hidden_states(TinyCausalLM(), IDS, [patch])
-    # a finite patch still runs
-    ok = ActivationPatch(layer=1, positions=[2], values=torch.zeros(16))
-    hs = patched_forward_hidden_states(TinyCausalLM(), IDS, [ok])
-    np.testing.assert_allclose(hs[1][2].numpy(), 0.0)
+    model = TinyCausalLM()
+    with intervene(model, Patch(1, [2], torch.full((16,), float("nan")))):
+        with pytest.raises(NonFiniteActivationsError, match=r"layers \[1, 2, 3\]"):
+            _every_token(model)
+    # a finite patch still runs, and reading reports the patched value at the patched layer
+    with intervene(model, Patch(1, [2], torch.zeros(16))):
+        hs = _every_token(model)
+    np.testing.assert_allclose(hs[2, 1], 0.0)

@@ -16,7 +16,7 @@ from concept_probe.logger import JsonlLogger
 from concept_probe.probe import ConceptProbe
 from concept_probe.reporting import _fit_model
 from concept_probe.utils import deep_merge, json_dump
-from fakes import CharChatTok, CharModel, fake_forward
+from fakes import CharChatTok, CharModel
 
 
 # ------------------------------------------------------------- paired eval items
@@ -31,8 +31,7 @@ def _generate(model, tokenizer, system, prompts, *args, **kwargs):
 
 
 def _train(tmp_path, monkeypatch, overrides=None, concept=None, generate=_generate):
-    monkeypatch.setattr(probe_mod, "forward_hidden_states_all_layers", fake_forward)
-    monkeypatch.setattr(probe_mod, "generate_batch", generate)
+    monkeypatch.setattr(probe_mod, "_generate_pairs", generate)
     cfg = resolve_config(deep_merge({
         "prompts": {"train_questions": ["q1", "q2"], "eval_questions": [f"e{i}" + "+" * i for i in range(8)]},
         "evaluation": {"n_permutations": 20, "n_bootstrap": 20},
@@ -97,8 +96,9 @@ def test_score_texts_has_no_z_without_references_from_the_same_reading(tmp_path,
     probe, _, _ = _train(tmp_path, monkeypatch)
     probe.model_bundle.model = CharModel()
     probe.calibrations = [c for c in probe.calibrations if c.source == "evaluation"]  # generated completions only
-    rec = probe.score_texts(["ppx"], save_html=False)[0]
-    assert rec["scores_standardized"] is False and rec["score_mean_z"] is None
+    scores = probe.score_texts(["ppx"], save_html=False)
+    assert scores[0].token_z["c"] is None and scores[0].score_mean_z["c"] is None
+    assert "no calibration for items read as raw text" in scores.z_missing["c"]
     events = [json.loads(line) for line in (tmp_path / "log.jsonl").read_text().splitlines()]
     assert any("no calibration for items read as raw text" in e.get("message", "") for e in events)
 
@@ -130,10 +130,7 @@ def test_the_random_control_is_one_direction_at_every_layer():
 
 # ------------------------------------------------------------- scoring outputs
 def _scoring_probe(tmp_path, monkeypatch, name="c", config=None):
-    monkeypatch.setattr(probe_mod, "forward_hidden_states_all_layers", fake_forward)
-    from concept_probe import multi_probe as multi_mod
 
-    monkeypatch.setattr(multi_mod, "forward_hidden_states_all_layers", fake_forward)
     bundle = SimpleNamespace(model_id="fake", tokenizer=CharChatTok(), model=CharModel(), num_layers=2)
     probe = ConceptProbe(model_bundle=bundle, config=resolve_config(config or {"output": {"console": False}}),
                          concept=ConceptSpec(name=name, pos_label="p", neg_label="n", pos_system="a", neg_system="b"),
@@ -145,18 +142,18 @@ def _scoring_probe(tmp_path, monkeypatch, name="c", config=None):
 
 
 def test_repeated_alphas_get_their_own_files(tmp_path, monkeypatch):
-    recs = _scoring_probe(tmp_path, monkeypatch).score_prompts(["hi"], alphas=[0.0, 0.0, 0.0], save_html=False)
-    assert len({r["npz_path"] for r in recs}) == 3
+    scores = _scoring_probe(tmp_path, monkeypatch).score_prompts(["hi"], alphas=[0.0, 0.0, 0.0], save_html=False)
+    assert len(scores) == 3 and scores.column("alpha_index") == [0, 1, 2]
 
 
 def test_a_reused_batch_directory_raises_unless_overwriting(tmp_path, monkeypatch):
     probe = _scoring_probe(tmp_path, monkeypatch)
-    probe.score_prompts(["hi"], batch_subdir="b", save_html=False)
+    probe.score_prompts(["hi"], batch_subdir="b", save_html=False, save=True)
     with pytest.raises(FileExistsError):
-        probe.score_prompts(["hi"], batch_subdir="b", save_html=False)
+        probe.score_prompts(["hi"], batch_subdir="b", save_html=False, save=True)
     old = os.path.join(probe.run_dir, "scores", "b", "coherence_rating.json")
     open(old, "w").write("[]")
-    probe.score_prompts(["hi"], batch_subdir="b", save_html=False, overwrite=True)
+    probe.score_prompts(["hi"], batch_subdir="b", save_html=False, overwrite=True, save=True)
     assert not os.path.exists(old)
 
 

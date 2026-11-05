@@ -19,13 +19,9 @@ from .modeling import ModelBundle, QUANTIZATION_LEVELS
 from .reading import EmptySpanError, Readout, Reps, read_encoded, read_texts
 from .record import Choice
 from .settings import configure
-from .patching import (
-    ActivationPatch,
-    ResidualStreamEditor,
-    build_patch_edit_fn,
-    cache_residual_stream,
-    patched_forward_hidden_states,
-)
+from .interventions import Ablate, Add, Compose, Edit, Intervention, Patch, Rotate, Where, intervene
+from .generation import AnswerLogprobs, Generation, Generations, TokenStep, answer_logprobs, generate
+from .scoring import ScoredItem, Scores
 from .console import ConsoleLogger
 from .concept_runner import train_concept_from_json
 from .reporting import generate_multi_probe_report
@@ -44,6 +40,12 @@ def rate_batch_coherence(*args, **kwargs):
     from .coherence import rate_batch_coherence as _rate_batch_coherence
 
     return _rate_batch_coherence(*args, **kwargs)
+
+
+def rate_coherence(*args, **kwargs):
+    from .coherence import rate_coherence as _rate_coherence
+
+    return _rate_coherence(*args, **kwargs)
 
 
 __all__ = [
@@ -85,11 +87,23 @@ __all__ = [
     "Choice",
     "configure",
     "multi_probe_score_prompts",
-    "ActivationPatch",
-    "ResidualStreamEditor",
-    "build_patch_edit_fn",
-    "cache_residual_stream",
-    "patched_forward_hidden_states",
+    "Intervention",
+    "Add",
+    "Ablate",
+    "Patch",
+    "Rotate",
+    "Edit",
+    "Compose",
+    "Where",
+    "intervene",
+    "generate",
+    "Generation",
+    "Generations",
+    "TokenStep",
+    "answer_logprobs",
+    "AnswerLogprobs",
+    "Scores",
+    "ScoredItem",
     "ConsoleLogger",
     "train_concept_from_json",
     "EvalRunResult",
@@ -100,5 +114,6 @@ __all__ = [
     "aggregate_eval_batches",
     "rate_batch_coherence_safe",
     "rate_batch_coherence",
+    "rate_coherence",
     "generate_multi_probe_report",
 ]

@@ -87,15 +87,19 @@ concept = ConceptSpec(
 workspace = ProbeWorkspace(model_id="meta-llama/Llama-3.2-3B-Instruct")
 probe = workspace.train_concept(concept)
 
-probe.score_prompts(
+scores = probe.score_prompts(
     prompts=["Write a short paragraph about the ocean."],
     alphas=[0.0, 6.0, -6.0],
     alpha_unit="sigma",
 )
+scores.z()                       # each completion's z: the prompt at each alpha, in order
+[item.text for item in scores]   # the completions
 ```
 
-Outputs are written under `outputs/<concept_name>/<timestamp>/`. A `run_name` that already
-holds a run raises instead of mixing two runs; pass `overwrite=True` to replace it.
+Outputs are written under `outputs/<concept_name>/<timestamp>/`, and each call's scores in a
+folder of their own under `scores/` (see [Generating and scoring](#generating-and-scoring)). A
+`run_name` that already holds a run raises instead of mixing two runs; pass `overwrite=True` to
+replace it.
 
 ## Loading the model
 
@@ -390,15 +394,16 @@ Without evaluation, `best_d`/`best_p` are null and the sweep is NaN.
 Probe scores are raw projections onto the unit concept direction, with an arbitrary offset.
 Each probe stores two references per layer, both from the evaluation items:
 
-- per item (`score_center`, `score_scale`): the midpoint between the poles' mean item score and
-  the pooled within-pole SD of item scores, where an item's score is its mean over its tokens;
+- per item (`center`, `scale` of its calibration): the midpoint between the poles' mean item
+  score and the pooled within-pole SD of item scores, where an item's score is its mean over its
+  tokens;
 - per token (`token_center`, `token_scale`): the same over single tokens.
 
 A single token spreads much more than a mean over a text's tokens, which averages most of the
 token-to-token variation away, so the two scales differ (by 1.9-3.4x across layers in a 1B
-Llama on ~16-token texts). Scoring functions save standardized scores next to the raw ones, each
-with its own reference: per-token z (`scores_z_per_layer`, `scores_agg_z`, shown in the heatmaps)
-and the z of an item's mean (`score_mean_z`). In both, 0 is the midpoint between the poles, so
+Llama on ~16-token texts). Scoring functions give standardized scores next to the raw ones, each
+with its own reference: per-token z (`token_z`, shown in the heatmaps) and the z of an item's mean
+(`score_mean_z`). In both, 0 is the midpoint between the poles, so
 positive leans toward the positive pole, and 1 is a within-pole SD.
 
 **z = 0 does not mean "without the concept".** It is the midpoint between the mean scores of the
@@ -419,7 +424,7 @@ them without a split), and saves it as `threshold` in `metrics.json` and in the 
 
 **z for another reading context.** A probe trained on texts has no z references for the
 completions `score_prompts` generates (they are read differently), so their `score_mean_z` is
-None. The scorers now say why in each record (`z_missing`) and in a warning. `probe.calibrate(pos_texts,
+None. The scorers say why (`scores.z_missing`) and warn. `probe.calibrate(pos_texts,
 neg_texts, as_reply_to=prompts)` measures references on texts read as replies to those prompts,
 which is how generations are read; with `role` / `system_prompt` / `prompt` instead, it calibrates
 texts read that way.
@@ -453,22 +458,97 @@ number of layers actually steered (3 instead of 5 for a window at the first laye
   With one steered layer, `alpha=0.1` adds 10% of a typical token's norm; distributed over n
   layers, each adds `0.1 / n` of its own layer's norm.
 
-Each record has `steer_layers` and `steer_alpha_per_layer`, the alpha each layer applied after
-distribution and units.
+The scores' `settings` have the steered layers (`steer_layers`), and each item's `info` the alpha
+each layer applied after distribution and units (`steer_alpha_per_layer`) and the intervention.
+`probe.steering(alpha, unit)` gives that intervention, to use anywhere (see [Interventions](#interventions)).
 
 Generation is greedy by default (`steering.steer_sampling = false`), so a prompt at an alpha has
 one completion. With sampling, the RNGs are seeded with `seed`, or else `random.seed`, so the
-completions are reproducible (best effort: GPU kernels are not bit-deterministic). Each record
-has the settings it was generated with under `generation`. An empty completion has
-`score_mean` null.
+completions are reproducible for the same batch size (best effort: GPU kernels are not
+bit-deterministic). The scores' `settings` have the generation settings under `generation`. An
+empty completion has `score_mean` null.
 `random_scoring_vector` / `random_steering_vector` use one random direction per probe, derived
 from its name and run directory, so the control is the same vector in every function. It is the
 same direction at every layer (with each layer's norm): concept vectors of adjacent layers point
 nearly the same way, so independent random directions would partly cancel and push the residual
 stream about half as far as the concept.
 
-Each prompt and alpha gets its own files, so repeated alphas (several samples, with sampling on) do not overwrite
-each other. A `batch_subdir` that already holds files raises unless `overwrite=True`.
+Repeated alphas (several samples, with sampling on) are separate items (`info["alpha_index"]`). A
+`batch_subdir` that already holds files raises unless `overwrite=True`.
+
+## Generating and scoring
+
+`score_texts`, `score_prompts` and `multi_probe_score_prompts` return a `Scores` object in memory:
+one item per text or generation, in order (for generations, prompt by prompt, each prompt's
+alphas in the order given).
+
+```python
+scores = probe.score_prompts(prompts, alphas=[-4.0, 0.0, 4.0])
+scores.means(), scores.z()            # each item's mean token score and its z (NaN where none)
+alphas = scores.column("alpha")       # any value of the items' info, to group or filter them
+item = scores[0]
+item.text, item.tokens, item.span     # the completion, every token, and the completion's span
+item.token_scores["valence"]          # the probe's score of every token (keyed by probe name)
+item.token_z["valence"]               # their z, or None without a calibration for this reading
+item.scores["valence"]                # raw projections per token and scoring layer
+```
+
+Prompts are generated `batch_size` at a time (`steering.gen_batch_size`, by default
+`training.gen_batch_size`, 16), padded on the left; completions are then read again, without the
+steering, in batches of `readout.batch_size`. On a Qwen 2.5 0.5B in an RTX 2060, eight prompts went
+from 10.5 s one at a time to 1.3 s in a batch, with the same greedy completions (in half precision
+one of eight can differ in its last tokens; `batch_size=1` reproduces generating alone).
+
+Each call saves (decision D4; `save=False`, or `concept_probe.configure(save=False)`, turns it off)
+one folder: `scores.npz` (every item's token ids, tokens and per-token scores per layer, per probe
+and in z), `scores.jsonl` (one readable line per item: prompt, alpha, text, mean score, z),
+`heatmaps.html` (every item, with a menu to pick the probe; positive in blue, negative in orange)
+and `settings.json`. `Scores.load(folder)` reads it back. `save_segments=True` adds each message's
+mean score to the lines.
+
+The pieces are public:
+
+- `generate(model, tokenizer, prompts, ...)` generates in batches, optionally under an
+  intervention, and returns the generations (token ids, where the completion is, text);
+  `on_token=` is called at every step with the score of each probe in `watch=` on the token just
+  read (with steering on, that reading includes the added vector); `keep_logits="all"` or a number
+  keeps the logits (or the top ones) of each generated token, as the steered model produced them.
+- `answer_logprobs(model, tokenizer, prompts, answers, intervention=...)` gives log P(answer |
+  prompt) for given answers, in batches: `probs()` renormalizes them, `log_odds(0, 1)` compares
+  two. An answer is tokenized on its own, so write it as the model would (with a leading space
+  when it would put one); `answer_tokens` shows the tokens.
+- `score_text_tokens(model, tokenizer, vectors, text)` scores every token of a raw text with any
+  directions.
+
+## Interventions
+
+An intervention says what to change in the residual stream, at which layers and positions, with
+any vectors, and `intervene(model, intervention)` applies it while a `with` block runs: whatever
+the model does inside (generating, reading, a forward pass) runs on the edited stream.
+
+```python
+from concept_probe import Add, Ablate, Patch, Rotate, Edit, intervene
+
+Add({12: v}, alpha=4.0)                       # steer: add 4 v at layer 12 (a dict, or an array per layer)
+Ablate(directions, layers=[10, 11, 12])       # project the direction out (several rows: a subspace)
+Ablate({12: v}, value=0.5)                    # set the stream's coordinate along v to 0.5
+Patch(12, positions=[-1], values=donor)       # overwrite the last prompt token with a donor's activation
+Rotate(u, w, angle=np.pi / 4, layers=[12])    # rotate in the plane of u and w
+Edit(my_function, layers=[12])                # anything: my_function(layer, hidden, where) -> hidden
+Add({12: v}, 4.0) + Ablate({20: u})           # several, in order
+
+with intervene(model, Ablate(probe.directions, layers=range(16))):
+    reps = read_texts(model, tokenizer, texts)   # read with the direction removed
+```
+
+Layer `l` is the output of block `l`, as everywhere. Positions count each row's own tokens from 0,
+without padding, so an intervention means the same in a batch padded on either side and while
+generating with a cache; negative positions count back from the end of the prompt, and
+`"prompt"` / `"generated"` select those parts (`None`, the default, is every position).
+`probe.steering(alpha, unit)` builds the `Add` a probe steers with, and `generate`,
+`answer_logprobs` and `score_prompts` take any intervention. Reading under an intervention reports
+the stream after the edit at an edited layer (what the next block receives; Hugging Face's
+`output_hidden_states` records it before) and neither reads nor fills the representations cache.
 
 ## Directions: reading and steering
 
@@ -604,19 +684,26 @@ Under strong steering, format drift counts as a wrong answer, so check `extracte
 accuracy as correctness. `marker` works in both `run_scored_eval` and `run_multi_scored_eval`; a
 `marker` together with your own `evaluator` raises, since it would not be used.
 
+`run_scored_eval` and `run_multi_scored_eval` return the scores (`results`, a `Scores`), one record
+per generation with the evaluator's verdict (`per_sample`), and where the analysis was written (it
+is written next to the saved scores, so not when they were not saved).
+`generate_multi_probe_report` takes what `run_multi_scored_eval` returned, or a batch folder.
+
 `multi_probe_score_prompts` runs one model for every probe, so the probes must come from the same
 model identity (the model, the dtype used, the quantization, the chat template and its date). The generation
 settings (system prompt, `max_new_tokens`, sampling and, when sampling, `temperature`, `top_p`
 and the seed) come from the arguments or, when not passed, from the probes' configs, which must
 then agree. Non-zero alphas need `steer_probe` (index, name or probe); the steering layers and
-their distribution come from its config. The npz of each prompt has every probe's per-layer
-scores (`scores_per_layer_<i>`, `layer_indices_<i>`, in the order of `probe_names`), and
-warnings go to the run's log as well as the console.
+their distribution come from its config. Each item has every probe's scores, keyed by its name;
+`scores.npz` has them as `scores_<i>` and `layers_<i>` in the order of `probe_names`. Warnings go
+to the run's log as well as the console.
 
 Coherence rating sends completions to the external Groq API, so it is off by default
 (`rate_coherence=False`). The key is the `api_key` argument, else `GROQ_API_KEY` from a file you
 pass as `coherence_env_path`, else from the environment; no `.env` is read unless passed. Ratings record the judge model and
-date: they are labels from another model, not ground truth.
+date: they are labels from another model, not ground truth. `rate_coherence(texts)` rates texts in
+memory; `rate_batch_coherence(folder)` rates a saved batch's completions and saves
+`coherence_rating.json`, one rating per generation by its index in the scores.
 
 ## Loading a trained probe
 
@@ -638,7 +725,9 @@ recorded are compared on their config, whose dtype may be `"auto"`: that one is 
 `concept_probe/defaults.json` holds every setting. Overrides with a key the defaults do not have
 (a misspelling, for instance) raise instead of being ignored. The model settings are described in
 [Loading the model](#loading-the-model); `readout.batch_size` and `output.rep_cache`,
-`output.rep_cache_dir` and `output.rep_cache_dtype` in [Reading representations](#reading-representations).
+`output.rep_cache_dir` and `output.rep_cache_dtype` in [Reading representations](#reading-representations);
+`steering.gen_batch_size` and `output.generation_logits` (null, `"all"` or a number of top logits
+to keep) in [Generating and scoring](#generating-and-scoring).
 
 ## JSON-driven workflow
 
@@ -690,6 +779,15 @@ from concept_probe import (
     ModelBundle,
     configure,
     multi_probe_score_prompts,
+    Scores,
+    generate,
+    answer_logprobs,
+    intervene,
+    Add,
+    Ablate,
+    Patch,
+    Rotate,
+    Edit,
     train_concept_from_json,
     generate_multi_probe_report,
     run_scored_eval,
@@ -717,6 +815,38 @@ GitHub Actions CI runs the same lightweight checks and also builds source and wh
 
 ### Unreleased
 
+- **Interventions** (`concept_probe.interventions`): `Add`, `Ablate` (project out, or set a
+  coordinate; one direction or a subspace), `Patch`, `Rotate`, `Edit` (a function of your own) and
+  their sums, applied with `intervene(model, ...)`, at layers and positions counted per row without
+  padding. Reading under one reports the edited stream at the edited layer and skips the cache.
+  `probe.steering(alpha, unit)` builds a probe's steering. They replace `ResidualStreamEditor`,
+  `ActivationPatch`, `build_patch_edit_fn`, `patched_forward_hidden_states`,
+  `cache_residual_stream`, `LayerSteerer` and `MultiLayerSteererLayerwise`, which are gone.
+- **Generation in batches, in memory**: `generate` (left padding, an optional intervention,
+  `on_token` with each watched probe's score while generating, `keep_logits`) replaces
+  `generate_once` and `generate_batch`; training's opposed mode now generates in batches too (the
+  same completions on the test model). `answer_logprobs` gives the probability of given answers
+  under an intervention.
+- **Scoring returns `Scores`**: `score_texts`, `score_prompts` and `multi_probe_score_prompts`
+  return every item's tokens and per-token scores in memory, instead of a list of records (or a
+  dict) pointing at one npz and one HTML file per generation. They generate and read in batches
+  (8x faster in a 0.5B model), save one folder per call (`scores.npz`, `scores.jsonl`,
+  `heatmaps.html`, `settings.json`) and follow the session's `save` setting. The per-layer token z
+  (`scores_z_per_layer`) is no longer saved (it is the per-layer scores standardized with the token
+  references). Sampled completions differ from before, since a batch draws its tokens in another
+  order. Heatmaps show positive in blue and negative in orange, as the other figures.
+- **Settings removed**: `steering.do_steering` (the alphas decide), `output.save_token_scores_npz`
+  (saving is on or off as a whole), `output.save_generation_logits`, `generation_logits_top_k` and
+  `generation_logits_dtype` (now `output.generation_logits`; the logits come from the generation
+  itself, with no extra pass). Runs saved with them still load. `steering.gen_batch_size` is new.
+- **Removed**: `forward_hidden_states_all_layers` (`read_encoded(..., "sequence_tokens")` reads
+  every token of an input; the readout is new), `token_scores_from_hs_layers`,
+  `render_token_heatmap`, `render_token_heatmap_multi` and `render_batch_heatmap` (one renderer,
+  `render_heatmaps`).
+- **Evals read from memory**: `run_scored_eval` / `run_multi_scored_eval` build their records
+  from the returned scores (`scores_index` instead of `npz_path` / `html_path`); coherence ratings
+  are matched by that index instead of by file name, and `rate_coherence(texts)` rates texts in
+  memory. `generate_multi_probe_report` accepts the returned run.
 - **Loading.** `model.dtype` defaults to `"auto"`: bfloat16 on GPUs that compute in it, float16
   on older ones (float32 for Gemma 3), float32 on the CPU. It used to be bfloat16 everywhere,
   which older GPUs only emulate, slowly. `model.quantization` takes `"nf4"`, `"int8"`, `"hqq4"`,

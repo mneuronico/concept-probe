@@ -6,14 +6,12 @@ import numpy as np
 import pytest
 import torch
 
-from concept_probe import multi_probe as multi_mod
 from concept_probe import Calibration, ReadContext, preview_input
-from concept_probe import probe as probe_mod
 from concept_probe.config import ConceptSpec, resolve_config
 from concept_probe.logger import JsonlLogger
 from concept_probe.multi_probe import multi_probe_score_prompts
 from concept_probe.probe import ConceptProbe, _encode_text_for_read, _normalize_messages
-from fakes import CharChatTok, CharModel, fake_forward
+from fakes import CharChatTok, CharModel
 
 
 # ------------------------------------------------------------- system prompts
@@ -56,8 +54,7 @@ def test_a_template_that_strips_the_text_warns_once():
 
 # ------------------------------------------------------------- probes on fakes
 def _probe(tmp_path, monkeypatch, name="c", vectors=None, config=None):
-    monkeypatch.setattr(probe_mod, "forward_hidden_states_all_layers", fake_forward)
-    monkeypatch.setattr(multi_mod, "forward_hidden_states_all_layers", fake_forward)
+    # CharModel's hidden states are those of fakes.fake_forward: 'p' is +1, 'n' is -1 at layer 0
     bundle = SimpleNamespace(model_id="fake", tokenizer=CharChatTok(), model=CharModel(), num_layers=2)
     probe = ConceptProbe(
         model_bundle=bundle,
@@ -81,17 +78,20 @@ def _probe(tmp_path, monkeypatch, name="c", vectors=None, config=None):
 
 
 def test_score_texts_reads_the_raw_text_by_default(tmp_path, monkeypatch):
-    rec = _probe(tmp_path, monkeypatch).score_texts(["ppx"])[0]
-    assert rec["role"] == "raw" and rec["system_prompt"] is None
-    assert rec["input_text"] == "^ppx" and rec["text_span"] == [1, 4]
-    z = np.load(rec["npz_path"])
-    np.testing.assert_allclose(z["scores_agg"], [0, 1, 1, 0])
+    scores = _probe(tmp_path, monkeypatch).score_texts(["ppx"], save=True)
+    it = scores[0]
+    assert it.info["role"] == "raw" and it.info["system_prompt"] is None
+    assert it.info["input_text"] == "^ppx" and it.span == (1, 4)
+    np.testing.assert_allclose(it.token_scores["c"], [0, 1, 1, 0])
     # single tokens use the token references: (score - 0.5) / 0.25
-    np.testing.assert_allclose(z["scores_agg_z"], [-2, 2, 2, -2])
-    assert rec["scores_standardized"]
+    np.testing.assert_allclose(it.token_z["c"], [-2, 2, 2, -2])
     # the text's mean over its own tokens uses the item references: (2/3 - 0) / 0.5
-    assert rec["score_mean"] == pytest.approx(2 / 3)
-    assert rec["score_mean_z"] == pytest.approx(4 / 3)
+    assert scores.means()[0] == pytest.approx(2 / 3)
+    assert scores.z()[0] == pytest.approx(4 / 3)
+    # and the same numbers are on disk, one set of files for the call
+    saved = type(scores).load(scores.dir)
+    np.testing.assert_allclose(saved[0].token_z["c"], it.token_z["c"])
+    assert sorted(os.listdir(scores.dir)) == ["scores.jsonl", "scores.npz", "settings.json"]
 
 
 def test_score_texts_rejects_settings_its_role_would_ignore(tmp_path, monkeypatch):
@@ -100,39 +100,40 @@ def test_score_texts_rejects_settings_its_role_would_ignore(tmp_path, monkeypatc
         probe.score_texts(["ppx"], system_prompt="S")
     with pytest.raises(ValueError, match="assistant"):
         probe.score_texts(["ppx"], role="user", prompt="q")
-    rec = probe.score_texts(["ppx"], role="user", system_prompt="S")[0]
-    assert rec["input_text"] == "^<s>S|<u>ppx|"
+    it = probe.score_texts(["ppx"], role="user", system_prompt="S")[0]
+    assert it.info["input_text"] == "^<s>S|<u>ppx|"
 
 
 def test_score_prompts_adds_no_system_and_excludes_the_end_of_sequence_token(tmp_path, monkeypatch):
     probe = _probe(tmp_path, monkeypatch)
-    rec = probe.score_prompts(["hi"], alphas=[0.0], save_html=False)[0]
-    assert rec["prompt_text"] == "^<u>hi|<a>"
-    assert rec["completion"] == "pp"
-    assert rec["completion_end"] == rec["prompt_len"] + 2
-    assert rec["score_mean"] == pytest.approx(1.0)  # 'pp' only; with the '$' it would be 2/3
-    assert rec["score_mean_z"] == pytest.approx(2.0)  # (1 - 0) / 0.5, item references
+    it = probe.score_prompts(["hi"], alphas=[0.0], save_html=False)[0]
+    assert "".join(it.tokens[:it.span[0]]) == "^<u>hi|<a>"
+    assert it.text == "pp"
+    assert it.span[1] == it.span[0] + 2 and it.tokens[it.span[1]] == "$"
+    assert it.score_mean["c"] == pytest.approx(1.0)  # 'pp' only; with the '$' it would be 2/3
+    assert it.score_mean_z["c"] == pytest.approx(2.0)  # (1 - 0) / 0.5, item references
 
 
 def test_resid_norm_steering_scales_each_layer(tmp_path, monkeypatch):
     probe = _probe(tmp_path, monkeypatch)
-    rec = probe.score_prompts(["hi"], alphas=[0.1], alpha_unit="resid_norm", steer_layers=[0, 1], save_html=False)[0]
-    assert rec["alpha_value"] == pytest.approx(0.1)
-    assert rec["steer_layer_scales"] == {0: 2.0, 1: 4.0}
+    it = probe.score_prompts(["hi"], alphas=[0.1], alpha_unit="resid_norm", steer_layers=[0, 1], save_html=False)[0]
+    assert it.info["alpha_value"] == pytest.approx(0.1)
+    assert it.info["steer_layer_scales"] == {0: 2.0, 1: 4.0}
+    assert it.info["steer_alpha_per_layer"] == {0: pytest.approx(0.1), 1: pytest.approx(0.2)}  # divided, then scaled
 
 
 def test_the_random_control_vector_of_a_probe_is_the_same_everywhere(tmp_path, monkeypatch):
     probe = _probe(tmp_path, monkeypatch)
-    text_rec = probe.score_texts(["ppx"], random_scoring_vector=True)[0]
-    prompt_rec = probe.score_prompts(["hi"], alphas=[1.0], random_scoring_vector=True,
-                                     random_steering_vector=True, save_html=False)[0]
+    texts = probe.score_texts(["ppx"], random_scoring_vector=True)
+    prompts = probe.score_prompts(["hi"], alphas=[1.0], random_scoring_vector=True,
+                                  random_steering_vector=True, save_html=False)
     multi = multi_probe_score_prompts([probe], ["hi"], random_scoring_vector=True, save_html=False,
                                       output_root=str(tmp_path / "multi"))
     seeds = {
-        text_rec["random_scoring_vector_seed"],
-        prompt_rec["random_scoring_vector_seed"],
-        prompt_rec["random_steering_vector_seed"],
-        multi["results"][0]["random_scoring_vector_seed_by_probe"]["c"],
+        texts.settings["random_scoring_vector_seed"],
+        prompts.settings["random_scoring_vector_seed"]["c"],
+        prompts.settings["random_steering_vector_seed"],
+        multi.settings["random_scoring_vector_seed"]["c"],
     }
     assert len(seeds) == 1
 
@@ -140,14 +141,14 @@ def test_the_random_control_vector_of_a_probe_is_the_same_everywhere(tmp_path, m
 def test_multi_probe_score_means_exclude_the_end_of_sequence_token(tmp_path, monkeypatch):
     a = _probe(tmp_path, monkeypatch, "a")
     b = _probe(tmp_path, monkeypatch, "b", vectors=[[-1.0, 0.0], [-1.0, 0.0]])
-    rec = multi_probe_score_prompts([a, b], ["hi"], save_html=False, output_root=str(tmp_path / "m"))["results"][0]
-    assert rec["score_mean_by_probe"] == {"a": pytest.approx(1.0), "b": pytest.approx(-1.0)}
-    assert rec["score_mean_z_by_probe"]["a"] == pytest.approx(2.0)
+    it = multi_probe_score_prompts([a, b], ["hi"], save_html=False, output_root=str(tmp_path / "m"))[0]
+    assert it.score_mean == {"a": pytest.approx(1.0), "b": pytest.approx(-1.0)}
+    assert it.score_mean_z["a"] == pytest.approx(2.0)
 
 
 def test_a_repeated_run_name_does_not_mix_runs(tmp_path, monkeypatch):
     probe = _probe(tmp_path, monkeypatch)
-    kwargs = dict(save_html=False, output_root=str(tmp_path / "m"), run_name="same")
+    kwargs = dict(save_html=False, output_root=str(tmp_path / "m"), run_name="same", save=True)
     multi_probe_score_prompts([probe], ["hi"], **kwargs)
     with pytest.raises(FileExistsError):
         multi_probe_score_prompts([probe], ["hi"], **kwargs)
@@ -174,12 +175,12 @@ def test_multi_probe_generation_settings_must_agree_or_be_passed(tmp_path, monke
     b = _probe(tmp_path, monkeypatch, "b", config=_cfg(steering={"steer_temperature": 0.2}))
     # greedy (the default) does not use the temperature, so the disagreement does not matter
     out = multi_probe_score_prompts([a, b], ["hi"], output_root=str(tmp_path / "g"))
-    assert out["results"][0]["generation"]["temperature"] is None
+    assert out.settings["generation"]["temperature"] is None
     with pytest.raises(ValueError, match="steer_temperature"):
         multi_probe_score_prompts([a, b], ["hi"], greedy=False, output_root=str(tmp_path / "m"))
     out = multi_probe_score_prompts([a, b], ["hi"], greedy=False, temperature=0.5, output_root=str(tmp_path / "m"))
-    assert out["results"][0]["completion"] == "pp"
-    assert out["results"][0]["generation"]["temperature"] == 0.5
+    assert out[0].text == "pp"
+    assert out.settings["generation"]["temperature"] == 0.5
 
 
 def test_multi_probe_steers_with_the_steering_probe_settings(tmp_path, monkeypatch):
@@ -188,9 +189,10 @@ def test_multi_probe_steers_with_the_steering_probe_settings(tmp_path, monkeypat
     a = _probe(tmp_path, monkeypatch, "a")
     b = _probe(tmp_path, monkeypatch, "b", config=_cfg(steering={"steer_distribute": False}))
     out = multi_probe_score_prompts([a, b], ["hi"], alphas=[1.0], steer_probe=1, steer_layers=[0],
-                                    output_root=str(tmp_path / "m"))
-    config = json.load(open(os.path.join(out["run_dir"], "config.json")))
-    assert config["steering"]["steer_distribute"] is False
+                                    output_root=str(tmp_path / "m"), save=True)
+    config = json.load(open(os.path.join(out.settings["run_dir"], "config.json")))
+    assert config["steer_distribute"] is False and config["steer_probe"] == "b"
+    assert out[0].info["steer_alpha_per_layer"] == {0: 1.0}
 
 
 # ------------------------------------------------------------- marker

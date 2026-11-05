@@ -3,7 +3,7 @@ import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
     from groq import Groq
@@ -45,69 +45,6 @@ def _read_env_file(env_path: Optional[str]) -> Dict[str, str]:
         key, value = line.split("=", 1)
         values[key.strip()] = value.strip().strip('"').strip("'")
     return values
-
-
-def _find_log_jsonl(start_dir: Path, max_levels: int = 6) -> Path:
-    # Bounded ascent: run layout is <run_dir>/log.jsonl with batches at most a few levels
-    # below; walking to the filesystem root risks latching onto an unrelated log.jsonl.
-    cur = start_dir.resolve()
-    for parent in [cur] + list(cur.parents)[:max_levels]:
-        candidate = parent / "log.jsonl"
-        if candidate.exists():
-            return candidate
-    raise FileNotFoundError(
-        f"Could not find log.jsonl within {max_levels} levels above {start_dir}"
-    )
-
-
-def _normalize_npz_path(path_str: str, repo_root: Path, log_dir: Path) -> Path:
-    raw = Path(path_str)
-    if raw.is_absolute():
-        return raw.resolve()
-    candidate = (repo_root / raw).resolve()
-    if candidate.exists():
-        return candidate
-    return (log_dir / raw).resolve()
-
-
-def _iter_log_entries(log_path: Path) -> Iterable[Dict[str, object]]:
-    with log_path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                yield json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-
-def _collect_completion_map(log_path: Path, repo_root: Path) -> Dict[str, str]:
-    completion_map: Dict[str, str] = {}
-    log_dir = log_path.parent
-    for entry in _iter_log_entries(log_path):
-        event = entry.get("event")
-        payload = entry.get("data", entry)
-        if event not in {"score_prompt", "multi_score_prompt"}:
-            continue
-        npz_path = payload.get("npz_path")
-        completion = payload.get("completion")
-        if not isinstance(npz_path, str) or not isinstance(completion, str):
-            continue
-        normalized = _normalize_npz_path(npz_path, repo_root, log_dir)
-        completion_map[str(normalized)] = completion
-        # cwd-independent key: logged npz paths may be relative to a different working
-        # directory, so also index by <batch_name>/<file_name>.
-        raw = Path(npz_path)
-        completion_map[f"{raw.parent.name}/{raw.name}"] = completion
-    return completion_map
-
-
-def _list_batch_npz(batch_dir: Path) -> List[Path]:
-    npz_files = sorted(batch_dir.glob("prompt_*.npz"))
-    if npz_files:
-        return npz_files
-    return sorted(p for p in batch_dir.glob("*.npz") if p.name != "tensors.npz")
 
 
 def _chunked(items: List[Dict[str, object]], size: int) -> Iterable[List[Dict[str, object]]]:
@@ -173,6 +110,53 @@ def _validate_ratings(items: List[Dict[str, object]]) -> Dict[int, str]:
     return ratings
 
 
+def _credentials(model: Optional[str], api_key: Optional[str], env_path: Optional[str]) -> Tuple[str, str]:
+    env_file = _read_env_file(env_path)
+    api_key = api_key or env_file.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        raise EnvironmentError("Missing GROQ_API_KEY (set it in the environment, or pass api_key or env_path).")
+    if model is None:
+        model = env_file.get("GROQ_MODEL") or os.environ.get("GROQ_MODEL") or DEFAULT_MODEL
+    return model, api_key
+
+
+def rate_coherence(
+    texts: Sequence[str],
+    max_elements_per_request: int = DEFAULT_MAX_PER_REQUEST,
+    *,
+    model: Optional[str] = None,
+    api_key: Optional[str] = None,
+    env_path: Optional[str] = None,
+) -> List[str]:
+    """Rate each text as COHERENT, PARTIALLY_COHERENT or NONSENSE with a judge model; returns the
+    ratings in order.
+
+    NOTE: this sends the texts to the external Groq API. Do not use it for data that must not leave
+    the machine. The ratings are labels from another model, not ground truth.
+
+    api_key: explicit key; when None, GROQ_API_KEY from the file ``env_path`` if one is given,
+    then from the environment (no .env file is read unless passed). model: explicit model id; when
+    None, GROQ_MODEL from ``env_path``, then from the environment, then the package default.
+    """
+    if max_elements_per_request <= 0:
+        raise ValueError("max_elements_per_request must be positive.")
+    model, api_key = _credentials(model, api_key, env_path)
+    items = [{"id": i, "completion": str(t)} for i, t in enumerate(texts)]
+    print(f"Sending {len(items)} completions to the Groq API (model={model}) for coherence rating.")
+    ratings_by_id: Dict[int, str] = {}
+    for chunk in _chunked(items, max_elements_per_request):
+        content = _call_groq(api_key, model, messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps(chunk, ensure_ascii=False)},
+        ])
+        ratings_by_id.update(_validate_ratings(_parse_json_list(content)))
+        time.sleep(0.1)
+    missing = [i for i in range(len(items)) if i not in ratings_by_id]
+    if missing:
+        raise RuntimeError(f"Missing rating for id {missing[0]} ({len(missing)} missing).")
+    return [ratings_by_id[i] for i in range(len(items))]
+
+
 def rate_batch_coherence(
     batch_dir: str,
     max_elements_per_request: int = DEFAULT_MAX_PER_REQUEST,
@@ -180,88 +164,23 @@ def rate_batch_coherence(
     model: Optional[str] = None,
     api_key: Optional[str] = None,
     env_path: Optional[str] = None,
-) -> List[Dict[str, str]]:
+) -> List[Dict[str, Any]]:
+    """Rate the completions of a saved batch of scores (its ``scores.jsonl``) with
+    :func:`rate_coherence`, and save them to ``<batch_dir>/coherence_rating.json``: one entry per
+    generation, with its ``index`` in the scores, the rating, the judge model and when it rated.
     """
-    Rate completion coherence for a score batch directory.
-
-    NOTE: this sends the batch's completions to the external Groq API. Do not use it for
-    data that must not leave the machine.
-
-    api_key: explicit key; when None, GROQ_API_KEY from the file ``env_path`` if one is given,
-    then from the environment (no .env file is read unless passed).
-    model: explicit model id; when None, GROQ_MODEL from ``env_path``, then from the environment,
-    then the package default. Explicit arguments win over the file, the file over the environment.
-
-    Saves output to <batch_dir>/coherence_rating.json and returns the list. Each entry records
-    the judge model and when it rated: the ratings are labels from another model, not ground
-    truth.
-    """
-    if max_elements_per_request <= 0:
-        raise ValueError("max_elements_per_request must be positive.")
-
-    env_file = _read_env_file(env_path)
-    api_key = api_key or env_file.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY")
-    if not api_key:
-        raise EnvironmentError("Missing GROQ_API_KEY (set it in the environment, or pass api_key or env_path).")
-    if model is None:
-        model = env_file.get("GROQ_MODEL") or os.environ.get("GROQ_MODEL") or DEFAULT_MODEL
-
     batch_path = Path(batch_dir).resolve()
-    if not batch_path.exists():
-        raise FileNotFoundError(f"Batch directory not found: {batch_dir}")
-
-    repo_root = Path.cwd().resolve()
-    log_path = _find_log_jsonl(batch_path)
-    completion_map = _collect_completion_map(log_path, repo_root)
-    npz_files = _list_batch_npz(batch_path)
-    if not npz_files:
-        raise FileNotFoundError(f"No .npz files found in {batch_dir}")
-
-    records: List[Tuple[int, Path, str]] = []
-    missing: List[str] = []
-    for idx, npz_path in enumerate(npz_files):
-        completion = completion_map.get(str(npz_path.resolve()))
-        if completion is None:
-            completion = completion_map.get(f"{npz_path.parent.name}/{npz_path.name}")
-        if completion is None:
-            missing.append(npz_path.name)
-            continue
-        records.append((idx, npz_path, completion))
-
-    if missing:
-        raise RuntimeError(
-            "Missing completions for some .npz files. "
-            f"First missing: {missing[0]} (total missing: {len(missing)})"
-        )
-
-    items = [{"id": idx, "completion": completion} for idx, _, completion in records]
-    print(f"Sending {len(items)} completions to the Groq API (model={model}) for coherence rating.")
-    ratings_by_id: Dict[int, str] = {}
-    for chunk in _chunked(items, max_elements_per_request):
-        user_payload = json.dumps(chunk, ensure_ascii=False)
-        content = _call_groq(
-            api_key,
-            model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_payload},
-            ],
-        )
-        parsed = _parse_json_list(content)
-        ratings_by_id.update(_validate_ratings(parsed))
-        time.sleep(0.1)
-
+    lines_path = batch_path / "scores.jsonl"
+    if not lines_path.exists():
+        raise FileNotFoundError(f"No scores.jsonl in {batch_dir}")
+    lines = [json.loads(l) for l in lines_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    model, api_key = _credentials(model, api_key, env_path)
+    ratings = rate_coherence([l["text"] for l in lines], max_elements_per_request, model=model, api_key=api_key)
     rated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    results: List[Dict[str, str]] = []
-    for idx, npz_path, _ in records:
-        rating = ratings_by_id.get(idx)
-        if rating is None:
-            raise RuntimeError(f"Missing rating for id {idx}.")
-        results.append({"example": npz_path.name, "rating": rating, "judge_model": model, "rated_at": rated_at})
-
-    out_path = batch_path / "coherence_rating.json"
-    out_path.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
+    results = [{"index": i, "rating": r, "judge_model": model, "rated_at": rated_at} for i, r in enumerate(ratings)]
+    (batch_path / "coherence_rating.json").write_text(json.dumps(results, indent=2, ensure_ascii=False),
+                                                      encoding="utf-8")
     return results
 
 
-__all__ = ["rate_batch_coherence"]
+__all__ = ["rate_coherence", "rate_batch_coherence"]

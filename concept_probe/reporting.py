@@ -1,10 +1,10 @@
 import json
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
-from .eval_system import correctness_label, item_key
+from .eval_system import EvalRunResult, correctness_label, item_key
 
 
 def _load_items(path: Path) -> Tuple[List[Dict[str, object]], Path]:
@@ -311,25 +311,37 @@ def _html_escape(text: str) -> str:
 
 
 def generate_multi_probe_report(
-    path: str,
+    source: Union[str, "EvalRunResult"],
     *,
     title: str = "Multi-Probe Report",
     output_name: str = "report.html",
+    out_dir: Optional[str] = None,
     seed: int = 123,
 ) -> Path:
     """
     Build an interactive HTML report for a multi-probe eval batch.
 
     Args:
-        path: Batch directory or analysis/per_sample.json path.
+        source: what ``run_multi_scored_eval`` returned (in memory), or a batch directory or its
+            analysis/per_sample.json path.
         title: Title shown in the HTML.
-        output_name: Output HTML filename (written under the analysis dir).
+        output_name: Output HTML filename.
+        out_dir: where to write it; by default the batch's analysis directory.
         seed: Random seed for the cross-validation folds.
 
     Charts show one steering alpha at a time (a selector switches between them); the
     correctness model uses every alpha, with alpha as a covariate.
     """
-    items, analysis_dir = _load_items(Path(path))
+    if isinstance(source, EvalRunResult):
+        items = [r for r in source.per_sample if isinstance(r, dict)]
+        analysis_dir = Path(out_dir or source.analysis_dir or "")
+        if not (out_dir or source.analysis_dir):
+            raise ValueError("The eval run was not saved; pass out_dir= to say where to write the report.")
+    else:
+        items, analysis_dir = _load_items(Path(source))
+        if out_dir is not None:
+            analysis_dir = Path(out_dir)
+    analysis_dir.mkdir(parents=True, exist_ok=True)
     probe_names = _extract_probe_names(items)
     if not probe_names:
         raise ValueError("No probe names found in per_sample.json.")

@@ -61,7 +61,7 @@ def test_an_evaluator_cannot_overwrite_the_scoring_fields(tmp_path, monkeypatch)
 
 
 def test_an_empty_completion_has_no_score_in_any_probe():
-    assert np.isnan(E._score_mean_by_probe_from_result({"score_mean_by_probe": {"a": None, "b": 1.0}})["a"])
+    assert np.isnan(E._score_or_nan(None)) and E._score_or_nan(1.0) == 1.0
 
 
 # ------------------------------------------------------------- report
@@ -117,7 +117,7 @@ def test_aggregation_warns_when_an_item_repeats_at_an_alpha(tmp_path, capsys):
 # ------------------------------------------------------------- coherence key
 def test_an_explicit_env_file_wins_over_the_environment(tmp_path, monkeypatch):
     probe = _probe(tmp_path, monkeypatch)
-    rec = probe.score_prompts(["hi"], save_html=False)[0]
+    scores = probe.score_prompts(["hi"], save_html=False, save=True)
     env = tmp_path / "keys.env"
     env.write_text("GROQ_API_KEY=from-file\n")
     monkeypatch.setenv("GROQ_API_KEY", "from-environment")
@@ -129,5 +129,5 @@ def test_an_explicit_env_file_wins_over_the_environment(tmp_path, monkeypatch):
 
     monkeypatch.setattr(coherence, "_call_groq", fake_call)
     with pytest.raises(RuntimeError, match="stop"):
-        coherence.rate_batch_coherence(os.path.dirname(rec["npz_path"]), env_path=str(env))
+        coherence.rate_batch_coherence(scores.dir, env_path=str(env))
     assert used == ["from-file"]

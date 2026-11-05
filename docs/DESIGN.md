@@ -174,7 +174,8 @@ hoy). Los métodos que sólo usan arrays (puntaje crudo, z, clasificar) no neces
   direcciones de empujar y las unidades de la probe. Con un vector cualquiera es lo mismo sin probe.
 - Con padding a la izquierda, las intervenciones en posiciones fijas tienen que correrse por el
   padding de cada fila: es el detalle técnico más delicado de esta capa.
-- `LayerSteerer` y `MultiLayerSteererLayerwise` quedan como envoltorios (D7).
+- `LayerSteerer` y `MultiLayerSteererLayerwise` quedan como envoltorios (D7). *En la etapa 4 se
+  sacaron (D7 revisado).*
 
 ### Capa 5 — Generar y puntuar
 
@@ -266,18 +267,21 @@ concept_probe/
   record.py             #    registro de elecciones automáticas (consola, log, lo guardado)
 ```
 
+Desde las etapas 3 y 4 existen también:
+
+```
+concept_probe/
+  evaluation.py         # 6b evaluar la lectura: sets con nombre, nulos, etiquetas mezcladas
+  interventions.py      # 4  sumar, borrar, trasplantar, rotar, una función propia; intervene()
+  generation.py         # 5  generar en lotes, leer mientras genera, probabilidad de respuestas
+  scoring.py            # 5 y 7  puntuar con varias probes, Scores, sus archivos
+```
+
 Lo que falta, con los nombres provisionales de la propuesta:
 
 ```
 concept_probe/
-  core/                 # (etapas 3 a 6)
-    interventions.py    # 4
-    generate.py         # 5  generar, puntuar, probabilidad de respuestas
-    stats.py            # 6a
-    evaluate.py         # 6b y controles
-    steering_eval.py    # 6c
-  io.py, plots.py       # 7  guardadores, lectores, gráficos
-  record.py             #    registro de elecciones automáticas (consola, log, lo guardado)
+  steering_eval.py      # 6c (etapa 5)
   probe.py, multi_probe.py, eval_system.py, ...   # API de hoy, como composición
 ```
 
@@ -416,6 +420,28 @@ trasplantar, rotar, combinar), entradas 22, 21, 30 y 27. `score_prompts` y
 `multi_probe_score_prompts` como composición; `eval_system.py`, `coherence.py` y `reporting.py`
 leen de memoria.
 - Al terminar: generar y puntuar va en lotes, y nada obliga a escribir a disco.
+- *Hecha el 2026-11-05 (`interventions.py`, `generation.py`, `scoring.py`). Los números de puntuar
+  no cambiaron en los tests de referencia, salvo las respuestas con muestreo (en lotes el azar se
+  sortea en otro orden, D8); cambiaron, como se esperaba, los archivos: cada llamada guarda una
+  carpeta con `scores.npz`, `scores.jsonl`, `heatmaps.html` y `settings.json` (decidido el
+  2026-11-05: "pocos por llamada"). Probada con Qwen 2.5 0.5B en la RTX 2060: ocho pedidos en un
+  lote tardaron 1.3 s contra 10.5 s de a uno, con las mismas respuestas (7 de 8 iguales al empujar
+  en todas las posiciones, por redondeo en fp16); empujar solo los tokens generados, con la caché de
+  claves, da lo mismo en lote y de a uno; el z medio de las respuestas subió con la dosis (-0.47,
+  +1.58, +3.22); la lectura por token mientras genera coincide con la relectura (diferencia máxima
+  0.002); la probabilidad de una respuesta coincide con la calculada a mano, y borrar la dirección de
+  valencia en todas las capas bajó las chances de "Positive" frente a "Negative" en una reseña
+  positiva de 8.1 a 1.6. Cambios respecto de la propuesta: `LayerSteerer`,
+  `MultiLayerSteererLayerwise`, `ResidualStreamEditor`, `ActivationPatch` y sus funciones no quedan
+  como envoltorios sino que se sacan (D7 revisado), igual que `generate_once`, `generate_batch` y
+  `forward_hidden_states_all_layers`; `ResidualStreamEditor` no se conserva como mecanismo, porque
+  las posiciones por fila necesitan saber dónde está cada columna de cada llamada al modelo, y eso lo
+  hace `intervene`. Leer bajo una intervención informa, en la capa editada, el flujo ya editado (lo
+  que recibe la capa siguiente): Hugging Face registra la salida de un bloque antes de los hooks, y
+  M5 midió así el puntaje en la capa empujada sin el vector. Se sacan opciones que el formato nuevo
+  dejó sin sentido (`steering.do_steering`, `output.save_token_scores_npz` y las tres de los
+  logits, que pasan a ser `output.generation_logits`). Los heatmaps usan los colores de los otros
+  gráficos (positivo azul, negativo naranja).*
 
 **Etapa 5 — Evaluar el empuje (capa 6c).** Entradas 23 y 24.
 - Al terminar: `shared/steer.py` y las medidas de coherencia de `shared/measure.py` sobran.
@@ -481,7 +507,7 @@ estable; la 7 prueba el conjunto.
   Revisado el 2026-11-05 (la librería es para usuarios nuevos y el único usuario hasta ahora es el
   autor): sin sinónimos. `use_4bit` y `direction_normalization` ya no existen como opciones; las
   corridas guardadas con ellos se siguen cargando, traducidas al leerlas. Las clases viejas de
-  empuje se deciden en la etapa 4.
+  empuje y de trasplante también se sacan (etapa 4).
 - **D8. "Mismos resultados"** quiere decir iguales salvo redondeo. Leer y generar van en lotes por
   defecto; los tests de referencia comparan con tolerancia; lotes de 1 reproducen lo de hoy exacto.
 

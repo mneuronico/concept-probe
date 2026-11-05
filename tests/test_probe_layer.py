@@ -123,10 +123,10 @@ def test_what_needs_the_model_says_so_and_attach_gives_it(tmp_path):
     with pytest.raises(ValueError, match="dtype"):
         probe.attach(TinyCausalLM().float(), CharChatTok())
     probe.attach(model, tok)
-    rec = probe.score_texts(["pp x"], batch_subdir="b", save_html=False)[0]
-    assert rec["batch_dir"].startswith(str(tmp_path))  # the probe got a run folder when it first saved
+    scores = probe.score_texts(["pp x"], batch_subdir="b", save_html=False, save=True)
+    assert scores.dir.startswith(str(tmp_path))  # the probe got a run folder when it first saved
     z = probe.z(read_texts(model, tok, ["pp x"], cache=False))
-    np.testing.assert_allclose(rec["score_mean_z"], z[0], rtol=1e-4)
+    np.testing.assert_allclose(scores.z()[0], z[0], rtol=1e-4)
 
 
 def test_classify_uses_the_calibrated_threshold():
@@ -220,8 +220,8 @@ def test_training_reads_with_the_estimator_and_steers_with_the_raw_difference(tm
     assert "steering.steer_direction" in [c["setting"] for c in metrics["choices"]]
     assert not np.allclose(probe.steer_directions, probe.directions)
     assert metrics["steer_sigma_best_layer"] != metrics["sigma_best_layer"]
-    rec = probe.score_prompts(["say"], alphas=[2.0], alpha_unit="sigma", batch_subdir="b")[0]
-    assert rec["steer_alpha_per_layer"][probe.layer] == pytest.approx(2.0 * probe.steer_sigma)
+    it = probe.score_prompts(["say"], alphas=[2.0], alpha_unit="sigma", batch_subdir="b")[0]
+    assert it.info["steer_alpha_per_layer"][probe.layer] == pytest.approx(2.0 * probe.steer_sigma)
 
 
 def test_steering_can_use_the_reading_direction(tmp_path):
@@ -288,16 +288,16 @@ def test_an_older_run_steers_with_its_one_direction_and_says_so(tmp_path, capsys
 
 def test_a_texts_probe_says_why_generations_get_no_z_and_can_be_calibrated(tmp_path):
     _, probe, _ = _train(tmp_path)
-    rec = probe.score_prompts(["say"], batch_subdir="before")[0]
-    assert rec["score_mean_z"] is None and "as generated completions" in rec["z_missing"]
+    scores = probe.score_prompts(["say"], batch_subdir="before")
+    assert np.isnan(scores.z()[0]) and "as generated completions" in scores.z_missing[scores.probes[0]]
     probe.calibrate(EVAL_POS, _flip(EVAL_POS), as_reply_to="say")
-    rec = probe.score_prompts(["say"], batch_subdir="after")[0]
-    assert rec["score_mean_z"] is not None and rec["z_missing"] is None
+    scores = probe.score_prompts(["say"], batch_subdir="after")
+    assert np.isfinite(scores.z()[0]) and scores.z_missing[scores.probes[0]] is None
 
 
 def test_reading_arrays_and_scoring_texts_give_the_same_z(tmp_path):
     _, probe, _ = _train(tmp_path)
     texts = ["pp xp", "nn yn", "xyz"]
-    from_records = [r["score_mean_z"] for r in probe.score_texts(texts, batch_subdir="z")]
+    from_records = probe.score_texts(texts, batch_subdir="z").z()
     reps = read_texts(probe.model_bundle.model, probe.model_bundle.tokenizer, texts, cache=False)
     np.testing.assert_allclose(probe.z(reps, ReadContext(role="raw")), from_records, rtol=1e-4)

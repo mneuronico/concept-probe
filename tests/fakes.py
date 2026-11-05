@@ -132,4 +132,22 @@ class CharModel(torch.nn.Module):
     def generate(self, input_ids, max_new_tokens=8, **kwargs):
         self.calls.append(input_ids)
         tail = torch.tensor([[ord(c) for c in self.completion + "$"]], dtype=torch.long)
-        return torch.cat([input_ids, tail], dim=1)
+        return torch.cat([input_ids, tail.expand(input_ids.shape[0], -1)], dim=1)
+
+
+@torch.no_grad()
+def hidden_states_alone(model, input_ids):
+    """Reference reading of one input, alone and unpadded: one ``(seq_len, dim)`` float32 tensor per
+    block output, the last one taken before the final norm (as the library reads it). Tests compare
+    the batched readers with it."""
+    ids = input_ids.reshape(1, -1)
+    captured = {}
+    norm = model.model.norm
+    handle = norm.register_forward_pre_hook(lambda module, args: captured.__setitem__("pre", args[0]))
+    try:
+        out = model(input_ids=ids, attention_mask=torch.ones_like(ids), output_hidden_states=True)
+    finally:
+        handle.remove()
+    hs = list(out.hidden_states)
+    hs[-1] = captured["pre"]
+    return [h[0].float() for h in hs[1:]]

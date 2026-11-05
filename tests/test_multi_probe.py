@@ -5,11 +5,11 @@ import numpy as np
 import pytest
 import torch
 
-from concept_probe import multi_probe as multi_mod
 from concept_probe.config import ConceptSpec, resolve_config
 from concept_probe.logger import JsonlLogger
 from concept_probe.multi_probe import multi_probe_score_prompts
 from concept_probe.probe import ConceptProbe
+from fakes import FunctionModel
 
 
 class _Tok:
@@ -23,16 +23,19 @@ class _Tok:
         return "x" * len(list(ids))
 
 
-class _Model:
-    device = torch.device("cpu")
-
-    def generate(self, input_ids, max_new_tokens=8, **kwargs):
-        return torch.cat([input_ids, torch.tensor([[8, 9]], dtype=torch.long)], dim=1)
-
-
 def _fake_forward(model, input_ids, **kwargs):
     n = int(input_ids.shape[-1])
     return [torch.arange(1, n + 1, dtype=torch.float32).unsqueeze(1).repeat(1, 2)]  # one layer, dim 2
+
+
+class _Model(FunctionModel):
+    """Token t of any input reads (t + 1, t + 1); generate appends the tokens 8 and 9."""
+
+    def __init__(self):
+        super().__init__(_fake_forward)
+
+    def generate(self, input_ids, max_new_tokens=8, **kwargs):
+        return torch.cat([input_ids, torch.tensor([[8, 9]], dtype=torch.long).expand(input_ids.shape[0], -1)], dim=1)
 
 
 def _probe(tmp_path, name, vectors, bundle):
@@ -55,15 +58,14 @@ def bundle():
     return SimpleNamespace(model_id="fake", tokenizer=_Tok(), model=_Model(), num_layers=1)
 
 
-def test_each_probe_is_scored_with_its_own_vectors(tmp_path, monkeypatch, bundle):
-    monkeypatch.setattr(multi_mod, "forward_hidden_states_all_layers", _fake_forward)
+def test_each_probe_is_scored_with_its_own_vectors(tmp_path, bundle):
     a = _probe(tmp_path, "a", [[1.0, 0.0]], bundle)
     b = _probe(tmp_path, "b", [[-1.0, 0.0]], bundle)
     out = multi_probe_score_prompts([a, b], ["hi"], output_root=str(tmp_path / "multi"), save_html=False)
-    rows = np.load(out["results"][0]["npz_path"])["scores_agg"]
-    np.testing.assert_allclose(rows[0], [1, 2, 3, 4, 5])
-    np.testing.assert_allclose(rows[1], -rows[0])
-    assert out["results"][0]["score_mean_by_probe"] == {"a": 4.5, "b": -4.5}
+    it = out[0]
+    np.testing.assert_allclose(it.token_scores["a"], [1, 2, 3, 4, 5])
+    np.testing.assert_allclose(it.token_scores["b"], -it.token_scores["a"])
+    assert it.score_mean == {"a": 4.5, "b": -4.5} and it.span == (3, 5)
 
 
 @pytest.mark.parametrize("names", [("a", "a"), ("my concept", "my_concept")])

@@ -3,7 +3,8 @@ import numpy as np
 import torch
 import pytest
 
-from concept_probe.probe import EmptySpanError, reps_from_hs_layers, token_scores_from_hs_layers
+from concept_probe.generation import TokenScorer
+from concept_probe.probe import EmptySpanError, reps_from_hs_layers
 
 # 2 layers, 4 tokens, dim 2; token t has value (t+1) in both dims, layer 1 doubled.
 HS = [
@@ -44,22 +45,9 @@ def test_unknown_mode_raises():
 
 
 def test_token_scores_per_layer_and_aggregates():
-    cv = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
-    per_layer, agg = token_scores_from_hs_layers(HS, cv, [0, 1], aggregate="mean")
-    np.testing.assert_allclose(per_layer[:, 0], [1, 2, 3, 4])
-    np.testing.assert_allclose(per_layer[:, 1], [2, 4, 6, 8])
-    np.testing.assert_allclose(agg, [1.5, 3, 4.5, 6])
-
-    _, agg_sum = token_scores_from_hs_layers(HS, cv, [0, 1], aggregate="sum")
-    np.testing.assert_allclose(agg_sum, [3, 6, 9, 12])
-
-
-def test_token_scores_reference_layer():
-    cv = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
-    per_layer, _ = token_scores_from_hs_layers(HS, cv, [0, 1], aggregate="mean", reference_layer=0)
-    # both layers projected on cv[0] = e0
-    np.testing.assert_allclose(per_layer[:, 0], [1, 2, 3, 4])
-    np.testing.assert_allclose(per_layer[:, 1], [2, 4, 6, 8])
-
-    with pytest.raises(ValueError):
-        token_scores_from_hs_layers(HS, cv, [0], aggregate="mean", reference_layer=5)
+    per_layer = np.array([[1.0, 2.0], [2.0, 4.0], [3.0, 6.0], [4.0, 8.0]], dtype=np.float32)
+    mean = TokenScorer("c", [0, 1], np.eye(2, dtype=np.float32), "mean")
+    np.testing.assert_allclose(mean.combine(per_layer), [1.5, 3, 4.5, 6])
+    total = TokenScorer("c", [0, 1], np.eye(2, dtype=np.float32), "sum")
+    np.testing.assert_allclose(total.combine(per_layer), [3, 6, 9, 12])
+    assert mean.token_z(per_layer) is None  # no calibration, no z

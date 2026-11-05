@@ -182,17 +182,14 @@ def _run_summary(probe):
     return out
 
 
-def _npz_arrays(path, keys):
-    if not path:
-        return {}
-    data = np.load(path)
-    return {k: data[k] for k in keys if k in data.files}
-
-
 # --------------------------------------------------------------------------- tests
 @pytest.mark.parametrize("key", list(TRAININGS))
 def test_train_concept(probes, key):
     _check(f"train_{key}", _run_summary(probes[key]))
+
+
+def _item_z(it, name):
+    return {} if it.token_z[name] is None else {"scores_agg_z": it.token_z[name]}
 
 
 def test_score_texts(probes):
@@ -201,20 +198,33 @@ def test_score_texts(probes):
                         ("shared", {"random_scoring_vector": True}), ("texts", {"reference_layer": 0})):
         texts = TEXTS_TO_SCORE if kwargs.get("role") == "user" else TEXTS_TO_SCORE[:3]
         name = f"{key}_" + "_".join(sorted(kwargs)) if kwargs else key
-        records = probes[key].score_texts(texts, batch_subdir=name, **kwargs)
+        scores = probes[key].score_texts(texts, batch_subdir=name, save=True, **kwargs)
+        n = scores.probes[0]
         out[name] = [
-            dict({k: r[k] for k in ("input_text", "text_span", "layers", "score_mean", "score_mean_z",
-                                    "scores_standardized", "random_scoring_vector_seed", "system_prompt")},
-                 **_npz_arrays(r["npz_path"], ("scores_per_layer", "scores_agg", "scores_z_per_layer", "scores_agg_z")))
-            for r in records
+            dict(input_text=it.info["input_text"], text_span=it.info["text_span"], layers=it.layers[n],
+                 score_mean=it.score_mean[n], score_mean_z=it.score_mean_z[n],
+                 scores_standardized=it.token_z[n] is not None,
+                 random_scoring_vector_seed=scores.settings["random_scoring_vector_seed"],
+                 system_prompt=it.info["system_prompt"], scores_per_layer=it.scores[n], scores_agg=it.token_scores[n],
+                 **_item_z(it, n))
+            for it in scores
         ]
-        out[name + "_files"] = _files(records[0]["batch_dir"])
+        out[name + "_files"] = _files(scores.dir)
     _check("score_texts", out)
 
 
-PROMPT_KEYS = ("prompt_text", "completion", "prompt_len", "completion_end", "alpha", "alpha_unit", "alpha_value",
-               "steer_layers", "steer_layer_scales", "steer_alpha_per_layer", "layers", "score_mean", "score_mean_z",
-               "do_steering", "random_scoring_vector_seed", "random_steering_vector_seed", "sampling_seed")
+def _prompt_record(scores, it, tok):
+    n, i = scores.probes[0], it.info
+    return dict(
+        prompt_text=tok.decode(it.token_ids[:i["prompt_len"]].tolist()), completion=it.text, prompt_len=i["prompt_len"],
+        completion_end=i["completion_end"], alpha=i["alpha"], alpha_unit=i["alpha_unit"], alpha_value=i["alpha_value"],
+        steer_layers=scores.settings["steer_layers"], steer_layer_scales=i["steer_layer_scales"],
+        steer_alpha_per_layer=i["steer_alpha_per_layer"], layers=it.layers[n], score_mean=it.score_mean[n],
+        score_mean_z=it.score_mean_z[n], do_steering=bool(i["steer_alpha_per_layer"]),
+        random_scoring_vector_seed=scores.settings["random_scoring_vector_seed"][n],
+        random_steering_vector_seed=scores.settings["random_steering_vector_seed"],
+        sampling_seed=scores.settings["generation"]["seed"], scores_per_layer=it.scores[n],
+        scores_agg=it.token_scores[n], **_item_z(it, n))
 
 
 def test_score_prompts(probes):
@@ -230,27 +240,27 @@ def test_score_prompts(probes):
     out = {}
     for name, kwargs in calls.items():
         probe = probes["texts" if name == "texts_probe" else "shared"]
-        records = probe.score_prompts(QUESTIONS[:3], batch_subdir=name, **kwargs)
-        out[name] = [
-            dict({k: r[k] for k in PROMPT_KEYS},
-                 **_npz_arrays(r["npz_path"], ("scores_per_layer", "scores_agg", "scores_agg_z")))
-            for r in records
-        ]
-        out[name + "_files"] = _files(records[0]["batch_dir"])
+        scores = probe.score_prompts(QUESTIONS[:3], batch_subdir=name, save=True, **kwargs)
+        out[name] = [_prompt_record(scores, it, probe.model_bundle.tokenizer) for it in scores]
+        out[name + "_files"] = _files(scores.dir)
     _check("score_prompts", out)
 
 
 def test_multi_probe_score_prompts(probes):
-    run = multi_probe_score_prompts(
+    scores = multi_probe_score_prompts(
         [probes["shared"], probes["opposed"], probes["texts_var"]], QUESTIONS[:3], alphas=[0.0, 4.0],
-        steer_probe="shared", output_root=str(probes["root"] / "multi"), run_name="ref", batch_subdir="b",
+        steer_probe="shared", output_root=str(probes["root"] / "multi"), run_name="ref", batch_subdir="b", save=True,
     )
+    nan = lambda it: np.full(len(it.token_ids), np.nan, np.float32)  # noqa: E731
     out = {"records": [
-        dict({k: r[k] for k in ("completion", "prompt_len", "completion_end", "alpha_value", "steer_alpha_per_layer",
-                                "steer_layers", "score_mean_by_probe", "score_mean_z_by_probe", "probe_names")},
-             **_npz_arrays(r["npz_path"], ("scores_agg", "scores_agg_z")))
-        for r in run["results"]
-    ], "files": _files(run["run_dir"])}
+        dict(completion=it.text, prompt_len=it.info["prompt_len"], completion_end=it.info["completion_end"],
+             alpha_value=it.info["alpha_value"], steer_alpha_per_layer=it.info["steer_alpha_per_layer"],
+             steer_layers=scores.settings["steer_layers"], score_mean_by_probe=it.score_mean,
+             score_mean_z_by_probe=it.score_mean_z, probe_names=scores.probes,
+             scores_agg=np.stack([it.token_scores[n] for n in scores.probes]),
+             scores_agg_z=np.stack([nan(it) if it.token_z[n] is None else it.token_z[n] for n in scores.probes]))
+        for it in scores
+    ], "files": _files(scores.settings["run_dir"])}
     _check("multi_probe_score_prompts", out)
 
 

@@ -26,32 +26,11 @@ from .inputs import (
     encode_text,
     token_char_offsets,
 )
+from .interventions import active_interventions, edited_outputs
 from .modeling import _resolve_attr_path, attention_mask_from_ids, get_transformer_layers, identity_of
 from .record import Choice, announce
 from .settings import default_rep_cache_dir, settings
 from .utils import resolve_layer_index
-
-
-def _slice_generation_step_logits(
-    full_logits: torch.Tensor,
-    *,
-    prompt_len: int,
-    total_tokens: int,
-) -> torch.Tensor:
-    if full_logits.ndim != 2:
-        raise ValueError(f"Expected full logits shape (seq_len, vocab_size); got {tuple(full_logits.shape)}")
-
-    generated_steps = max(0, int(total_tokens) - int(prompt_len))
-    if generated_steps <= 0:
-        return full_logits.new_empty((0, int(full_logits.shape[-1])))
-
-    start = 0 if int(prompt_len) <= 0 else int(prompt_len) - 1
-    end = start + generated_steps
-    if end > int(full_logits.shape[0]):
-        raise ValueError(
-            f"Cannot slice generation logits: prompt_len={prompt_len}, total_tokens={total_tokens}, logits_seq_len={int(full_logits.shape[0])}"
-        )
-    return full_logits[start:end]
 
 
 # Mirrors the wrapper layouts handled by modeling.get_transformer_layers, so any model
@@ -118,68 +97,6 @@ def check_finite_hidden_states(hs_layers: Sequence[torch.Tensor], model) -> None
     )
 
 
-@torch.no_grad()
-def forward_hidden_states_all_layers(
-    model,
-    input_ids: torch.Tensor,
-    *,
-    return_generation_logits: bool = False,
-    generation_prompt_len: Optional[int] = None,
-) -> Union[List[torch.Tensor], Tuple[List[torch.Tensor], torch.Tensor]]:
-    """Per-layer hidden states ``(seq_len, hidden_dim)`` (CPU float32) of one input: entry ``l`` is
-    the output of block ``l``. Raises :class:`NonFiniteActivationsError` on NaN or inf."""
-    attn = attention_mask_from_ids(input_ids).to(model.device)
-
-    final_norm = _get_final_norm_module(model)
-    captured: Dict[str, torch.Tensor] = {}
-
-    def _capture_pre_norm(module, args):
-        x = args[0] if isinstance(args, tuple) else args
-        captured["pre_norm"] = x.detach()
-
-    handle = final_norm.register_forward_pre_hook(_capture_pre_norm)
-    try:
-        out = model(
-            input_ids=input_ids.to(model.device),
-            attention_mask=attn,
-            output_hidden_states=True,
-            use_cache=False,
-            return_dict=True,
-        )
-    finally:
-        handle.remove()
-
-    if "pre_norm" not in captured:
-        raise RuntimeError(
-            "Forward pre-hook on final norm did not fire; model layout is unexpected."
-        )
-
-    hs = list(out.hidden_states)
-    # HF returns the post-final-norm tensor as hidden_states[-1] for decoder-only LMs,
-    # collapsing the last layer to a much smaller scale than the rest of the residual
-    # stream. Replace it with the pre-norm input so all layers are on the same scale.
-    hs[-1] = captured["pre_norm"]
-
-    num_layers = len(hs) - 1
-    hs_layers = [hs[l + 1][0].detach().float().cpu() for l in range(num_layers)]
-    check_finite_hidden_states(hs_layers, model)
-    if not return_generation_logits:
-        return hs_layers
-
-    logits = getattr(out, "logits", None)
-    if logits is None:
-        raise ValueError("Model output does not include logits; cannot save generation logits.")
-    logits_2d = logits[0]
-    seq_len = int(input_ids.shape[-1])
-    prompt_len = seq_len if generation_prompt_len is None else int(generation_prompt_len)
-    step_logits = _slice_generation_step_logits(
-        logits_2d,
-        prompt_len=prompt_len,
-        total_tokens=seq_len,
-    )
-    return hs_layers, step_logits.detach().to(dtype=torch.float32, device="cpu")
-
-
 # --------------------------------------------------------------------------------------- readouts
 #: Readout names, as the config takes them. ``assistant_*`` pool over the item's own tokens (a text
 #: or a generated completion); ``sequence_*`` from the start of the input to the end of the item.
@@ -195,6 +112,7 @@ READ_MODES = (
     "assistant_max",
     "assistant_first",
     "assistant_tokens",
+    "sequence_tokens",
 )
 SPANS = ("text", "sequence")
 AGGREGATES = ("mean", "last", "first", "max", "tokens")
@@ -392,7 +310,9 @@ def _forward_batch(model, ids_list: Sequence[torch.Tensor], pad_id: int) -> Tupl
 
     Right padding leaves every real token where it would be alone (positions from 0, and causal
     attention never reaches the padding after it). The last entry is the input of the final norm,
-    on the scale of the other layers (Hugging Face returns it after the norm).
+    on the scale of the other layers (Hugging Face returns it after the norm). Under an
+    intervention (:func:`concept_probe.intervene`), an edited block's entry is its output after the
+    edit, which is what the next block receives.
     """
     lens = [int(x.shape[-1]) for x in ids_list]
     width = max(lens)
@@ -408,13 +328,16 @@ def _forward_batch(model, ids_list: Sequence[torch.Tensor], pad_id: int) -> Tupl
 
     handle = _get_final_norm_module(model).register_forward_pre_hook(capture)
     try:
-        out = model(input_ids=input_ids.to(model.device), attention_mask=attn.to(model.device),
-                    output_hidden_states=True, use_cache=False, return_dict=True, **_forward_kwargs(model))
+        with edited_outputs(model) as edited:
+            out = model(input_ids=input_ids.to(model.device), attention_mask=attn.to(model.device),
+                        output_hidden_states=True, use_cache=False, return_dict=True, **_forward_kwargs(model))
     finally:
         handle.remove()
     if "pre_norm" not in captured:
         raise RuntimeError("Forward pre-hook on final norm did not fire; model layout is unexpected.")
     hs = list(out.hidden_states)
+    for layer, tensor in edited.items():
+        hs[layer + 1] = tensor.detach()
     hs[-1] = captured["pre_norm"]
     return hs, lens
 
@@ -518,6 +441,11 @@ def _open_cache(model, tokenizer, cache: Any, identity: Optional[Dict[str, Any]]
         root = default_rep_cache_dir()
     else:
         root = str(cache)
+    if active_interventions(model):
+        choices.append(Choice("representations cache", root, None,
+                              "an intervention is applied to the model, so its representations are neither "
+                              "taken from the cache nor stored in it"))
+        return None
     ident = _cache_identity(model, tokenizer, identity)
     if not ident.get("model_id"):
         choices.append(Choice("representations cache", root, None,

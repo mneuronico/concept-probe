@@ -5,9 +5,10 @@ import pytest
 from concept_probe.eval_system import (
     _compute_coherence,
     _compute_stats,
-    _mean_completion_score,
+    _per_sample_records,
     simple_equality_evaluator,
 )
+from concept_probe.scoring import ScoredItem, Scores
 
 
 def test_score_stats_do_not_require_correct_labels():
@@ -38,19 +39,36 @@ def test_stats_tolerate_null_scores():
 
 
 def test_compute_coherence_skips_rows_without_alpha():
-    per_sample = [{"correct": True, "npz_path": "x.npz"}]  # no alpha key
+    per_sample = [{"correct": True, "scores_index": 0}]  # no alpha key
     counts, accuracy = _compute_coherence(per_sample, [0.0], ratings={})
     assert all(c == [0] for c in counts.values())
 
 
-def test_mean_completion_score_empty_span_is_nan(tmp_path):
-    path = tmp_path / "a.npz"
-    np.savez(path, scores_agg=np.array([1.0, 2.0, 3.0]), prompt_len=np.array([3]))
-    assert np.isnan(_mean_completion_score(str(path)))
+def test_coherence_ratings_are_matched_by_the_generation_index():
+    per_sample = [{"alpha": 0.0, "correct": True, "scores_index": 0},
+                  {"alpha": 0.0, "correct": False, "scores_index": 1}]
+    counts, accuracy = _compute_coherence(per_sample, [0.0], ratings={0: "COHERENT", 1: "NONSENSE"})
+    assert counts["COHERENT"] == [1] and counts["NONSENSE"] == [1]
+    assert accuracy["COHERENT"] == [1.0] and accuracy["NONSENSE"] == [0.0]
 
-    path2 = tmp_path / "b.npz"
-    np.savez(path2, scores_agg=np.array([1.0, 2.0, 3.0]), prompt_len=np.array([1]))
-    assert _mean_completion_score(str(path2)) == 2.5
+
+def _item(index, alpha, text, mean):
+    return ScoredItem(index=index, text=text, token_ids=np.zeros(3, np.int64), tokens=["a", "b", "c"], span=(1, 3),
+                      layers={"c": [0]}, scores={"c": np.zeros((3, 1), np.float32)},
+                      token_scores={"c": np.zeros(3, np.float32)}, token_z={"c": None}, score_mean={"c": mean},
+                      score_mean_z={"c": None}, info={"alpha": alpha, "alpha_unit": "raw", "prompt": f"q{index}"})
+
+
+def test_records_come_from_the_scores_in_memory():
+    scores = Scores("generations", ["c"], [_item(0, 0.0, "42", 1.5), _item(0, 2.0, "41", None), _item(1, 0.0, "7", 0.5)],
+                    {"generation": {"greedy": True}})
+    items = [{"prompt": "q0", "expected": "42"}, {"prompt": "q1", "expected": "7"}]
+    rows = _per_sample_records(scores, items, lambda c, item: simple_equality_evaluator(c, item), None,
+                               expected_key="expected", include_item=False, multi=False, show_progress=False)
+    assert [r["item_index"] for r in rows] == [0, 0, 1] and [r["scores_index"] for r in rows] == [0, 1, 2]
+    assert [r["correct"] for r in rows] == [True, False, True]
+    assert rows[0]["score_mean"] == 1.5 and np.isnan(rows[1]["score_mean"])  # an empty completion has no score
+    assert rows[1]["alpha"] == 2.0 and rows[0]["generation"] == {"greedy": True}
 
 
 def test_simple_equality_evaluator_markers():
@@ -60,12 +78,6 @@ def test_simple_equality_evaluator_markers():
     assert simple_equality_evaluator("no marker here", item, marker=":")["correct"] is False
     assert simple_equality_evaluator("b", {"expected": ["a", "b"]})["correct"] is True
     assert simple_equality_evaluator("anything", {})["correct"] is None
-
-
-def test_completion_score_stops_at_the_recorded_completion_end(tmp_path):
-    path = tmp_path / "c.npz"
-    np.savez(path, scores_agg=np.array([0.0, 2.0, 4.0, 100.0]), prompt_len=np.array([1]), completion_end=np.array([3]))
-    assert _mean_completion_score(str(path)) == 3.0  # the end-of-sequence score (100) is excluded
 
 
 def test_accuracy_intervals_are_wilson():

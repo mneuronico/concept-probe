@@ -14,7 +14,7 @@ from concept_probe import EmptySpanError, NonFiniteActivationsError, Readout, re
 from concept_probe.inputs import encode_text
 from concept_probe.modeling import get_transformer_layers
 from concept_probe.reading import READ_MODES, RepCache, read_encoded, reps_from_hs_layers
-from concept_probe.probe import forward_hidden_states_all_layers
+from fakes import hidden_states_alone as forward_hidden_states_alone
 from fakes import CharChatTok
 from tiny_model import TinyCausalLM
 
@@ -29,7 +29,7 @@ def _named(seed=0, name="tiny-test"):
 
 def _hidden(model, tok, text, **kw):
     enc = encode_text(tok, text, **kw)
-    hs = forward_hidden_states_all_layers(model, enc.input_ids.unsqueeze(0))
+    hs = forward_hidden_states_alone(model, enc.input_ids.unsqueeze(0))
     return enc, torch.stack(hs).numpy()  # (layers, seq, dim)
 
 
@@ -48,7 +48,7 @@ def test_every_readout_mode_matches_the_one_input_reader(mode):
     batched = read_texts(model, tok, TEXTS, mode, role="user", system="x y", last_k=2, batch_size=3, cache=False).data
     for i, text in enumerate(TEXTS):
         enc = encode_text(tok, text, "x y", role="user")
-        hs = forward_hidden_states_all_layers(model, enc.input_ids.unsqueeze(0))
+        hs = forward_hidden_states_alone(model, enc.input_ids.unsqueeze(0))
         expected = reps_from_hs_layers(hs, enc.start, mode, 2, span_end=enc.end)
         np.testing.assert_allclose(batched[i], expected, rtol=1e-6, atol=1e-6)
 
@@ -215,5 +215,5 @@ def test_read_encoded_reads_generated_ids_without_retokenizing():
     model, tok = TinyCausalLM(), CharChatTok()
     ids = torch.tensor([ord(c) for c in "^<u>hi|<a>ppx$"])
     reps = read_encoded(model, tok, [Encoded(ids, 11, 14)], cache=False)
-    hs = forward_hidden_states_all_layers(model, ids.unsqueeze(0))
+    hs = forward_hidden_states_alone(model, ids.unsqueeze(0))
     np.testing.assert_allclose(reps.data[0], reps_from_hs_layers(hs, 11, "assistant_all_mean", 12, 14), rtol=1e-6)

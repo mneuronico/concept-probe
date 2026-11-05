@@ -329,8 +329,9 @@ def _config_dtype_name(value: Any) -> Optional[str]:
 
 def upgrade_saved_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """A run's saved config in today's terms: runs saved by earlier versions wrote
-    ``model.use_4bit`` (now ``model.quantization = "nf4"``) and ``training.direction_normalization``
-    (now ``training.estimator``). Returns a new dict; today's configs come back unchanged."""
+    ``model.use_4bit`` (now ``model.quantization = "nf4"``), ``training.direction_normalization``
+    (now ``training.estimator``) and settings of the old per-generation score files. Returns a new
+    dict; today's configs come back unchanged."""
     cfg = json.loads(json.dumps(cfg))
     model = cfg.get("model", {})
     if "use_4bit" in model:
@@ -341,6 +342,15 @@ def upgrade_saved_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     if "direction_normalization" in training:
         normalization = training.pop("direction_normalization") or "none"
         training.setdefault("estimator", {"kind": "mean_diff", "normalization": normalization})
+    # Before scores were saved as one set of files per call: steering.do_steering (alphas decided),
+    # output.save_token_scores_npz (saving is on or off as a whole), and three settings of the logits.
+    cfg.get("steering", {}).pop("do_steering", None)
+    output = cfg.get("output", {})
+    output.pop("save_token_scores_npz", None)
+    keep, top_k = output.pop("save_generation_logits", None), output.pop("generation_logits_top_k", None)
+    output.pop("generation_logits_dtype", None)
+    if keep is not None and "generation_logits" not in output:
+        output["generation_logits"] = (int(top_k) if top_k else "all") if keep else None
     return cfg
 
 

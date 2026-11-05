@@ -110,8 +110,7 @@ def _concept(**kwargs):
 
 
 def _train(tmp_path, monkeypatch, mode, overrides=None, concept=None):
-    monkeypatch.setattr(probe_mod, "forward_hidden_states_all_layers", _fake_forward)
-    monkeypatch.setattr(probe_mod, "generate_batch", _fake_generate_batch)
+    monkeypatch.setattr(probe_mod, "_generate_pairs", _fake_generate_batch)
     tok = _CharChatTok()
     cfg = resolve_config(deep_merge({
         "prompts": {"train_questions": ["q1", "q2"], "eval_questions": ["e1", "e2+"]},
@@ -241,7 +240,7 @@ def test_settings_that_would_be_ignored_or_misread_raise_before_anything_runs(tm
     def must_not_generate(*args, **kwargs):
         raise AssertionError("generation ran before the settings were checked")
 
-    monkeypatch.setattr(probe_mod, "generate_batch", must_not_generate)
+    monkeypatch.setattr(probe_mod, "_generate_pairs", must_not_generate)
     cfg = resolve_config(deep_merge({"output": {"console": False}}, overrides))
     bundle = SimpleNamespace(model_id="fake", tokenizer=_CharChatTok(), model=CharModel(), num_layers=2)
     probe = ConceptProbe(model_bundle=bundle, config=cfg, concept=_concept(), run_dir=str(tmp_path),
@@ -360,8 +359,7 @@ def _generate_with_an_empty_reply(empty_question):
 
 
 def test_an_empty_completion_is_left_out_instead_of_pooling_the_prompt(tmp_path, monkeypatch):
-    monkeypatch.setattr(probe_mod, "forward_hidden_states_all_layers", _fake_forward)
-    monkeypatch.setattr(probe_mod, "generate_batch", _generate_with_an_empty_reply("q2"))
+    monkeypatch.setattr(probe_mod, "_generate_pairs", _generate_with_an_empty_reply("q2"))
     cfg = resolve_config({
         "prompts": {"train_questions": ["q1", "q2", "q3"], "eval_questions": ["e1", "e2+"]},
         "evaluation": {"n_permutations": 10, "n_bootstrap": 10},

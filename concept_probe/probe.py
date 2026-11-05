@@ -16,6 +16,7 @@ from .modeling import (
     _chat_template_kwargs,
     _resolve_attr_path,
     apply_chat,
+    get_transformer_layers,
     attention_mask_from_ids,
     identity_from_config,
     identity_mismatches,
@@ -26,6 +27,16 @@ from .record import Choice, announce
 from .settings import settings
 from .directions import estimator_spec, fit_directions, make_estimator
 from .evaluation import EvalSet, ReadingEvaluation, evaluate_reading, label_shuffle_control
+from .generation import (
+    TokenScorer,
+    TokenStep,
+    _project_tokens,
+    completion_end as _completion_end,
+    eos_token_ids as _eos_token_ids,
+    generate,
+)
+from .interventions import Add
+from .scoring import ScoreInput, Scores, batch_dir, score_inputs
 from .linear_probe import Calibration, _token_references, calibrations_from_tensors, sigmoid, steer_directions_for
 from .directions import (  # re-exported: they lived here before
     DIRECTION_NORMALIZATIONS,
@@ -55,12 +66,10 @@ from .reading import (  # re-exported: they lived here before
     _get_final_norm_module,
     _model_dtype,
     _read,
-    _slice_generation_step_logits,
     _span_bounds,
     check_finite_hidden_states,
     extract_completion_reps,
     extract_text_reps,
-    forward_hidden_states_all_layers,
     read_encoded,
     read_texts,
     reps_from_hs_layers,
@@ -85,7 +94,6 @@ from .inputs import (  # re-exported: they lived here before
     _user_text_span,
     preview_input,
 )
-from .steering import MultiLayerSteererLayerwise
 from .utils import (
     deep_merge,
     ensure_dir,
@@ -96,7 +104,7 @@ from .utils import (
     safe_slug,
     set_seed,
 )
-from .visuals import plot_score_hist, plot_sweep, render_batch_heatmap, render_token_heatmap, segment_token_scores
+from .visuals import plot_score_hist, plot_sweep
 from .console import ConsoleLogger
 
 def _resolve_random_control_seed(explicit_seed: Optional[int], config_seed: Any) -> int:
@@ -321,132 +329,6 @@ def _same_context(reference: Optional[Dict[str, Any]], context: Dict[str, Any]) 
     return ReadContext.from_dict(reference).matches(ReadContext.from_dict(context))
 
 
-def _prepare_batch_dir(out_dir: str, overwrite: bool) -> None:
-    """Create ``out_dir`` for a scoring batch. A directory that already holds files raises unless
-    ``overwrite`` (which deletes those files and the analysis folder): an earlier batch's files,
-    such as its coherence ratings, would otherwise be read together with the new ones."""
-    if os.path.isdir(out_dir):
-        existing = [f for f in os.listdir(out_dir) if os.path.isfile(os.path.join(out_dir, f))]
-        if existing and not overwrite:
-            raise FileExistsError(
-                f"{out_dir} already holds a scoring batch ({len(existing)} files); pass another batch_subdir, or "
-                "overwrite=True to replace it."
-            )
-        if existing:
-            for f in existing:
-                os.remove(os.path.join(out_dir, f))
-            shutil.rmtree(os.path.join(out_dir, "analysis"), ignore_errors=True)
-    ensure_dir(out_dir)
-
-
-def _prompt_slug(text: str, max_words: int = 8, max_len: int = 48) -> str:
-    words = text.strip().split()
-    snippet = " ".join(words[:max_words])
-    slug = safe_slug(snippet)[:max_len]
-    return slug or "prompt"
-
-
-def _prompt_slug_any(prompt: PromptLike, max_words: int = 8, max_len: int = 48) -> str:
-    return _prompt_slug(_prompt_to_text(prompt), max_words=max_words, max_len=max_len)
-
-
-def _alpha_label(alpha: float, unit: str) -> str:
-    if unit == "sigma":
-        label = f"sigma{alpha:+.2f}"
-    else:
-        label = f"alpha{alpha:+.4f}"
-    label = label.replace("+", "p").replace("-", "m").replace(".", "p")
-    return safe_slug(label)
-
-
-def _normalize_generation_logits_dtype(dtype_name: Optional[str]) -> Tuple[str, torch.dtype]:
-    raw = "float16" if dtype_name is None else str(dtype_name).strip().lower()
-    if raw in {"float16", "fp16", "half"}:
-        return ("float16", torch.float16)
-    if raw in {"float32", "fp32", "single"}:
-        return ("float32", torch.float32)
-    raise ValueError(
-        f"Unsupported generation logits dtype '{dtype_name}'. Use 'float16' or 'float32'."
-    )
-
-
-def _pack_generation_logits_arrays(
-    generation_step_logits: torch.Tensor,
-    *,
-    logits_top_k: Optional[int],
-    logits_dtype_name: Optional[str],
-    logits_source: str = "raw_model",
-) -> Dict[str, np.ndarray]:
-    if generation_step_logits.ndim != 2:
-        raise ValueError(
-            f"Expected generation_step_logits to have shape (num_steps, vocab_size); got {tuple(generation_step_logits.shape)}"
-        )
-    if generation_step_logits.shape[0] <= 0:
-        return {}
-
-    dtype_name, torch_dtype = _normalize_generation_logits_dtype(logits_dtype_name)
-    logits = generation_step_logits.detach().to(dtype=torch.float32, device="cpu")
-    out: Dict[str, np.ndarray] = {
-        "generation_logits_steps": np.array([int(logits.shape[0])], dtype=np.int32),
-        "generation_logits_dtype": np.array([dtype_name]),
-        "generation_logits_source": np.array([str(logits_source)]),
-    }
-
-    if logits_top_k is not None and int(logits_top_k) > 0:
-        k = int(max(1, min(int(logits_top_k), int(logits.shape[-1]))))
-        top_vals, top_idx = torch.topk(logits, k=k, dim=-1)
-        out["generation_logits_topk_values"] = top_vals.to(dtype=torch_dtype).numpy()
-        out["generation_logits_topk_indices"] = top_idx.to(dtype=torch.int32).numpy().astype(np.int32, copy=False)
-        out["generation_logits_topk_k"] = np.array([k], dtype=np.int32)
-    else:
-        out["generation_logits"] = logits.to(dtype=torch_dtype).numpy()
-        out["generation_logits_topk_k"] = np.array([0], dtype=np.int32)
-
-    return out
-
-
-def token_scores_from_hs_layers(
-    hs_layers: List[torch.Tensor],
-    concept_vectors: np.ndarray,
-    layer_indices: List[int],
-    aggregate: str,
-    reference_layer: Optional[int] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Project each selected layer's hidden states onto a concept direction.
-
-    By default each layer ``li`` is scored with its own concept vector
-    ``concept_vectors[li]`` (the usual per-layer probe). If ``reference_layer``
-    is given, *every* selected layer is instead scored against the single
-    direction ``concept_vectors[reference_layer]``. This is a "logit-lens"-style
-    read: it measures how decodable a *fixed* direction (e.g. the one learned at
-    a late layer) is from the activations at every other layer, holding the
-    direction constant so that changes across layers reflect the representation
-    rather than a change of basis. ``reference_layer`` accepts negative indices.
-    """
-    if not layer_indices:
-        raise ValueError("layer_indices must be non-empty")
-    num_vectors = int(concept_vectors.shape[0])
-    if reference_layer is not None:
-        ref = resolve_layer_index(reference_layer, num_vectors, "reference_layer")
-    total = int(hs_layers[0].shape[0])
-    scores_per_layer = np.zeros((total, len(layer_indices)), dtype=np.float32)
-
-    for i, li in enumerate(layer_indices):
-        hs = hs_layers[li]
-        vi = li if reference_layer is None else ref
-        v = torch.tensor(concept_vectors[vi], dtype=hs.dtype)
-        scores_per_layer[:, i] = (hs @ v).numpy()
-
-    if aggregate == "mean":
-        scores_agg = scores_per_layer.mean(axis=1)
-    elif aggregate == "sum":
-        scores_agg = scores_per_layer.sum(axis=1)
-    else:
-        raise ValueError(f"Unknown aggregate: {aggregate}")
-
-    return scores_per_layer, scores_agg
-
-
 @torch.no_grad()
 def score_text_tokens(
     model,
@@ -475,9 +357,8 @@ def score_text_tokens(
         layer_indices: which layers to score (default: all). ``scores_per_layer`` has shape
             ``(num_tokens, len(layer_indices))``.
         reference_layer: if set, project every selected layer onto the single direction of that
-            layer (logit-lens); see ``token_scores_from_hs_layers``.
-        unit_norm: L2-normalize each concept vector before projecting (default False, to match
-            ``token_scores_from_hs_layers`` semantics).
+            layer (a logit-lens-style read: the direction is held fixed across layers).
+        unit_norm: L2-normalize each concept vector before projecting (default False).
         add_bos: put the BOS token first (default True; it gets offset (0, 0)).
 
     Returns:
@@ -511,14 +392,16 @@ def score_text_tokens(
         input_ids = torch.cat([torch.tensor([[bos]], dtype=input_ids.dtype), input_ids], dim=1)
         offsets = [[0, 0]] + offsets
 
-    hs_layers = forward_hidden_states_all_layers(model, input_ids)
-    if len(hs_layers) != num_layers:
-        raise ValueError(
-            f"Layer mismatch: model returned {len(hs_layers)} layers, concept_vectors has {num_layers}."
-        )
-    scores_per_layer, _ = token_scores_from_hs_layers(
-        hs_layers, cv, layers, aggregate="mean", reference_layer=reference_layer
-    )
+    n_blocks = len(get_transformer_layers(model))
+    if n_blocks != num_layers:
+        raise ValueError(f"Layer mismatch: the model has {n_blocks} layers, concept_vectors has {num_layers}.")
+    if reference_layer is not None:
+        ref = resolve_layer_index(reference_layer, num_layers, "reference_layer")
+        rows = np.stack([cv[ref] for _ in layers])
+    else:
+        rows = cv[layers]
+    scorer = TokenScorer("vectors", list(layers), rows)
+    scores_per_layer = _project_tokens(model, tokenizer, [input_ids[0]], [scorer])[0]["vectors"]
     token_ids = input_ids[0].detach().cpu().numpy().astype(np.int32)
     return {
         "token_ids": token_ids,
@@ -529,138 +412,13 @@ def score_text_tokens(
     }
 
 
-def _eos_token_ids(model, tokenizer) -> Set[int]:
-    """Token ids that end a generation: the model's generation config, plus the tokenizer's EOS."""
-    ids: Set[int] = set()
-    eos = getattr(getattr(model, "generation_config", None), "eos_token_id", None)
-    if eos is not None:
-        ids.update(int(e) for e in (eos if isinstance(eos, (list, tuple)) else [eos]))
-    tok_eos = getattr(tokenizer, "eos_token_id", None)
-    if tok_eos is not None:
-        ids.add(int(tok_eos))
-    return ids
-
-
-def _completion_end(token_ids: Any, prompt_len: int, eos_ids: Set[int]) -> int:
-    """End of a generated completion: the first end-of-sequence token at or after ``prompt_len``
-    (excluded from the completion), or the end of the sequence.
-
-    Every generation path keeps that token in its ids and ends the completion before it, so
-    pooling and ``score_mean`` never include it.
-    """
-    ids = [int(t) for t in token_ids]
-    for i in range(int(prompt_len), len(ids)):
-        if ids[i] in eos_ids:
-            return i
-    return len(ids)
-
-
-@torch.no_grad()
-def generate_once(
-    model,
-    tokenizer,
-    system: str,
-    prompt: PromptLike,
-    max_new_tokens: int,
-    greedy: bool,
-    temperature: Optional[float],
-    top_p: Optional[float],
-    warn: Optional[Callable[[str], None]] = None,
-    warn_prefix: str = "prompt",
-) -> Tuple[torch.Tensor, int]:
-    messages, _ = _normalize_messages(prompt, system, warn=warn, warn_prefix=warn_prefix)
-    if warn is not None and len(messages) > 0 and messages[-1].get("role") != "user":
-        warn(
-            f"{warn_prefix} ends with role='{messages[-1].get('role')}'; generation typically expects the last message to be a user turn."
-        )
-
-    input_ids = apply_chat(tokenizer, messages, add_generation_prompt=True)
-    prompt_len = int(input_ids.shape[-1])
-    attn = attention_mask_from_ids(input_ids).to(model.device)
-
-    gen_ids = model.generate(
-        input_ids=input_ids.to(model.device),
-        attention_mask=attn,
-        max_new_tokens=max_new_tokens,
-        do_sample=not greedy,
-        temperature=temperature if not greedy else None,
-        top_p=top_p if not greedy else None,
-        pad_token_id=tokenizer.eos_token_id,
-    )
-    return gen_ids[0].detach().cpu(), prompt_len
-
-
-@torch.no_grad()
-def generate_batch(
-    model,
-    tokenizer,
-    system: str,
-    prompts: List[PromptLike],
-    max_new_tokens: int,
-    greedy: bool,
-    temperature: Optional[float],
-    top_p: Optional[float],
-    batch_size: int = 16,
-    warn: Optional[Callable[[str], None]] = None,
-    warn_prefix: str = "prompt",
-) -> List[Tuple[torch.Tensor, int]]:
-    """Batched equivalent of ``generate_once`` over many prompts under one system.
-
-    Returns one ``(ids, prompt_len)`` per prompt, where ``ids`` is a 1D CPU tensor of
-    ``[prompt_tokens + completion_tokens (+ the end-of-sequence token)]`` -- the same contract
-    as ``generate_once``, so callers can use the results interchangeably. Prompts are
-    left-padded within each batch with an attention mask; left padding and the padding after
-    the first end-of-sequence token are stripped per item.
-
-    Batching changes the shapes of the matrix products, so in half precision a greedy
-    completion can differ from the unbatched one. Use ``batch_size=1`` when exact
-    reproducibility across batch sizes matters.
-    """
-    if not prompts:
-        return []
-    pad_id = tokenizer.pad_token_id
-    if pad_id is None:
-        pad_id = tokenizer.eos_token_id
-
-    encoded: List[torch.Tensor] = []
-    for i, p in enumerate(prompts):
-        messages, _ = _normalize_messages(p, system, warn=warn, warn_prefix=f"{warn_prefix}[{i}]")
-        if warn is not None and len(messages) > 0 and messages[-1].get("role") != "user":
-            warn(
-                f"{warn_prefix}[{i}] ends with role='{messages[-1].get('role')}'; "
-                "generation typically expects the last message to be a user turn."
-            )
-        encoded.append(apply_chat(tokenizer, messages, add_generation_prompt=True)[0])
-
-    eos_ids = _eos_token_ids(model, tokenizer)
-    step = max(1, int(batch_size))
-    results: List[Optional[Tuple[torch.Tensor, int]]] = [None] * len(encoded)
-    for start in range(0, len(encoded), step):
-        chunk = encoded[start : start + step]
-        plens = [int(t.shape[-1]) for t in chunk]
-        maxlen = max(plens)
-        input_ids = torch.full((len(chunk), maxlen), pad_id, dtype=torch.long)
-        attn = torch.zeros((len(chunk), maxlen), dtype=torch.long)
-        for j, t in enumerate(chunk):
-            input_ids[j, maxlen - plens[j] :] = t.to(input_ids.dtype)
-            attn[j, maxlen - plens[j] :] = 1
-        gen = model.generate(
-            input_ids=input_ids.to(model.device),
-            attention_mask=attn.to(model.device),
-            max_new_tokens=max_new_tokens,
-            do_sample=not greedy,
-            temperature=temperature if not greedy else None,
-            top_p=top_p if not greedy else None,
-            pad_token_id=pad_id,
-        )
-        gen = gen.detach().cpu()
-        for j in range(len(chunk)):
-            plen = plens[j]
-            row = gen[j][maxlen - plen :]  # drop left padding -> [prompt + completion (+ EOS + pad)]
-            end = _completion_end(row, plen, eos_ids)
-            keep = min(int(row.shape[-1]), end + 1)  # keep the EOS, drop the padding after it
-            results[start + j] = (row[:keep].clone(), plen)
-    return results  # type: ignore[return-value]
+def _generate_pairs(model, tokenizer, system, prompts, max_new_tokens, greedy, temperature, top_p, batch_size=16,
+                    warn=None, warn_prefix="prompts") -> List[Tuple[torch.Tensor, int]]:
+    """Training's generations: ``(token ids, prompt length)`` per prompt (see :func:`generate`)."""
+    gens = generate(model, tokenizer, prompts, system=system, max_new_tokens=max_new_tokens, greedy=greedy,
+                    temperature=temperature, top_p=top_p, batch_size=batch_size, save=False, warn=warn,
+                    label=warn_prefix)
+    return [(torch.as_tensor(g.token_ids), g.prompt_len) for g in gens]
 
 
 def _default_concept() -> ConceptSpec:
@@ -929,7 +687,7 @@ class ConceptProbe:
                 self._warn(
                     "train_prompt_mode=shared; ignoring prompts.train_questions_pos/train_questions_neg."
                 )
-            pos_results = generate_batch(
+            pos_results = _generate_pairs(
                 model,
                 tokenizer,
                 self.concept.pos_system,
@@ -942,7 +700,7 @@ class ConceptProbe:
                 warn=self._warn,
                 warn_prefix="train_questions (pos_system)",
             )
-            neg_results = generate_batch(
+            neg_results = _generate_pairs(
                 model,
                 tokenizer,
                 self.concept.neg_system,
@@ -1000,19 +758,12 @@ class ConceptProbe:
                     else (train_neg_ids, train_neg_starts, train_neg_ends)
                 )
                 progress_every_side = max(1, len(questions) // 5)
-                for i, q in enumerate(questions):
-                    ids, plen = generate_once(
-                        model,
-                        tokenizer,
-                        system,
-                        q,
-                        train_cfg["train_max_new_tokens"],
-                        train_cfg["train_greedy"],
-                        temperature=train_cfg.get("train_temperature", 0.7),
-                        top_p=train_cfg.get("train_top_p", 0.9),
-                        warn=self._warn,
-                        warn_prefix=f"train_questions_{side}[{i}] ({side}_system)",
-                    )
+                side_results = _generate_pairs(
+                    model, tokenizer, system, questions, train_cfg["train_max_new_tokens"], train_cfg["train_greedy"],
+                    temperature=train_cfg.get("train_temperature", 0.7), top_p=train_cfg.get("train_top_p", 0.9),
+                    batch_size=gen_bs, warn=self._warn, warn_prefix=f"train_questions_{side} ({side}_system)",
+                )
+                for i, (q, (ids, plen)) in enumerate(zip(questions, side_results)):
                     ids_list.append(ids)
                     starts.append(plen)
                     ends.append(_completion_end(ids, plen, eos_ids))
@@ -1163,7 +914,7 @@ class ConceptProbe:
             eval_bs = gen_bs if eval_bs is None else int(eval_bs)
             read: Dict[str, Dict[str, Any]] = {"eval": {}, "eval_with_system_prompt": {}}
             for side, system in (("pos", self.concept.pos_system), ("neg", self.concept.neg_system)):
-                results = generate_batch(model, tokenizer, system, eval_prompts, eval_cfg["eval_max_new_tokens"],
+                results = _generate_pairs(model, tokenizer, system, eval_prompts, eval_cfg["eval_max_new_tokens"],
                                          eval_cfg["eval_greedy"], temperature=eval_cfg.get("eval_temperature", 0.7),
                                          top_p=eval_cfg.get("eval_top_p", 0.9), batch_size=eval_bs, warn=self._warn,
                                          warn_prefix=f"eval_questions ({side}_system)")
@@ -1983,6 +1734,26 @@ class ConceptProbe:
             raise ValueError("prompt is a user turn before the text, so it only applies to role='assistant'.")
         return self.config["prompts"].get("neutral_system") if system_prompt is None else system_prompt
 
+    def _token_scorer(self, *, generated: bool = False, context: Optional[Dict[str, Any]] = None,
+                      layer_selection: Optional[Dict[str, Any]] = None, vectors: Optional[np.ndarray] = None,
+                      reference_layer: Optional[int] = None) -> TokenScorer:
+        """How this probe scores tokens read in ``context`` (or as generated completions): its
+        directions at its scoring layers (``evaluation.layer_selection``), combined as
+        ``evaluation.score_aggregate``, with the calibration for that context. ``vectors`` replaces
+        the directions (a random control: then there is no calibration); ``reference_layer`` reads
+        every layer with that one layer's direction (a logit-lens-style read, also without one)."""
+        layers = self._layer_selection(layer_selection)
+        V = np.asarray(self.directions if vectors is None else vectors, dtype=np.float32)
+        if reference_layer is not None:
+            ref = resolve_layer_index(reference_layer, V.shape[0], "reference_layer")
+            rows = np.stack([V[ref] for _ in layers])
+        else:
+            rows = V[layers]
+        own = vectors is None and reference_layer is None
+        cal = self.calibration_for(GENERATED_CONTEXT if generated else context) if own else None
+        return TokenScorer(str(self.concept.name), list(layers), rows,
+                           self.config["evaluation"]["score_aggregate"], cal)
+
     def score_texts(
         self,
         texts: List[PromptLike],
@@ -1997,138 +1768,74 @@ class ConceptProbe:
         role: str = "raw",
         prompt: Optional[str] = None,
         overwrite: bool = False,
-    ) -> List[Dict[str, Any]]:
-        """Score every token of each text with the probe (token-level scores, no pooling).
+        batch_size: Optional[int] = None,
+        save: Optional[bool] = None,
+    ) -> Scores:
+        """Score every token of each text with the probe, in batches; returns :class:`Scores`.
 
         By default each text is read raw: the BOS token and the text, with no chat template and
         no system prompt. ``role="user"`` reads it as a user turn (a message list is read as
         given) after ``system_prompt``, or ``prompts.neutral_system`` if that is set;
         ``role="assistant"`` reads it as the model's reply, after that system prompt and an
-        optional user turn ``prompt``. :func:`preview_input` shows the exact input, and each
-        record carries it as ``input_text`` together with ``text_span``, the text's own tokens.
+        optional user turn ``prompt``. :func:`preview_input` shows the exact input; each item's
+        ``info`` has it as ``input_text``, and its ``span`` is the text's own tokens.
 
-        The npz holds raw projections (``scores_per_layer``, ``scores_agg``) and, when the probe
-        has eval references, standardized single-token scores (``scores_z_per_layer``,
-        ``scores_agg_z``: 0 is the midpoint between the eval poles, 1 the within-pole SD of single
-        tokens), which the heatmaps then show. The midpoint is not "without the concept": text that
-        belongs to neither pole can land well away from 0. Each record has the text's mean score over its own
-        tokens, ``score_mean``, and ``score_mean_z``, standardized with the per-item references.
-        z scores need references measured on texts read the same way (role, system prompt, prompt):
-        the evaluation's in texts mode, the transfer check's (eval texts) in shared/opposed mode.
-        Otherwise only the raw projections are saved, with a warning.
+        Each item has raw projections per token and layer, their combination per token and, where
+        the probe has a calibration for texts read this way, token z scores (0 is the midpoint
+        between the poles, which is not "without the concept"; 1 the within-pole SD of single
+        tokens). ``score_mean`` is the text's mean token score and ``score_mean_z`` its z with the
+        per-item references. Without such a calibration only raw projections are given, and
+        ``z_missing`` says why. ``random_scoring_vector`` scores with same-norm random directions
+        instead (a control); ``reference_layer`` reads every layer with one layer's direction.
+
+        Saved by default (``save``, or the session's setting) to
+        ``<run_dir>/<output_subdir>/<batch_subdir>``: ``scores.npz``, ``scores.jsonl``,
+        ``heatmaps.html`` and ``settings.json`` (see :class:`concept_probe.scoring.Scores`).
         """
         self._require_model("score_texts")
-        tokenizer = self.model_bundle.tokenizer
-        model = self.model_bundle.model
-        aggregate = self.config["evaluation"]["score_aggregate"]
-        layers = self._layer_selection(layer_selection)
+        tokenizer, model = self.model_bundle.tokenizer, self.model_bundle.model
         sys_prompt = self._system_for(role, system_prompt, prompt)
         read_context = _text_context(role, sys_prompt, prompt, "assistant_all_mean")
         save_html = self.config["plots"].get("heatmap_html", True) if save_html is None else save_html
-        save_token_scores_npz = self.config["output"].get("save_token_scores_npz", True)
-        scoring_seed: Optional[int] = None
-        scoring_vectors = self.directions
+        vectors, scoring_seed = None, None
         if random_scoring_vector:
-            scoring_vectors, scoring_seed = self._random_control_vectors(random_vector_seed)
-            self._warn(
-                f"score_texts using random scoring vector control (same-norm per layer, seed={scoring_seed})."
-            )
-        elif reference_layer is None and self.calibration_for(read_context) is None:
-            self._warn(f"score_texts: only raw projections are saved: {self._missing_z_reason(read_context)}")
+            vectors, scoring_seed = self._random_control_vectors(random_vector_seed)
+            self._warn(f"score_texts using random scoring vector control (same-norm per layer, seed={scoring_seed}).")
+        scorer = self._token_scorer(context=read_context, layer_selection=layer_selection, vectors=vectors,
+                                    reference_layer=reference_layer)
+        z_missing = None
+        if not random_scoring_vector and reference_layer is None and scorer.calibration is None:
+            z_missing = self._missing_z_reason(read_context)
+            self._warn(f"score_texts: only raw projections are given: {z_missing}")
+        elif scorer.calibration is None:
+            z_missing = "random scoring vectors" if random_scoring_vector else "read with one layer's direction"
 
-        base_dir = os.path.join(self._ensure_run_dir(), output_subdir)
-        ensure_dir(base_dir)
-        if batch_subdir is None:
-            batch_subdir = f"batch_{now_tag()}"
-        out_dir = base_dir if batch_subdir == "" else os.path.join(base_dir, batch_subdir)
-        _prepare_batch_dir(out_dir, overwrite)
-        results = []
-        batch_entries = []
-        total_texts = len(texts)
-        progress_every = max(1, total_texts // 5) if total_texts else 1
-        self._status(f"Scoring {total_texts} texts -> {out_dir}")
-
+        inputs = []
         for i, text in enumerate(texts):
-            input_ids, text_start, text_end = _encode_text_for_read(
-                tokenizer,
-                text,
-                sys_prompt,
-                role=role,
-                prompt=prompt,
-                warn=self._warn,
-                warn_prefix=f"score_texts.texts[{i}]",
-            )
-            used_prompt_system = isinstance(text, list) and any(
-                isinstance(m, dict) and m.get("role") == "system" for m in text
-            )
-            hs_layers = forward_hidden_states_all_layers(model, input_ids)
-            scores_per_layer, scores_agg = token_scores_from_hs_layers(
-                hs_layers, scoring_vectors, layers, aggregate=aggregate,
-                reference_layer=reference_layer,
-            )
-            calibrated = not (random_scoring_vector or reference_layer is not None)
-            standardized = self._token_z(scores_per_layer, layers, aggregate, read_context) if calibrated else None
-            span = slice(text_start, text_end) if text_start is not None else slice(0, 0)
-            score_mean = float(np.mean(scores_agg[span])) if scores_agg[span].size else None
-            score_mean_z = self._item_z(scores_per_layer[span], layers, aggregate, read_context) if calibrated else None
-            token_ids = input_ids[0].detach().cpu().numpy().astype(np.int32)
-            tokens = _decode_tokens(tokenizer, token_ids)
-            text_span = None if text_start is None else [int(text_start), int(text_end)]
-
-            slug = _prompt_slug_any(text)
-            base = f"text_{i:03d}_{slug}"
-            if save_token_scores_npz:
-                npz_path = os.path.join(out_dir, f"{base}.npz")
-                payload: Dict[str, Any] = dict(
-                    token_ids=token_ids,
-                    scores_per_layer=scores_per_layer,
-                    scores_agg=scores_agg,
-                    layer_indices=np.array(layers, dtype=np.int32),
-                    text_span=np.array(text_span if text_span else [-1, -1], dtype=np.int32),
-                )
-                if standardized is not None:
-                    payload.update(scores_z_per_layer=standardized[0], scores_agg_z=standardized[1])
-                np.savez_compressed(npz_path, **payload)
-            else:
-                npz_path = None
-
-            if save_html:
-                shown = scores_agg if standardized is None else standardized[1]
-                unit = "raw projection" if standardized is None else "token z: 0 = midpoint of the eval poles"
-                html_path = os.path.join(out_dir, f"{base}.html")
-                render_token_heatmap(tokens, shown.tolist(), html_path, title=f"{slug} ({unit})")
-                batch_entries.append((f"text {i:03d}: {slug} ({unit})", tokens, shown.tolist()))
-            else:
-                html_path = None
-
-            rec = {
-                "text": text,
-                "role": role,
-                "system_prompt": sys_prompt,
-                "system_prompt_overridden": bool(used_prompt_system),
-                "input_text": tokenizer.decode(token_ids.tolist(), skip_special_tokens=False),
-                "text_span": text_span,
-                "layers": layers,
-                "score_mean": score_mean,
-                "score_mean_z": score_mean_z,
-                "npz_path": npz_path,
-                "html_path": html_path,
-                "scores_standardized": standardized is not None,
-                "random_scoring_vector": bool(random_scoring_vector),
-                "random_scoring_vector_seed": scoring_seed,
-                "batch_dir": out_dir,
-            }
-            results.append(rec)
-            self.logger.log("score_text", rec)
-            if total_texts and ((i + 1) % progress_every == 0 or (i + 1) == total_texts):
-                self._status(f"Scored text {i + 1}/{total_texts}")
-
-        if save_html and batch_entries:
-            batch_path = os.path.join(out_dir, "batch_texts.html")
-            render_batch_heatmap(batch_entries, batch_path, title="Batch text scores")
-            self.logger.log("score_text_batch", {"html_path": batch_path, "count": len(batch_entries)})
-
-        return results
+            input_ids, start, end = _encode_text_for_read(tokenizer, text, sys_prompt, role=role, prompt=prompt,
+                                                          warn=self._warn, warn_prefix=f"score_texts.texts[{i}]")
+            ids = input_ids[0]
+            span = (0, 0) if start is None else (int(start), int(end))
+            info = {"input": text, "role": role, "system_prompt": sys_prompt,
+                    "system_prompt_overridden": _has_system_message(text),
+                    "input_text": tokenizer.decode(ids.tolist(), skip_special_tokens=False),
+                    "text_span": None if start is None else [int(start), int(end)]}
+            inputs.append(ScoreInput(ids, span, _prompt_to_text(text), i, info))
+        bs = int(batch_size or self.config["readout"].get("batch_size", 16))
+        self._status(f"Scoring {len(texts)} texts")
+        items = score_inputs(model, tokenizer, inputs, [scorer], batch_size=bs)
+        run_settings = {"role": role, "system_prompt": sys_prompt, "prompt": prompt, "layers": scorer.layers,
+                        "aggregate": scorer.aggregate, "reference_layer": reference_layer,
+                        "random_scoring_vector": bool(random_scoring_vector),
+                        "random_scoring_vector_seed": scoring_seed, "batch_size": bs,
+                        "calibration": None if scorer.calibration is None else scorer.calibration.context.to_dict()}
+        result = Scores("texts", [scorer.name], items, run_settings, {scorer.name: z_missing})
+        if settings().save if save is None else save:
+            out = batch_dir(os.path.join(self._ensure_run_dir(), output_subdir), batch_subdir, overwrite)
+            result.save(out, html=save_html)
+            self._status(f"Saved the scores of {len(items)} texts to {out}")
+        self.logger.log("score_texts", {"n_texts": len(items), "dir": result.dir, **run_settings})
+        return result
 
     def _steer_sigma(self) -> Optional[float]:
         """The unit of alpha_unit="sigma": the eval items' pooled within-pole SD on the steering
@@ -2155,6 +1862,57 @@ class ConceptProbe:
             return value, {li: float(self.resid_norm[li]) for li in steer_layers}
         return value, None
 
+    def steer_layer_list(self, steer_layers: Optional[Union[str, List[int]]] = None,
+                         window_radius: Optional[int] = None) -> List[int]:
+        """The layers :meth:`steering` steers: ``steering.steer_layers`` (``"probe"``, ``"window"`` of
+        ``steering.steer_window_radius`` around the probe's layer, or a list), or the arguments."""
+        self._require_trained()
+        cfg = self.config["steering"]
+        return _resolve_steer_layers(cfg["steer_layers"] if steer_layers is None else steer_layers, int(self.layer),
+                                     cfg["steer_window_radius"] if window_radius is None else window_radius,
+                                     self.num_layers)
+
+    def steering(
+        self,
+        alpha: float,
+        unit: str = "raw",
+        *,
+        layers: Optional[Union[str, List[int]]] = None,
+        window_radius: Optional[int] = None,
+        distribute: Optional[bool] = None,
+        positions: Any = None,
+        vectors: Optional[np.ndarray] = None,
+    ) -> Add:
+        """The intervention that steers with this probe: an :class:`~concept_probe.interventions.Add`
+        of ``alpha_l * v_l`` at each steered layer ``l``, where ``v_l`` is the probe's steering
+        direction at that layer (``steer_directions``; decision D1) and ``alpha`` is in ``unit``:
+
+        - ``"raw"``: as is;
+        - ``"sigma"``: times ``steer_sigma``, the eval items' pooled within-pole SD on the steering
+          direction at the probe's layer (a scale knob, not literally "n standard deviations of
+          behavior");
+        - ``"resid_norm"``: times each layer's mean residual norm on the training tokens, so 0.1
+          adds 10% of a typical token's norm.
+
+        ``layers`` defaults to ``steering.steer_layers`` (see :meth:`steer_layer_list`); with
+        several layers and ``distribute`` (``steering.steer_distribute``), alpha is divided among
+        them. ``positions`` restricts it to some tokens (see :mod:`concept_probe.interventions`),
+        ``vectors`` replaces the directions (a random control). Use it with
+        :func:`concept_probe.intervene`, :func:`concept_probe.generate` or
+        :func:`concept_probe.answer_logprobs`; the added vector compounds through later layers.
+        """
+        unit = _validate_alpha_unit(unit)
+        steer_layers = self.steer_layer_list(layers, window_radius)
+        distribute = self.config["steering"]["steer_distribute"] if distribute is None else bool(distribute)
+        if abs(float(alpha)) > 1e-12:
+            self._check_alpha_unit(unit)
+        value, scales = self._steering_alpha(alpha, unit, steer_layers)
+        per = value / len(steer_layers) if distribute else value
+        alphas = {l: float(per * (1.0 if scales is None else scales[l])) for l in steer_layers}
+        V = self.steer_directions if vectors is None else vectors
+        return Add({l: np.asarray(V[l], dtype=np.float32) for l in steer_layers}, alpha=alphas, positions=positions,
+                   label=f"steering with {self.concept.name!r}: alpha {float(alpha):g} ({unit})")
+
     def score_prompts(
         self,
         prompts: List[PromptLike],
@@ -2172,364 +1930,60 @@ class ConceptProbe:
         steer_distribute: Optional[bool] = None,
         save_html: Optional[bool] = None,
         save_segments: Optional[bool] = None,
-        save_generation_logits: Optional[bool] = None,
-        generation_logits_top_k: Optional[int] = None,
-        generation_logits_dtype: Optional[str] = None,
+        keep_logits: Union[None, int, str] = None,
         batch_subdir: Optional[str] = None,
         random_scoring_vector: bool = False,
         random_steering_vector: bool = False,
         random_vector_seed: Optional[int] = None,
         seed: Optional[int] = None,
         overwrite: bool = False,
-    ) -> List[Dict[str, Any]]:
-        """Generate (optionally steered) completions and score them with the probe.
+        batch_size: Optional[int] = None,
+        on_token: Optional[Callable[[TokenStep], Any]] = None,
+        save: Optional[bool] = None,
+    ) -> Scores:
+        """Generate completions (steered with this probe at each of ``alphas``) and score them.
 
         Each prompt is a user turn of the chat template, after ``system_prompt`` (or
         ``prompts.neutral_system``) if one is set; by default there is none.
-        :func:`preview_input` with ``generation=True`` shows the exact input.
-
-        alphas/alpha_unit: the offset ``alpha * v_l`` is added to the residual stream at every
-        token position of each steered layer (divided across layers when steer_distribute=True,
-        and compounding through subsequent layers). ``"raw"`` uses alpha as is. ``"sigma"``
-        multiplies it by sigma_best_layer, the pooled within-pole SD of the per-item eval scores
-        at the best layer, so it is a scale knob, not literally "n standard deviations of
-        behavior". ``"resid_norm"`` multiplies it, per layer, by the mean residual norm of the
-        training tokens at that layer: alpha=0.1 adds 10% of a typical token's norm.
+        :func:`preview_input` with ``generation=True`` shows the exact input. For each alpha, the
+        prompts are generated ``batch_size`` at a time (``steering.gen_batch_size``) under
+        :meth:`steering` with that alpha (``alpha_unit``, ``steer_layers``, ``steer_window_radius``,
+        ``steer_distribute``); then every completion is read again without the intervention (with
+        it, an added vector reads itself back) and scored. Items come in the order of the prompts,
+        each prompt's alphas in the order given; ``info`` has the alpha, the alpha applied at each
+        layer (``steer_alpha_per_layer``) and the intervention.
 
         ``score_mean`` averages the completion's tokens, up to and not including the
-        end-of-sequence token; ``score_mean_z`` standardizes that mean with the per-item references
-        (0 is the midpoint between the eval poles, not "without the concept"; 1 their pooled
-        within-pole SD). The npz and the heatmaps carry single-token z scores, standardized with
-        the per-token references.
+        end-of-sequence token; ``score_mean_z`` standardizes that mean with the calibration for
+        generated completions (0 is the midpoint between the poles, not "without the concept"; 1
+        their pooled within-pole SD), and the token z scores use its per-token references.
 
-        Steering: by default only the probe's layer is steered (``steering.steer_layers =
-        "probe"``). With several layers (``"window"`` or a list), each layer adds its own probe
-        vector ``v_l``, and with ``steer_distribute`` alpha is divided by the number of layers
-        actually steered (fewer at the model's edges). Each record has the alpha applied at each
-        layer, ``steer_alpha_per_layer``.
+        Generation is greedy by default (``steering.steer_sampling``). When sampling, the
+        generators are seeded with ``seed``, or else ``random.seed``, so completions are
+        reproducible for the same batch size (best-effort: GPU kernels are not bit-deterministic).
+        ``on_token`` gets each step's scores while generating (see :func:`concept_probe.generate`);
+        ``keep_logits`` keeps the steered model's logits of each generated token (``"all"`` or the
+        top ``k``, default ``output.generation_logits``).
 
-        Generation is greedy by default (``steering.steer_sampling``). When sampling, the RNGs
-        are seeded with ``seed``, or else ``random.seed``, so completions are reproducible
-        (best-effort: GPU kernels are not bit-deterministic across hardware/library versions);
-        each record has the generation settings under ``generation``.
+        Saved by default like :meth:`score_texts`; ``save_segments`` adds each message's mean score
+        to the lines of ``scores.jsonl``.
         """
         self._require_model("score_prompts")
-        alpha_unit = _validate_alpha_unit(alpha_unit)
-        tokenizer = self.model_bundle.tokenizer
-        model = self.model_bundle.model
-        aggregate = self.config["evaluation"]["score_aggregate"]
-        layers = self._layer_selection(layer_selection)
-        sys_prompt = self.config["prompts"].get("neutral_system") if system_prompt is None else system_prompt
         save_html = self.config["plots"].get("heatmap_html", True) if save_html is None else save_html
-        save_segments = False if save_segments is None else save_segments
-        do_steering = bool(self.config["steering"].get("do_steering", True))
-        save_token_scores_npz = self.config["output"].get("save_token_scores_npz", True)
-        if save_generation_logits is None:
-            save_generation_logits = bool(self.config["output"].get("save_generation_logits", False))
-        else:
-            save_generation_logits = bool(save_generation_logits)
-        if generation_logits_top_k is None:
-            generation_logits_top_k = self.config["output"].get("generation_logits_top_k", None)
-        if generation_logits_dtype is None:
-            generation_logits_dtype = self.config["output"].get("generation_logits_dtype", "float16")
-        if save_generation_logits and not save_token_scores_npz:
-            self._warn("save_generation_logits requested but output.save_token_scores_npz=false; logits will not be saved.")
-        save_generation_logits = bool(save_generation_logits and save_token_scores_npz)
-        scoring_seed: Optional[int] = None
-        steering_seed: Optional[int] = None
-        scoring_vectors = self.directions
-        steering_vectors = self.steer_directions
-        if random_scoring_vector or random_steering_vector:
-            control_vectors, control_seed = self._random_control_vectors(random_vector_seed)
-        if random_scoring_vector:
-            scoring_seed, scoring_vectors = control_seed, control_vectors
-            self._warn(
-                f"score_prompts using random scoring vector control (same-norm per layer, seed={scoring_seed})."
-            )
-        if random_steering_vector:
-            steering_seed, steering_vectors = control_seed, control_vectors
-            self._warn(
-                f"score_prompts using random steering vector control (same-norm per layer, seed={steering_seed})."
-            )
-
-        max_new_tokens = max_new_tokens if max_new_tokens is not None else self.config["steering"]["steer_max_new_tokens"]
-        greedy = greedy if greedy is not None else (not self.config["steering"]["steer_sampling"])
-        temperature = temperature if temperature is not None else self.config["steering"]["steer_temperature"]
-        top_p = top_p if top_p is not None else self.config["steering"]["steer_top_p"]
-        if not greedy:
-            # Sampled completions are reproducible: without an explicit seed, random.seed is used.
-            seed = int(self.config.get("random", {}).get("seed", 0)) if seed is None else int(seed)
-            set_seed(seed)
-        elif seed is not None:
-            set_seed(int(seed))
-        generation = {"greedy": bool(greedy), "max_new_tokens": int(max_new_tokens),
-                      "temperature": None if greedy else temperature, "top_p": None if greedy else top_p,
-                      "seed": None if greedy else seed}
-
-        if alphas is None:
-            alphas = [0.0]
-        if len(alphas) == 0:
-            raise ValueError("alphas is empty; pass at least one alpha (0.0 for no steering).")
-        nonzero_alpha_requested = any(abs(float(a)) > 1e-12 for a in alphas)
-        if nonzero_alpha_requested and not do_steering:
-            self._warn(
-                "Non-zero alphas provided; overriding steering.do_steering=false and enabling steering."
-            )
-            do_steering = True
-        if random_steering_vector and not nonzero_alpha_requested:
-            self._warn("random_steering_vector=true but all alphas are zero; no steering is applied.")
-        if nonzero_alpha_requested:
-            self._check_alpha_unit(alpha_unit)
-
-        if steer_layers is None:
-            steer_layers = self.config["steering"]["steer_layers"]
-        if steer_window_radius is None:
-            steer_window_radius = self.config["steering"]["steer_window_radius"]
-        if steer_distribute is None:
-            steer_distribute = self.config["steering"]["steer_distribute"]
-
-        steer_layer_list = _resolve_steer_layers(
-            steer_layers, int(self.layer), steer_window_radius, self.num_layers
+        result = _score_generations(
+            [self], prompts, steer=self, alphas=alphas, alpha_unit=alpha_unit, steer_layers=steer_layers,
+            steer_window_radius=steer_window_radius, steer_distribute=steer_distribute, system_prompt=system_prompt,
+            max_new_tokens=max_new_tokens, greedy=greedy, temperature=temperature, top_p=top_p, seed=seed,
+            batch_size=batch_size, layer_selection=layer_selection, random_scoring_vector=random_scoring_vector,
+            random_steering_vector=random_steering_vector, random_vector_seed=random_vector_seed,
+            keep_logits=keep_logits, on_token=on_token, warn=self._warn, status=self._status,
         )
-
-        base_dir = os.path.join(self._ensure_run_dir(), output_subdir)
-        ensure_dir(base_dir)
-        if batch_subdir is None:
-            batch_subdir = f"batch_{now_tag()}"
-        out_dir = base_dir if batch_subdir == "" else os.path.join(base_dir, batch_subdir)
-        _prepare_batch_dir(out_dir, overwrite)
-        results = []
-        batch_entries = []
-        total_prompts = len(prompts)
-        total_alphas = len(alphas)
-        total_runs = total_prompts * total_alphas
-        self._status(
-            f"Scoring {total_prompts} prompts x {total_alphas} alphas ({total_runs} generations) -> {out_dir}"
-        )
-        show_progress = self.console is not None and self.console.enabled
-        if show_progress and total_runs:
-            _progress_print(0, total_runs, label="Generating", enabled=True)
-
-        eos_ids = _eos_token_ids(model, tokenizer)
-        z_missing = None
-        if not random_scoring_vector and self.calibration_for(GENERATED_CONTEXT) is None:
-            z_missing = self._missing_z_reason(GENERATED_CONTEXT)
-            self._warn(f"score_prompts: score_mean_z is None: {z_missing}")
-        run_idx = 0
-        progress_every = 1
-        for i, prompt in enumerate(prompts):
-            prompt_slug = _prompt_slug_any(prompt)
-            for j, alpha in enumerate(alphas):
-                alpha_val, layer_scales = self._steering_alpha(alpha, alpha_unit, steer_layer_list)
-
-                messages, used_prompt_system = _normalize_messages(
-                    prompt,
-                    sys_prompt,
-                    warn=self._warn,
-                    warn_prefix=f"score_prompts.prompts[{i}]",
-                )
-                input_ids = apply_chat(tokenizer, messages, add_generation_prompt=True).to(model.device)
-                attn = attention_mask_from_ids(input_ids).to(model.device)
-                prompt_len = int(input_ids.shape[-1])
-
-                should_steer = do_steering and abs(float(alpha_val)) > 1e-12
-                if should_steer:
-                    context = MultiLayerSteererLayerwise(
-                        model, steer_layer_list, steering_vectors, alpha_val, distribute=steer_distribute,
-                        layer_scales=layer_scales,
-                    )
-                    steer_alpha_per_layer = context.per_layer_alpha()
-                else:
-                    context = None
-                    steer_alpha_per_layer = {}
-
-                if context is not None:
-                    with context:
-                        gen_ids = model.generate(
-                            input_ids=input_ids,
-                            attention_mask=attn,
-                            max_new_tokens=max_new_tokens,
-                            do_sample=not greedy,
-                            temperature=temperature if not greedy else None,
-                            top_p=top_p if not greedy else None,
-                            pad_token_id=tokenizer.eos_token_id,
-                        )[0].detach().cpu()
-                        if save_generation_logits:
-                            # Generation logits must reflect the steered model that produced the text.
-                            _, generation_step_logits = forward_hidden_states_all_layers(
-                                model,
-                                gen_ids.unsqueeze(0),
-                                return_generation_logits=True,
-                                generation_prompt_len=prompt_len,
-                            )
-                        else:
-                            generation_step_logits = None
-                    # Score with the hooks removed: with them active, the injected vector reads
-                    # itself back (score inflation ~ alpha * cos(steer_dir, score_dir) at steered
-                    # layers), contaminating the probe readout of the generated text.
-                    hs_layers = forward_hidden_states_all_layers(model, gen_ids.unsqueeze(0))
-                else:
-                    gen_ids = model.generate(
-                        input_ids=input_ids,
-                        attention_mask=attn,
-                        max_new_tokens=max_new_tokens,
-                        do_sample=not greedy,
-                        temperature=temperature if not greedy else None,
-                        top_p=top_p if not greedy else None,
-                        pad_token_id=tokenizer.eos_token_id,
-                    )[0].detach().cpu()
-                    if save_generation_logits:
-                        hs_layers, generation_step_logits = forward_hidden_states_all_layers(
-                            model,
-                            gen_ids.unsqueeze(0),
-                            return_generation_logits=True,
-                            generation_prompt_len=prompt_len,
-                        )
-                    else:
-                        hs_layers = forward_hidden_states_all_layers(model, gen_ids.unsqueeze(0))
-                        generation_step_logits = None
-                scores_per_layer, scores_agg = token_scores_from_hs_layers(
-                    hs_layers, scoring_vectors, layers, aggregate=aggregate
-                )
-                generation_logits_payload: Dict[str, np.ndarray] = {}
-                if save_generation_logits and generation_step_logits is not None:
-                    generation_logits_payload = _pack_generation_logits_arrays(
-                        generation_step_logits,
-                        logits_top_k=generation_logits_top_k,
-                        logits_dtype_name=generation_logits_dtype,
-                        logits_source="steered_model" if should_steer else "raw_model",
-                    )
-
-                token_ids = gen_ids.numpy().astype(np.int32)
-                tokens = _decode_tokens(tokenizer, token_ids)
-                completion_end = _completion_end(token_ids, prompt_len, eos_ids)
-                completion_text = tokenizer.decode(token_ids[prompt_len:completion_end], skip_special_tokens=True)
-                completion_scores = scores_agg[prompt_len:completion_end]
-                score_mean = float(np.mean(completion_scores)) if completion_scores.size else None
-                standardized = None if random_scoring_vector else self._token_z(
-                    scores_per_layer, layers, aggregate, GENERATED_CONTEXT
-                )
-                score_mean_z = (
-                    None if random_scoring_vector
-                    else self._item_z(scores_per_layer[prompt_len:completion_end], layers, aggregate, GENERATED_CONTEXT)
-                )
-
-                alpha_label = _alpha_label(float(alpha), alpha_unit)
-                # j keeps repeated alphas (several samples of one prompt) in separate files
-                base = f"prompt_{i:03d}_{prompt_slug}_a{j:02d}_{alpha_label}"
-                if save_token_scores_npz:
-                    npz_path = os.path.join(out_dir, f"{base}.npz")
-                    npz_payload: Dict[str, Any] = dict(
-                        token_ids=token_ids,
-                        prompt_len=np.array([prompt_len], dtype=np.int32),
-                        completion_end=np.array([completion_end], dtype=np.int32),
-                        scores_per_layer=scores_per_layer,
-                        scores_agg=scores_agg,
-                        layer_indices=np.array(layers, dtype=np.int32),
-                    )
-                    if standardized is not None:
-                        npz_payload.update(scores_z_per_layer=standardized[0], scores_agg_z=standardized[1])
-                    npz_payload.update(generation_logits_payload)
-                    np.savez_compressed(npz_path, **npz_payload)
-                else:
-                    npz_path = None
-
-                if save_html:
-                    shown = scores_agg if standardized is None else standardized[1]
-                    unit = "raw projection" if standardized is None else "token z: 0 = midpoint of the eval poles"
-                    html_path = os.path.join(out_dir, f"{base}.html")
-                    title = f"prompt {i:03d} | {prompt_slug} | {alpha_label} | {unit}"
-                    render_token_heatmap(tokens, shown.tolist(), html_path, title=title)
-                    batch_entries.append((title, tokens, shown.tolist()))
-                else:
-                    html_path = None
-
-                segments_path = None
-                if save_segments:
-                    segments_path = os.path.join(out_dir, f"{base}_segments.json")
-                    segment_scores = scores_agg if standardized is None else standardized[1]
-                    segments = segment_token_scores(
-                        tokens,
-                        segment_scores.tolist(),
-                        prompt_len=prompt_len,
-                    )
-                    with open(segments_path, "w", encoding="utf-8") as handle:
-                        json.dump(
-                            {"prompt_len": prompt_len, "score_kind": "raw" if standardized is None else "z",
-                             "segments": segments},
-                            handle,
-                            ensure_ascii=False,
-                            indent=2,
-                        )
-
-                rec = {
-                    "prompt": prompt,
-                    "system_prompt": sys_prompt,
-                    "system_prompt_overridden": bool(used_prompt_system),
-                    "prompt_text": tokenizer.decode(token_ids[:prompt_len].tolist(), skip_special_tokens=False),
-                    "alpha": float(alpha),
-                    "alpha_unit": alpha_unit,
-                    "alpha_value": float(alpha_val),
-                    "steer_layer_scales": layer_scales,
-                    "steer_alpha_per_layer": steer_alpha_per_layer,
-                    "steer_vectors": "each steered layer's own probe vector",
-                    "generation": generation,
-                    "sampling_seed": generation["seed"],
-                    "steer_layers": steer_layer_list,
-                    "completion": completion_text,
-                    "prompt_len": prompt_len,
-                    "completion_end": completion_end,
-                    "layers": layers,
-                    "npz_path": npz_path,
-                    "html_path": html_path,
-                    "segments_path": segments_path,
-                    "score_mean": score_mean,
-                    "score_mean_z": score_mean_z,
-                    "do_steering": bool(should_steer),
-                    "random_scoring_vector": bool(random_scoring_vector),
-                    "random_scoring_vector_seed": scoring_seed,
-                    "random_steering_vector": bool(random_steering_vector),
-                    "random_steering_vector_seed": steering_seed,
-                    "z_missing": z_missing,
-                    "generation_logits_saved": bool(generation_logits_payload),
-                    "generation_logits_top_k": (
-                        int(generation_logits_payload["generation_logits_topk_k"][0])
-                        if "generation_logits_topk_k" in generation_logits_payload
-                        else None
-                    ),
-                    "generation_logits_steps": (
-                        int(generation_logits_payload["generation_logits_steps"][0])
-                        if "generation_logits_steps" in generation_logits_payload
-                        else 0
-                    ),
-                    "generation_logits_source": (
-                        str(generation_logits_payload["generation_logits_source"][0])
-                        if "generation_logits_source" in generation_logits_payload
-                        else None
-                    ),
-                    "batch_dir": out_dir,
-                }
-                results.append(rec)
-                self.logger.log("score_prompt", rec)
-                run_idx += 1
-                if total_runs and (
-                    run_idx % progress_every == 0 or run_idx == total_runs
-                ):
-                    _progress_print(
-                        run_idx,
-                        total_runs,
-                        label="Generating",
-                        enabled=show_progress,
-                        last=run_idx == total_runs,
-                    )
-            # Progress bar handles per-run updates; avoid extra log spam here.
-
-        if save_html and batch_entries:
-            batch_path = os.path.join(out_dir, "batch_prompts.html")
-            render_batch_heatmap(batch_entries, batch_path, title="Batch prompt scores")
-            self.logger.log("score_prompt_batch", {"html_path": batch_path, "count": len(batch_entries)})
-
-        return results
+        if settings().save if save is None else save:
+            out = batch_dir(os.path.join(self._ensure_run_dir(), output_subdir), batch_subdir, overwrite)
+            result.save(out, html=save_html, segments=bool(save_segments))
+            self._status(f"Saved the scores of {len(result)} generations to {out}")
+        self.logger.log("score_prompts", {"n_generations": len(result), "dir": result.dir, **result.settings})
+        return result
 
     @classmethod
     def load(cls, run_dir: str, model: Any = None, tokenizer: Any = None, *,
@@ -2577,6 +2031,151 @@ class ConceptProbe:
         if model is not None:
             obj.attach(model, tokenizer, allow_model_mismatch=allow_model_mismatch)
         return obj
+
+
+def _shared_setting(probes: List["ConceptProbe"], section: str, key: str, explicit: Any, argument: str) -> Any:
+    """A setting a call over several probes uses: ``explicit`` if given, else the probes' common
+    config value. Probes whose configs disagree raise, instead of the first one's value being used."""
+    if explicit is not None:
+        return explicit
+    values = [probe.config.get(section, {}).get(key) for probe in probes]
+    if any(v != values[0] for v in values[1:]):
+        named = ", ".join(f"{p.concept.name}={v!r}" for p, v in zip(probes, values))
+        raise ValueError(f"The probes disagree on {section}.{key} ({named}); pass {argument}= to choose one.")
+    return values[0]
+
+
+def _score_generations(
+    probes: List["ConceptProbe"],
+    prompts: List[PromptLike],
+    *,
+    steer: Optional["ConceptProbe"],
+    alphas: Optional[List[float]],
+    alpha_unit: str,
+    steer_layers: Any,
+    steer_window_radius: Optional[int],
+    steer_distribute: Optional[bool],
+    system_prompt: Optional[str],
+    max_new_tokens: Optional[int],
+    greedy: Optional[bool],
+    temperature: Optional[float],
+    top_p: Optional[float],
+    seed: Optional[int],
+    batch_size: Optional[int],
+    layer_selection: Optional[Dict[str, Any]],
+    random_scoring_vector: bool,
+    random_steering_vector: bool,
+    random_vector_seed: Optional[int],
+    keep_logits: Union[None, int, str],
+    on_token: Optional[Callable[[TokenStep], Any]],
+    warn: Callable[[str], None],
+    status: Callable[[str], None],
+) -> Scores:
+    """Generate each prompt at each alpha (steered with ``steer``) and score the completions with
+    every probe: what :meth:`ConceptProbe.score_prompts` and ``multi_probe_score_prompts`` do."""
+    alpha_unit = _validate_alpha_unit(alpha_unit)
+    alphas = [0.0] if alphas is None else [float(a) for a in alphas]
+    if not alphas:
+        raise ValueError("alphas is empty; pass at least one alpha (0.0 for no steering).")
+    steering_on = any(abs(a) > 1e-12 for a in alphas)
+    if steering_on and steer is None:
+        raise ValueError("Non-zero alphas need steer_probe: the probe (index, name or object) whose vectors steer.")
+    first = probes[0]
+    model, tokenizer = first.model_bundle.model, first.model_bundle.tokenizer
+
+    sys_prompt = _shared_setting(probes, "prompts", "neutral_system", system_prompt, "system_prompt")
+    max_new_tokens = int(_shared_setting(probes, "steering", "steer_max_new_tokens", max_new_tokens, "max_new_tokens"))
+    if greedy is None:
+        greedy = not _shared_setting(probes, "steering", "steer_sampling", None, "greedy")
+    if not greedy:
+        temperature = _shared_setting(probes, "steering", "steer_temperature", temperature, "temperature")
+        top_p = _shared_setting(probes, "steering", "steer_top_p", top_p, "top_p")
+        # Sampled completions are reproducible: without an explicit seed, random.seed is used.
+        seed = int(_shared_setting(probes, "random", "seed", seed, "seed"))
+    if batch_size is None:
+        batch_size = _shared_setting(probes, "steering", "gen_batch_size", None, "batch_size") or \
+            _shared_setting(probes, "training", "gen_batch_size", None, "batch_size")
+    batch_size = int(batch_size)
+    read_batch_size = int(first.config["readout"].get("batch_size", 16))
+    if keep_logits is None:
+        keep_logits = _shared_setting(probes, "output", "generation_logits", None, "keep_logits")
+
+    scorers, scoring_seeds, z_missing = [], {}, {}
+    for probe in probes:
+        vectors, probe_seed = (probe._random_control_vectors(random_vector_seed) if random_scoring_vector
+                               else (None, None))
+        scorer = probe._token_scorer(generated=True, layer_selection=layer_selection, vectors=vectors)
+        scorers.append(scorer)
+        scoring_seeds[scorer.name] = probe_seed
+        z_missing[scorer.name] = None
+        if random_scoring_vector:
+            z_missing[scorer.name] = "random scoring vectors"
+        elif scorer.calibration is None:
+            z_missing[scorer.name] = probe._missing_z_reason(GENERATED_CONTEXT)
+            warn(f"{probe.concept.name}: score_mean_z is None: {z_missing[scorer.name]}")
+    if random_scoring_vector:
+        warn(f"scoring with random vectors as a control (same norm per layer, seeds {scoring_seeds}).")
+
+    steer_vectors, steering_seed, steer_layer_list = None, None, []
+    if steer is not None:
+        steer_layer_list = steer.steer_layer_list(steer_layers, steer_window_radius)
+        if steering_on:
+            steer._check_alpha_unit(alpha_unit)
+        if random_steering_vector:
+            if steering_on:
+                steer_vectors, steering_seed = steer._random_control_vectors(random_vector_seed)
+                warn(f"steering with a random vector as a control (same norm per layer, seed={steering_seed}).")
+            else:
+                warn("random_steering_vector=true but all alphas are zero; no steering is applied.")
+
+    total = len(prompts) * len(alphas)
+    status(f"Generating {len(prompts)} prompts x {len(alphas)} alphas ({total} generations), "
+           f"{batch_size} at a time")
+    generated: List[Tuple[int, int, Any, Dict[str, Any]]] = []  # (prompt, alpha index, generation, info)
+    if not greedy:
+        set_seed(int(seed))
+    for j, alpha in enumerate(alphas):
+        intervention, info = None, {"alpha": alpha, "alpha_unit": alpha_unit, "alpha_value": 0.0,
+                                    "steer_alpha_per_layer": {}, "steer_layer_scales": None}
+        if steer is not None:
+            value, scales = steer._steering_alpha(alpha, alpha_unit, steer_layer_list)
+            info.update(alpha_value=float(value), steer_layer_scales=scales)
+            if abs(value) > 1e-12:
+                intervention = steer.steering(alpha, alpha_unit, layers=steer_layer_list,
+                                              distribute=steer_distribute, vectors=steer_vectors)
+                info["steer_alpha_per_layer"] = intervention.alpha_per_layer
+        gens = generate(model, tokenizer, prompts, system=sys_prompt, max_new_tokens=max_new_tokens, greedy=greedy,
+                        temperature=temperature, top_p=top_p, batch_size=batch_size, intervention=intervention,
+                        on_token=on_token, watch=probes if on_token is not None else (), keep_logits=keep_logits,
+                        save=False, warn=warn)
+        for g in gens:
+            generated.append((g.index, j, g, dict(info, intervention=g.intervention)))
+        status(f"Generated alpha {j + 1}/{len(alphas)} ({alpha:g} {alpha_unit})")
+
+    generated.sort(key=lambda x: (x[0], x[1]))  # prompt by prompt, each prompt's alphas in order
+    inputs = []
+    for i, j, g, info in generated:
+        info = dict(info, prompt=g.prompt, alpha_index=j, prompt_len=g.prompt_len, completion_end=g.completion_end,
+                    system_prompt_overridden=g.own_system)
+        inputs.append(ScoreInput(torch.as_tensor(g.token_ids), (g.prompt_len, g.completion_end), g.text, i, info,
+                                 logits=g.logits))
+    status(f"Scoring {len(inputs)} completions")
+    items = score_inputs(model, tokenizer, inputs, scorers, batch_size=read_batch_size)
+    run_settings = {
+        "system_prompt": sys_prompt, "alphas": alphas, "alpha_unit": alpha_unit,
+        "steer_probe": None if steer is None else str(steer.concept.name), "steer_layers": steer_layer_list,
+        "steer_distribute": None if steer is None else (
+            steer.config["steering"]["steer_distribute"] if steer_distribute is None else bool(steer_distribute)),
+        "steer_direction": None if steer is None else steer.steer_estimator,
+        "generation": {"greedy": bool(greedy), "max_new_tokens": max_new_tokens,
+                       "temperature": None if greedy else temperature, "top_p": None if greedy else top_p,
+                       "seed": None if greedy else seed, "batch_size": batch_size},
+        "layers": {s.name: s.layers for s in scorers}, "aggregate": {s.name: s.aggregate for s in scorers},
+        "random_scoring_vector": bool(random_scoring_vector), "random_scoring_vector_seed": scoring_seeds,
+        "random_steering_vector": bool(random_steering_vector), "random_steering_vector_seed": steering_seed,
+        "keep_logits": keep_logits,
+    }
+    return Scores("generations", [s.name for s in scorers], items, run_settings, z_missing)
 
 
 def _dotted_differences(a: Dict[str, Any], b: Dict[str, Any], prefix: str = "") -> List[str]:

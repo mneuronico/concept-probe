@@ -118,12 +118,12 @@
     "score_aggregate": "mean"
   },
   "steering": {
-    "do_steering": true,
     "steer_direction": "mean_diff",
     "steer_sampling": false,
     "steer_temperature": 0.7,
     "steer_top_p": 0.9,
     "steer_max_new_tokens": 64,
+    "gen_batch_size": null,
     "steer_layers": "probe",
     "steer_window_radius": 2,
     "steer_distribute": true
@@ -137,10 +137,7 @@
   "output": {
     "root_dir": "outputs",
     "save_reps_to_npz": true,
-    "save_token_scores_npz": true,
-    "save_generation_logits": false,
-    "generation_logits_top_k": null,
-    "generation_logits_dtype": "float16",
+    "generation_logits": null,
     "log_jsonl": true,
     "pretty_json_log": true,
     "console": true,

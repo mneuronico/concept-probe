@@ -60,7 +60,10 @@ class TinyCausalLM(nn.Module):
         self.model.norm = _RMSNorm()
         head = emb.clone()
         head[:, 0] = 0.0  # the large coordinate would otherwise pick the next token on its own
-        self.register_buffer("head", head, persistent=False)
+        self.lm_head = nn.Linear(dim, VOCAB, bias=False, dtype=torch.float64)
+        with torch.no_grad():
+            self.lm_head.weight.copy_(head)
+        self.lm_head.requires_grad_(False)
         self.register_buffer("allowed", torch.tensor([ord(c) for c in GEN_CHARS]), persistent=False)
         self.generation_config = SimpleNamespace(eos_token_id=EOS)
         self.eval()
@@ -68,6 +71,9 @@ class TinyCausalLM(nn.Module):
     @property
     def device(self) -> torch.device:
         return torch.device("cpu")
+
+    def get_output_embeddings(self) -> nn.Module:
+        return self.lm_head
 
     def forward(self, input_ids, attention_mask=None, output_hidden_states=False, use_cache=False,
                 return_dict=True, **kwargs):
@@ -81,7 +87,7 @@ class TinyCausalLM(nn.Module):
             states.append(h)
         normed = self.model.norm(h)
         states[-1] = normed  # like Hugging Face decoders: the last hidden state is after the final norm
-        logits = normed @ self.head.T
+        logits = self.lm_head(normed)
         return SimpleNamespace(hidden_states=tuple(states) if output_hidden_states else None, logits=logits)
 
     @torch.no_grad()
@@ -94,7 +100,7 @@ class TinyCausalLM(nn.Module):
         pad = EOS if pad_token_id is None else int(pad_token_id)
         done = torch.zeros(ids.shape[0], dtype=torch.bool)
         for _ in range(int(max_new_tokens)):
-            logits = self.forward(ids, attention_mask=mask).logits[:, -1, :]
+            logits = self(ids, attention_mask=mask).logits[:, -1, :]  # through __call__, so hooks run
             masked = torch.full_like(logits, float("-inf"))
             masked[:, self.allowed] = logits[:, self.allowed]
             if do_sample:
