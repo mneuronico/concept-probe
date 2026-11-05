@@ -56,7 +56,7 @@ def test_exposed_in_public_api():
 
 def test_training_defaults():
     training = concept_probe.load_defaults()["training"]
-    assert training["direction_normalization"] is None and training["estimator"] == "mean_diff"
+    assert "direction_normalization" not in training and training["estimator"] == "mean_diff"
     assert training["train_text_role"] == "raw"  # the text alone: no chat template, no system prompt
     assert training["train_text_prompt"] is None
 

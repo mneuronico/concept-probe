@@ -122,7 +122,7 @@ def _concept(name, **kwargs):
 TRAININGS = {
     "texts": ({"training": {"train_prompt_mode": "texts"}},
               dict(pos_system="", neg_system="", train_pos_texts=TRAIN_POS, train_neg_texts=TRAIN_NEG)),
-    "texts_var": ({"training": {"train_prompt_mode": "texts", "direction_normalization": "var"}},
+    "texts_var": ({"training": {"train_prompt_mode": "texts", "estimator": "mean_diff_var"}},
                   dict(pos_system="", neg_system="", train_pos_texts=TRAIN_POS, train_neg_texts=TRAIN_NEG)),
     "texts_user": ({"training": {"train_prompt_mode": "texts", "train_text_role": "user",
                                  "train_text_system": "x y z"}},
@@ -153,8 +153,11 @@ def _run_summary(probe):
         "best_layer", "best_d", "best_p", "best_d_ci95", "selection", "best_d_selection", "best_d_all_eval",
         "n_eval_selection", "sweep_max_d", "sweep_max_d_perm_p", "sigma_best_layer", "n_train_pos", "n_train_neg",
         "n_eval_pos", "n_eval_neg", "eval_mode_used", "eval_paired", "reference_context", "eval_readout",
-        "dropped_items", "direction_normalization", "train_text_role",
+        "dropped_items", "train_text_role",
     )}
+    # the normalization of the difference of means, as the reference recorded it before the estimator
+    # had its own setting
+    out["direction_normalization"] = metrics["estimator"].get("normalization")
     transfer = metrics.get("transfer_eval")
     out["transfer_eval"] = None if transfer is None else {
         k: transfer.get(k) for k in ("n_pos", "n_neg", "d_at_best_layer", "p_at_best_layer", "d_ci95_at_best_layer")

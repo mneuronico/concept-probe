@@ -80,7 +80,7 @@ y siete entradas son de carga del modelo.
   template y su fecha). La identidad viaja con las representaciones, la caché y la probe, y es lo
   que se compara al usar una probe con un modelo (hoy `_MODEL_IDENTITY_KEYS`).
 - `quantization`: nada, un nivel con nombre (`"nf4"`, `"int8"`; HQQ si lo sumamos) o cualquier
-  `quantization_config` de transformers (3). `use_4bit` queda como sinónimo de `"nf4"`.
+  `quantization_config` de transformers (3). `use_4bit` desaparece (D7).
 - `dtype="auto"` por defecto: bf16 si la GPU lo soporta; si no, fp32 para Gemma 3 y fp16 para el
   resto. Se guarda el dtype resuelto, nunca "auto", y se registra qué se pidió, qué se eligió y por
   qué (la GPU y la familia del modelo) (2, D5). Aviso al cargar Gemma 3 en fp16 (1).
@@ -467,10 +467,11 @@ estable; la 7 prueba el conjunto.
 - **D5. dtype.** `"auto"` por defecto, con todo registrado: qué se pidió, qué se eligió y por qué.
 - **D6. Embeddings.** Los índices de capa no se mueven (la capa l sigue siendo la salida del bloque
   l); los embeddings se piden aparte, con un nombre propio.
-- **D7. Lo reemplazado** (`use_4bit`, `direction_normalization`, `random_scoring_vector` /
-  `random_steering_vector`, `LayerSteerer` / `MultiLayerSteererLayerwise`, `generate_once`, la
-  lectura de carpetas en `coherence.py`) queda como sinónimo o envoltorio, con aviso de obsoleto
-  durante una versión.
+- **D7. Lo reemplazado.** Primero: sinónimos o envoltorios con aviso de obsoleto durante una versión.
+  Revisado el 2026-11-05 (la librería es para usuarios nuevos y el único usuario hasta ahora es el
+  autor): sin sinónimos. `use_4bit` y `direction_normalization` ya no existen como opciones; las
+  corridas guardadas con ellos se siguen cargando, traducidas al leerlas. Las clases viejas de
+  empuje se deciden en la etapa 4.
 - **D8. "Mismos resultados"** quiere decir iguales salvo redondeo. Leer y generar van en lotes por
   defecto; los tests de referencia comparan con tolerancia; lotes de 1 reproducen lo de hoy exacto.
 
@@ -490,7 +491,7 @@ estable; la 7 prueba el conjunto.
 |---|---|---|---|
 | 1 | 1 (y 0) | 0 | chequeo de finitos al capturar, error con dtype y capa; aviso de fp16 con Gemma 3 |
 | 2 | 0 | 1 | `dtype="auto"` por defecto, resuelto, registrado con su motivo (D5) |
-| 3 | 0 | 1 | `quantization` (nivel o config) en la identidad; `use_4bit` como sinónimo |
+| 3 | 0 | 1 | `quantization` (nivel o config) en la identidad; `use_4bit` desaparece |
 | 4 | 0 | 1 | todo acepta un modelo ya cargado, incluido `ProbeWorkspace` |
 | 5 | 1 | 1 | lectura en lotes con padding; float16 sólo en la caché |
 | 6 | 0 | 0 | resolver la ruta local sin red |

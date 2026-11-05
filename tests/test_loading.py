@@ -120,12 +120,15 @@ def test_a_dict_or_object_config_is_passed_through():
     assert resolve_quantization({"quantization": own}, torch.float16)[0] is own
 
 
-def test_use_4bit_is_an_alias_of_nf4_with_a_notice():
-    with pytest.warns(DeprecationWarning, match="quantization = 'nf4'"):
-        cfg, choices = resolve_quantization({"use_4bit": True}, torch.float16)
-    assert quantization_identity(cfg) == "nf4" and choices[0].chosen == "nf4"
-    with pytest.raises(ValueError, match="disagree"):
-        resolve_quantization({"use_4bit": True, "quantization": "int8"}, torch.float16)
+def test_saved_configs_from_earlier_versions_are_read_in_todays_terms():
+    old = {"model": {"model_id": "m", "use_4bit": True}, "training": {"direction_normalization": "var"}}
+    new = modeling.upgrade_saved_config(old)
+    assert new["model"] == {"model_id": "m", "quantization": "nf4"}
+    assert new["training"] == {"estimator": {"kind": "mean_diff", "normalization": "var"}}
+    assert old["model"]["use_4bit"] is True  # the input is left alone
+
+
+def test_bad_quantization_settings_raise():
     with pytest.raises(ValueError, match="one of"):
         resolve_quantization({"quantization": "q4"}, torch.float16)
     with pytest.raises(ValueError, match="quant_method"):

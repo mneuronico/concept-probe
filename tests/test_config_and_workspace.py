@@ -45,11 +45,13 @@ def test_known_keys_are_accepted():
 def test_requested_4bit_without_bitsandbytes_fails_instead_of_loading_full_precision(monkeypatch):
     monkeypatch.setitem(sys.modules, "bitsandbytes", None)  # makes `import bitsandbytes` fail
     with pytest.raises(ImportError, match="bitsandbytes"):
-        ModelBundle.load({"model_id": "unused", "use_4bit": True, "dtype": "float32"})
+        ModelBundle.load({"model_id": "unused", "quantization": "nf4", "dtype": "float32"})
 
 
-def test_4bit_is_off_by_default():
-    assert resolve_config()["model"]["use_4bit"] is False
+def test_quantization_is_off_by_default_and_the_old_switch_is_gone():
+    assert resolve_config()["model"]["quantization"] is None
+    with pytest.raises(ValueError, match="model.use_4bit"):
+        resolve_config({"model": {"use_4bit": True}})
 
 
 def _fake_from_pretrained(monkeypatch, model_type="llama"):

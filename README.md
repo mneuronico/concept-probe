@@ -108,8 +108,7 @@ holds a run raises instead of mixing two runs; pass `overwrite=True` to replace 
 - `model.quantization` is null (default), a level (`"nf4"`, `"int8"`, `"hqq4"`, `"hqq3"`,
   `"hqq2"`), a transformers quantization config, or a dict with its `quant_method` (for
   bitsandbytes with double quantization, for instance). NF4 computes in `model.dtype`. A level
-  that cannot load fails instead of loading the full-precision model. `model.use_4bit = true` is
-  the old name of `"nf4"` and still works, with a deprecation warning.
+  that cannot load fails instead of loading the full-precision model.
 - With `HF_HUB_OFFLINE` set, a repo id loads from its snapshot in the local cache.
 
 A model that is already loaded can be passed in instead, for instance one quantized another
@@ -468,8 +467,7 @@ the two poles:
 A dict sets parameters (`{"kind": "logistic", "C": 1.0}`), and `register_estimator(kind, factory)`
 adds an estimator: any object with `fit(pos, neg)` returning a direction. Every direction has unit
 length and points toward the positive pole. `logistic` and `lda` need scikit-learn (the `stats`
-extra). `training.direction_normalization` is the old name of the difference of means'
-normalization and still works, with a deprecation warning.
+extra).
 
 **Steering has its own direction.** Reading and steering do not favor the same estimator. Across
 Llama, Qwen and Gemma 3 models, `"mean_diff_var"` read better (by a wide margin in Gemma and Qwen)
@@ -586,7 +584,7 @@ accuracy as correctness. `marker` works in both `run_scored_eval` and `run_multi
 `marker` together with your own `evaluator` raises, since it would not be used.
 
 `multi_probe_score_prompts` runs one model for every probe, so the probes must come from the same
-model settings (`model_id`, `dtype`, `use_4bit`, chat template and its date). The generation
+model identity (the model, the dtype used, the quantization, the chat template and its date). The generation
 settings (system prompt, `max_new_tokens`, sampling and, when sampling, `temperature`, `top_p`
 and the seed) come from the arguments or, when not passed, from the probes' configs, which must
 then agree. Non-zero alphas need `steer_probe` (index, name or probe); the steering layers and
@@ -699,8 +697,8 @@ GitHub Actions CI runs the same lightweight checks and also builds source and wh
 - **Loading.** `model.dtype` defaults to `"auto"`: bfloat16 on GPUs that compute in it, float16
   on older ones (float32 for Gemma 3), float32 on the CPU. It used to be bfloat16 everywhere,
   which older GPUs only emulate, slowly. `model.quantization` takes `"nf4"`, `"int8"`, `"hqq4"`,
-  `"hqq3"`, `"hqq2"`, a dict or a transformers config (`use_4bit` still works, as `"nf4"`, with
-  a deprecation warning); HQQ layers compute in the model's dtype (transformers 4.57 forced
+  `"hqq3"`, `"hqq2"`, a dict or a transformers config, and replaces `model.use_4bit`, which is gone
+  (runs saved with it still load, as `"nf4"`); HQQ layers compute in the model's dtype (transformers 4.57 forced
   float32). `ProbeWorkspace(model=..., tokenizer=...)` takes a model that is already loaded.
 - **Model identity.** Probes record the identity of the model they were trained with (model,
   revision, dtype actually used, quantization, chat template and date) in `metrics.json`, and
@@ -719,8 +717,8 @@ GitHub Actions CI runs the same lightweight checks and also builds source and wh
 - **Message spans.** `preview_input` returns the token span of every message, and
   `message_spans(tokenizer, messages)` does for any conversation.
 - **Estimators.** `training.estimator` takes `mean_diff` (default), `mean_diff_var`, `mean_diff_sd`,
-  `mean_diff_drop_outliers`, `logistic`, `lda`, a dict with parameters, or a registered estimator;
-  `training.direction_normalization` still works, as an alias with a deprecation warning.
+  `mean_diff_drop_outliers`, `logistic`, `lda`, a dict with parameters, or a registered estimator.
+  It replaces `training.direction_normalization`, which is gone (runs saved with it still load).
 - **Steering has its own direction** (`steering.steer_direction`, default the raw difference of
   means): a probe trained with `mean_diff_var` reads with it and steers with the raw difference,
   which pushes further. Training announces it and saves both; `alpha_unit="sigma"` is measured on the
@@ -755,8 +753,7 @@ GitHub Actions CI runs the same lightweight checks and also builds source and wh
   excluded there, although bitsandbytes supports Windows since 0.43.
 - **Assistant-role training texts with no turn before them stop before anything runs**, with a
   message naming `training.train_text_prompt` and the system prompt settings.
-- Documented that `training.direction_normalization` also changes the steering direction, and that
-  z = 0 is the midpoint between the poles, not "without the concept".
+- Documented that z = 0 is the midpoint between the poles, not "without the concept".
 - `tests/test_reference_outputs.py` pins what the existing API returns and writes on a tiny
   deterministic model, so the redesign in [docs/DESIGN.md](docs/DESIGN.md) can show that it keeps
   the same results.
@@ -794,7 +791,7 @@ GitHub Actions CI runs the same lightweight checks and also builds source and wh
 - **Errors instead of silent fallbacks**: unknown config and concept keys; `alpha_unit`,
   `steer_layers`, `sweep_select` and layer indices outside their values (previously `"12"`
   steered layers 1 and 2, and out-of-range layer bounds were clipped); settings a text role
-  would ignore; `pos_system == neg_system` in contrastive modes; `use_4bit` without bitsandbytes;
+  would ignore; `pos_system == neg_system` in contrastive modes; a quantization without its library;
   a different model in `get_probe`; a reused `run_name`. Most are checked before anything runs.
 - **Fixes**: `multi_probe_score_prompts` scored every probe sharing a concept name with the last
   one's vectors (names must now be distinct); `ActivationPatch` layers outside the model,
@@ -834,7 +831,7 @@ GitHub Actions CI runs the same lightweight checks and also builds source and wh
   `n_train_pos`/`n_train_neg` count the items in the vector; segment files use the heatmap's
   scores; `aggregate_eval_batches` finds batches by their analysis folder; an explicit
   coherence env file wins over the environment; the example concepts set no system prompt.
-- **Other defaults**: `use_4bit` false (NF4 when on); coherence rating off, and no `.env` read
+- **Other defaults**: no quantization; coherence rating off, and no `.env` read
   unless passed; `train_concept_from_json` follows the config's steering settings; the random
   control vector is the same for a probe in every function; `metrics.json` reports null instead
   of 0 when there was no evaluation.

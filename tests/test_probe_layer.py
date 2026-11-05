@@ -230,14 +230,20 @@ def test_steering_can_use_the_reading_direction(tmp_path):
     assert probe.steer_directions is probe.directions and metrics["steer_sigma_best_layer"] == metrics["sigma_best_layer"]
 
 
-def test_direction_normalization_still_works_as_an_alias(tmp_path):
-    with pytest.warns(DeprecationWarning, match="training.estimator"):
-        _, old, metrics = _train(tmp_path / "a", {"training": {"direction_normalization": "var"}})
-    _, new, _ = _train(tmp_path / "b", {"training": {"estimator": "mean_diff_var"}})
-    np.testing.assert_array_equal(old.directions, new.directions)
-    assert metrics["direction_normalization"] == "var"
-    with pytest.raises(ValueError, match="disagree"):
-        _train(tmp_path / "c", {"training": {"direction_normalization": "var", "estimator": "logistic"}})
+def test_the_old_normalization_setting_is_gone_but_old_runs_load(tmp_path):
+    with pytest.raises(ValueError, match="training.direction_normalization"):
+        _train(tmp_path / "a", {"training": {"direction_normalization": "var"}})
+    ws, probe, _ = _train(tmp_path / "b", {"training": {"estimator": "mean_diff_var"}})
+    cfg_path = os.path.join(probe.run_dir, "config.json")
+    cfg = json.loads(open(cfg_path, encoding="utf-8").read())
+    cfg["training"].pop("estimator")
+    cfg["training"]["direction_normalization"] = "var"  # as earlier versions saved it
+    open(cfg_path, "w", encoding="utf-8").write(json.dumps(cfg))
+    metrics_path = os.path.join(probe.run_dir, "metrics.json")
+    metrics = json.loads(open(metrics_path, encoding="utf-8").read())
+    metrics.pop("estimator")
+    open(metrics_path, "w", encoding="utf-8").write(json.dumps(metrics))
+    assert ConceptProbe.load(probe.run_dir).estimator == {"kind": "mean_diff", "normalization": "var"}
 
 
 def test_training_with_another_estimator(tmp_path):

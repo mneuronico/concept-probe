@@ -2,7 +2,6 @@ import json
 import os
 import shutil
 import sys
-import warnings
 import zlib
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
@@ -21,6 +20,7 @@ from .modeling import (
     identity_from_config,
     identity_mismatches,
     identity_of,
+    upgrade_saved_config,
 )
 from .record import Choice, announce
 from .settings import settings
@@ -175,26 +175,6 @@ def _span_token_projections(
          for l in range(len(hs_layers))],
         axis=1,
     )
-
-
-def _training_estimator(train_cfg: Dict[str, Any]) -> Tuple[Any, List[Choice]]:
-    """The estimator of ``training.estimator``, or of the deprecated ``training.direction_normalization``
-    (the normalization of the difference of means), which must then leave the estimator alone."""
-    estimator = train_cfg.get("estimator", "mean_diff")
-    normalization = train_cfg.get("direction_normalization")
-    if normalization is None:
-        return estimator, []
-    if normalization not in DIRECTION_NORMALIZATIONS:
-        raise ValueError(f"training.direction_normalization must be one of {DIRECTION_NORMALIZATIONS} or null; "
-                         f"got {normalization!r}")
-    if estimator not in ("mean_diff", {"kind": "mean_diff"}):
-        raise ValueError("training.direction_normalization and training.estimator disagree; set only "
-                         "training.estimator (for example 'mean_diff_var').")
-    warnings.warn("training.direction_normalization is deprecated; set training.estimator, e.g. 'mean_diff_var'.",
-                  DeprecationWarning, stacklevel=3)
-    spec = {"kind": "mean_diff", "normalization": normalization}
-    return spec, [Choice("training.estimator", f"direction_normalization={normalization!r}", spec,
-                         "direction_normalization is the old name of the difference of means' normalization")]
 
 
 def pick_layer(num_layers: int, layer_idx: Optional[int], layer_frac: float) -> int:
@@ -754,10 +734,9 @@ class ConceptProbe:
         # ---- Validate everything before generating or writing anything.
         if train_prompt_mode not in ("shared", "opposed", "texts"):
             raise ValueError(f"Unknown train_prompt_mode: {train_prompt_mode}")
-        estimator_cfg, early_choices = _training_estimator(train_cfg)
-        read_estimator = make_estimator(estimator_cfg)
+        early_choices: List[Choice] = []
+        read_estimator = make_estimator(train_cfg.get("estimator", "mean_diff"))
         read_spec = estimator_spec(read_estimator)
-        direction_normalization = read_spec.get("normalization") if read_spec.get("kind") == "mean_diff" else None
         steer_direction_cfg = self.config.get("steering", {}).get("steer_direction", "mean_diff")
         if steer_direction_cfg != "read":
             make_estimator(steer_direction_cfg)  # an unknown estimator fails here, before anything runs
@@ -1650,7 +1629,6 @@ class ConceptProbe:
             "n_train_pos": n_train_pos,
             "n_train_neg": n_train_neg,
             "train_prompt_mode": train_prompt_mode,
-            "direction_normalization": direction_normalization,
             "estimator": read_spec,
             "steer_direction": steer_spec,
             "steer_sigma_best_layer": _opt(steer_sigma),
@@ -2684,7 +2662,7 @@ class ConceptProbe:
         :meth:`save`), with ``model`` attached if given (see :meth:`attach`). Runs saved by earlier
         versions load too."""
         with open(os.path.join(run_dir, "config.json"), "r", encoding="utf-8") as f:
-            cfg = json.loads(f.read())
+            cfg = upgrade_saved_config(json.loads(f.read()))
         with open(os.path.join(run_dir, "concept.json"), "r", encoding="utf-8") as f:
             concept = ConceptSpec.from_config({"concept": json.loads(f.read())})
         metrics: Dict[str, Any] = {}
@@ -2703,8 +2681,7 @@ class ConceptProbe:
         obj.resid_norm = tensors.get("resid_norm")
         obj.calibrations = calibrations_from_tensors(tensors)
         obj.identity = metrics.get("model_identity") or identity_from_config(cfg.get("model", {}))
-        estimator, _ = _training_estimator(cfg.get("training", {}))
-        obj.estimator = metrics.get("estimator") or estimator_spec(estimator)
+        obj.estimator = metrics.get("estimator") or estimator_spec(cfg.get("training", {}).get("estimator", "mean_diff"))
         if "steer_vectors" in tensors:
             obj.steer_directions = tensors["steer_vectors"]
             if np.array_equal(obj.steer_directions, obj.directions):
@@ -2774,7 +2751,7 @@ class ProbeWorkspace:
             if not os.path.exists(cfg_path):
                 raise FileNotFoundError(f"project_directory must point to a trained run dir containing config.json: {run_dir}")
             with open(cfg_path, "r", encoding="utf-8") as f:
-                cfg = json.loads(f.read())
+                cfg = upgrade_saved_config(json.loads(f.read()))
             if config_overrides:
                 check_config_keys(config_overrides, deep_merge(load_defaults(), cfg))
                 cfg = deep_merge(cfg, config_overrides)
@@ -2828,7 +2805,7 @@ class ProbeWorkspace:
             )]
         cfg["model"].update(model_id=identity.get("model_id") or cfg["model"]["model_id"],
                             dtype=identity.get("dtype") or cfg["model"].get("dtype"),
-                            quantization=identity.get("quantization"), use_4bit=False)
+                            quantization=identity.get("quantization"))
         return bundle
 
     def get_probe(

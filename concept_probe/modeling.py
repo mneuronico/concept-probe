@@ -248,7 +248,7 @@ def quantization_identity(config: Any) -> Any:
 
 
 def resolve_quantization(model_cfg: Dict[str, Any], dtype: torch.dtype) -> Tuple[Any, List[Choice]]:
-    """The transformers quantization config for ``model.quantization`` (or the old ``use_4bit``).
+    """The transformers quantization config for ``model.quantization``.
 
     ``model.quantization`` is null, a level of :data:`QUANTIZATION_LEVELS`, a transformers
     quantization config object, or a dict with its ``quant_method`` (e.g. bitsandbytes with double
@@ -257,14 +257,6 @@ def resolve_quantization(model_cfg: Dict[str, Any], dtype: torch.dtype) -> Tuple
     """
     choices: List[Choice] = []
     spec = model_cfg.get("quantization")
-    if model_cfg.get("use_4bit"):
-        if spec not in (None, "nf4"):
-            raise ValueError(f"model.use_4bit and model.quantization={spec!r} disagree; set only model.quantization.")
-        if spec is None:
-            warnings.warn("model.use_4bit is deprecated; set model.quantization = 'nf4'.", DeprecationWarning,
-                          stacklevel=3)
-            choices.append(Choice("model.quantization", "use_4bit=true", "nf4", "use_4bit is the old name of nf4"))
-        spec = "nf4"
     if spec is None:
         return None, choices
     if isinstance(spec, str):
@@ -335,11 +327,26 @@ def _config_dtype_name(value: Any) -> Optional[str]:
         return str(value)
 
 
+def upgrade_saved_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """A run's saved config in today's terms: runs saved by earlier versions wrote
+    ``model.use_4bit`` (now ``model.quantization = "nf4"``) and ``training.direction_normalization``
+    (now ``training.estimator``). Returns a new dict; today's configs come back unchanged."""
+    cfg = json.loads(json.dumps(cfg))
+    model = cfg.get("model", {})
+    if "use_4bit" in model:
+        if model.pop("use_4bit") and model.get("quantization") is None:
+            model["quantization"] = "nf4"
+        model.setdefault("quantization", None)
+    training = cfg.get("training", {})
+    if "direction_normalization" in training:
+        normalization = training.pop("direction_normalization") or "none"
+        training.setdefault("estimator", {"kind": "mean_diff", "normalization": normalization})
+    return cfg
+
+
 def identity_from_config(model_cfg: Dict[str, Any]) -> Dict[str, Any]:
     """The identity a saved config describes (for runs saved before identities were recorded)."""
-    quant = model_cfg.get("quantization")
-    if quant is None and model_cfg.get("use_4bit"):
-        quant = "nf4"
+    quant = upgrade_saved_config({"model": dict(model_cfg)})["model"].get("quantization")
     return {
         "model_id": model_cfg.get("model_id"),
         "dtype": _config_dtype_name(model_cfg.get("dtype")),
