@@ -122,20 +122,23 @@ def test_resid_norm_steering_scales_each_layer(tmp_path, monkeypatch):
     assert it.info["steer_alpha_per_layer"] == {0: pytest.approx(0.1), 1: pytest.approx(0.2)}  # divided, then scaled
 
 
-def test_the_random_control_vector_of_a_probe_is_the_same_everywhere(tmp_path, monkeypatch):
+def test_random_controls_come_in_the_same_call(tmp_path, monkeypatch):
     probe = _probe(tmp_path, monkeypatch)
-    texts = probe.score_texts(["ppx"], random_scoring_vector=True)
-    prompts = probe.score_prompts(["hi"], alphas=[1.0], random_scoring_vector=True,
-                                  random_steering_vector=True, save_html=False)
-    multi = multi_probe_score_prompts([probe], ["hi"], random_scoring_vector=True, save_html=False,
-                                      output_root=str(tmp_path / "multi"))
-    seeds = {
-        texts.settings["random_scoring_vector_seed"],
-        prompts.settings["random_scoring_vector_seed"]["c"],
-        prompts.settings["random_steering_vector_seed"],
-        multi.settings["random_scoring_vector_seed"]["c"],
-    }
-    assert len(seeds) == 1
+    probe.resid_norm = np.array([2.0, 4.0])
+    scores = probe.score_prompts(["hi", "yo"], alphas=[0.0, 1.0, -1.0], n_random=3, alpha_unit="resid_norm",
+                                 steer_layers=[0, 1], save_html=False)
+    # each prompt: alpha 0, alpha 1 and its 3 controls, alpha -1 and its 3 controls
+    assert len(scores) == 2 * 9
+    assert [it.info["control"] for it in scores][:9] == [None, None, 0, 1, 2, None, 0, 1, 2]
+    assert scores.settings["n_random"] == 3 and scores.settings["random_seed"] == 0
+    first = [it.info["intervention"] for it in scores][:9]
+    steer, control = first[1], first[2]
+    assert control["control_seed"] == [0, 0] and first[6]["control_seed"] == [0, 0]  # the same direction at -1
+    assert control["alpha"] == steer["alpha"]  # the same doses at the same layers
+    assert control["vector_norm"] == pytest.approx(steer["vector_norm"])  # and the same length at each layer
+    multi = multi_probe_score_prompts([probe], ["hi"], alphas=[1.0], steer_probe=0, n_random=2, random_seed=5,
+                                      save_html=False, output_root=str(tmp_path / "m"))
+    assert [it.info["intervention"].get("control_seed") for it in multi] == [None, [5, 0], [5, 1]]
 
 
 def test_multi_probe_score_means_exclude_the_end_of_sequence_token(tmp_path, monkeypatch):

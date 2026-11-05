@@ -75,6 +75,7 @@ def _per_sample_records(
             "completion": completion,
             "alpha_unit": it.info.get("alpha_unit"),
             "alpha_value": it.info.get("alpha_value"),
+            "control": it.info.get("control"),
             "generation": scores.settings.get("generation"),
         }
         if multi:
@@ -440,7 +441,7 @@ MARKER_POSITIONS = ("after", "before")
 
 # Fields of a per-sample record that come from the scoring run; an evaluator cannot replace them.
 CORE_RECORD_KEYS = frozenset({
-    "item_index", "scores_index", "alpha", "prompt", "completion", "score_mean", "score_mean_z",
+    "item_index", "scores_index", "alpha", "control", "prompt", "completion", "score_mean", "score_mean_z",
     "score_mean_by_probe", "score_mean_z_by_probe", "alpha_unit", "alpha_value", "generation", "probe_names",
 })
 
@@ -775,6 +776,8 @@ def _analyze(results: Scores, per_sample: List[Dict[str, Any]], *, analysis_name
         return None
     batch_dir = Path(results.dir).resolve()
     status("Writing analysis...")
+    # random controls (score_kwargs n_random) are records of their own, not the steering at that alpha
+    per_sample = [row for row in per_sample if row.get("control") is None]
     if rate_coherence:
         status("Rating coherence (best-effort)...")
         rate_batch_coherence_safe(str(batch_dir), max_elements_per_request=coherence_max_per_request,

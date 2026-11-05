@@ -467,11 +467,14 @@ one completion. With sampling, the RNGs are seeded with `seed`, or else `random.
 completions are reproducible for the same batch size (best effort: GPU kernels are not
 bit-deterministic). The scores' `settings` have the generation settings under `generation`. An
 empty completion has `score_mean` null.
-`random_scoring_vector` / `random_steering_vector` use one random direction per probe, derived
-from its name and run directory, so the control is the same vector in every function. It is the
-same direction at every layer (with each layer's norm): concept vectors of adjacent layers point
-nearly the same way, so independent random directions would partly cancel and push the residual
-stream about half as far as the concept.
+
+`n_random` adds random controls in the same call: at each non-zero alpha, the same steering with a
+random direction of the same length at each layer (`info["control"]` is its number, None for the
+probe's own steering). Control `k` is the same direction at every alpha, seeded by `random_seed`
+(else `random.seed`). It is one direction for all the steered layers, with each layer's norm:
+concept vectors of adjacent layers point nearly the same way, so independent random directions
+would partly cancel and push the residual stream about half as far as the concept. One control
+says little; [Evaluating steering](#evaluating-steering) compares the steering with ten.
 
 Repeated alphas (several samples, with sampling on) are separate items (`info["alpha_index"]`). A
 `batch_subdir` that already holds files raises unless `overwrite=True`.
@@ -519,6 +522,45 @@ The pieces are public:
   when it would put one); `answer_tokens` shows the tokens.
 - `score_text_tokens(model, tokenizer, vectors, text)` scores every token of a raw text with any
   directions.
+
+## Evaluating steering
+
+`evaluate_steering` sweeps the doses of a steering intervention, with random controls, and
+measures every completion:
+
+```python
+from concept_probe import evaluate_steering, coherence_judge
+
+ev = evaluate_steering(probe, prompts, doses=[-0.25, -0.1, 0.1, 0.25], unit="resid_norm",
+                       n_random=10, measures={"positivity": my_classifier})
+ev.row(0.25)["effects"]["positivity"]   # change from dose 0, its interval, the controls' p95
+ev.largest_coherent_dose                # {"positive": 0.1, "negative": -0.25}, say
+```
+
+- **Doses** are multiples of the unit (a probe's `steering(dose, unit)`), of an `Add` given at dose
+  1, or the argument of a function `dose -> Add`. Dose 0 is the baseline, added when missing.
+- **Random controls**: at each non-zero dose, `n_random` (10 by default) same-length random
+  directions, each the same at every dose. For each measure the table gives their mean changes and
+  the 95th percentile of their absolute values, next to the steering's change: what a direction
+  without the concept does to that measure.
+- **Measures of effect**: each probe in `probes` and the steering probe, read without the
+  intervention (in z where the probe has a calibration for generated completions, raw otherwise;
+  the steering probe's reading is informative but not independent of its steering), and any
+  function of the texts in `measures` (a classifier, an embedding model, or `coherence_judge()`,
+  the Groq judge, which sends the texts out). Each is reported as the mean change from dose 0,
+  paired by prompt, with a bootstrap interval over prompts.
+- **Coherence**: each completion's perplexity under the model without the intervention (as the
+  reply to its prompt), its share of repeated word 3-grams and its length. By default
+  (`CoherenceRule`) a dose is coherent when the median perplexity stays within half and twice
+  that of dose 0 and the repetition rises by at most 0.2; `coherence=` takes any
+  `rule(at_dose, at_zero) -> bool`. The largest coherent dose on each side is the largest one
+  whose smaller doses are all coherent too.
+
+It saves (by default, under the probe's run folder or the session's `output_root`) the scores of
+every completion with their measures, `steering.json` with the table, and `dose_response.png`: the
+change of each measure per dose with the controls in gray, and perplexity and repetition with the
+rule's limits, incoherent doses hollow. On a Qwen 2.5 0.5B in an RTX 2060, 8 prompts at 5 doses
+with 5 controls each (248 generations of 32 tokens) took a minute.
 
 ## Interventions
 
@@ -782,6 +824,7 @@ from concept_probe import (
     Scores,
     generate,
     answer_logprobs,
+    evaluate_steering,
     intervene,
     Add,
     Ablate,
@@ -815,6 +858,18 @@ GitHub Actions CI runs the same lightweight checks and also builds source and wh
 
 ### Unreleased
 
+- **Evaluating steering** (`evaluate_steering`, entries 23 and 24 of the workshop's list): a dose
+  sweep with `n_random` random controls of the same length, local coherence measures (perplexity
+  under the unsteered model, repetition, length), probes and any function of the texts as measures
+  of effect (the Groq judge is one, `coherence_judge`), a replaceable coherence rule and the
+  largest coherent dose on each side, with a table, its files and a plot.
+- **Random controls come in the same call**: `score_prompts` and `multi_probe_score_prompts` take
+  `n_random` (and `random_seed`) instead of `random_steering_vector` (one random direction per
+  call) and `random_vector_seed`; a control now has the steering vectors' length at each layer
+  (it had the reading directions'). `random_scoring_vector` is gone from `score_texts`,
+  `score_prompts` and `multi_probe_score_prompts`: the random-direction null of reading is in the
+  evaluation (`null_d95`). `Add.scaled(factor)` and `Add.random_like(seed)` give a dose of an
+  addition and its control.
 - **Interventions** (`concept_probe.interventions`): `Add`, `Ablate` (project out, or set a
   coordinate; one direction or a subspace), `Patch`, `Rotate`, `Edit` (a function of your own) and
   their sums, applied with `intervene(model, ...)`, at layers and positions counted per row without

@@ -16,14 +16,15 @@ import json
 import os
 import shutil
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 
-from .generation import TokenScorer, _project_tokens
+from .generation import TokenScorer, TokenStep, _project_tokens, generate
+from .interventions import Intervention
 from .inputs import _decode_tokens
-from .utils import ensure_dir, json_dump, now_tag
+from .utils import ensure_dir, json_dump, now_tag, set_seed
 from .visuals import render_heatmaps, segment_token_scores
 
 SCORES_NPZ, SCORES_JSONL, HEATMAPS_HTML, SETTINGS_JSON = "scores.npz", "scores.jsonl", "heatmaps.html", "settings.json"
@@ -281,6 +282,60 @@ def score_inputs(model, tokenizer, inputs: Sequence[ScoreInput], scorers: Sequen
             item.score_mean_z[s.name] = item_z(s, per_layer[lo:hi])
         items.append(item)
     return items
+
+
+@dataclass
+class Condition:
+    """One way of generating: an intervention (or none) and what to record about it in each item."""
+
+    info: Dict[str, Any]
+    intervention: Optional[Intervention] = None
+
+
+def generate_and_score(
+    model,
+    tokenizer,
+    prompts: Sequence[Any],
+    conditions: Sequence[Condition],
+    scorers: Sequence[TokenScorer],
+    *,
+    system: Optional[str] = None,
+    max_new_tokens: int = 64,
+    greedy: bool = True,
+    temperature: Optional[float] = None,
+    top_p: Optional[float] = None,
+    seed: Optional[int] = None,
+    batch_size: int = 16,
+    read_batch_size: int = 16,
+    on_token: Optional[Callable[[TokenStep], Any]] = None,
+    watch: Sequence[Any] = (),
+    keep_logits: Any = None,
+    warn: Optional[Callable[[str], None]] = None,
+    status: Optional[Callable[[str], None]] = None,
+) -> List[ScoredItem]:
+    """Generate every prompt under each condition (in batches) and score every completion, read
+    again without any intervention. Items come prompt by prompt, each prompt's conditions in order;
+    each item's ``info`` has its condition's ``info``, the prompt, where the completion is and the
+    intervention it was generated under."""
+    status = status or (lambda message: None)
+    if not greedy and seed is not None:
+        set_seed(int(seed))  # once: every condition draws from the same stream, in order
+    generated = []
+    for c, condition in enumerate(conditions):
+        gens = generate(model, tokenizer, prompts, system=system, max_new_tokens=max_new_tokens, greedy=greedy,
+                        temperature=temperature, top_p=top_p, batch_size=batch_size,
+                        intervention=condition.intervention, on_token=on_token, watch=watch if on_token else (),
+                        keep_logits=keep_logits, save=False, warn=warn)
+        generated.extend((g.index, c, g, condition) for g in gens)
+        status(f"Generated condition {c + 1}/{len(conditions)}")
+    generated.sort(key=lambda x: (x[0], x[1]))
+    inputs = [ScoreInput(torch.as_tensor(g.token_ids), (g.prompt_len, g.completion_end), g.text, g.index,
+                         dict(condition.info, prompt=g.prompt, prompt_len=g.prompt_len, completion_end=g.completion_end,
+                              system_prompt_overridden=g.own_system, intervention=g.intervention),
+                         logits=g.logits)
+              for _, _, g, condition in generated]
+    status(f"Scoring {len(inputs)} completions")
+    return score_inputs(model, tokenizer, inputs, scorers, batch_size=read_batch_size)
 
 
 def batch_dir(base: str, batch_subdir: Optional[str], overwrite: bool) -> str:

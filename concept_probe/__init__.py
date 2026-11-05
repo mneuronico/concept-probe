@@ -22,6 +22,7 @@ from .settings import configure
 from .interventions import Ablate, Add, Compose, Edit, Intervention, Patch, Rotate, Where, intervene
 from .generation import AnswerLogprobs, Generation, Generations, TokenStep, answer_logprobs, generate
 from .scoring import ScoredItem, Scores
+from .steering_eval import CoherenceRule, SteeringEvaluation, coherence_judge, evaluate_steering, repetition_rate
 from .console import ConsoleLogger
 from .concept_runner import train_concept_from_json
 from .reporting import generate_multi_probe_report
@@ -104,6 +105,11 @@ __all__ = [
     "AnswerLogprobs",
     "Scores",
     "ScoredItem",
+    "evaluate_steering",
+    "SteeringEvaluation",
+    "CoherenceRule",
+    "coherence_judge",
+    "repetition_rate",
     "ConsoleLogger",
     "train_concept_from_json",
     "EvalRunResult",

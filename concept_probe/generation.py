@@ -473,6 +473,45 @@ def _forward_accepts(model, name: str) -> bool:
 
 
 @torch.no_grad()
+def _continuation_logprobs(model, pairs: Sequence[Tuple[torch.Tensor, torch.Tensor]], *, pad: int, batch_size: int = 16,
+                           intervention: Optional[Intervention] = None) -> List[np.ndarray]:
+    """For each ``(prompt ids, continuation ids)``, the log-probability of every continuation token
+    given what comes before it, ``batch_size`` pairs per forward pass (right padding, the logits of
+    the continuation's positions only when the model can keep just those). ``intervention`` is
+    applied meanwhile, with positions counted from each prompt's start."""
+    out: List[np.ndarray] = [np.zeros(0) for _ in pairs]
+    todo = [r for r in range(len(pairs)) if int(pairs[r][1].shape[0]) > 0]
+    order = sorted(todo, key=lambda r: int(pairs[r][0].shape[0] + pairs[r][1].shape[0]))
+    keep_arg = _forward_accepts(model, "logits_to_keep")
+    step = max(1, int(batch_size))
+    for b in range(0, len(order), step):
+        rows = order[b:b + step]
+        plens = [int(pairs[r][0].shape[0]) for r in rows]
+        full = [torch.cat([pairs[r][0].reshape(-1), pairs[r][1].reshape(-1)]).to(torch.long) for r in rows]
+        lens = [int(x.shape[0]) for x in full]
+        input_ids = torch.full((len(full), max(lens)), int(pad), dtype=torch.long)
+        attn = torch.zeros_like(input_ids)
+        for j, x in enumerate(full):
+            input_ids[j, :lens[j]] = x
+            attn[j, :lens[j]] = 1
+        lo, hi = min(plens) - 1, max(lens) - 1  # the positions whose logits predict continuation tokens
+        kwargs: Dict[str, Any] = {"logits_to_keep": torch.arange(lo, hi, device=model.device)} if keep_arg else {}
+        applied = _Nothing() if intervention is None else intervene(model, intervention, prompt_lens=plens)
+        with applied:
+            logits = model(input_ids=input_ids.to(model.device), attention_mask=attn.to(model.device),
+                           use_cache=False, **kwargs).logits
+        offset = lo if keep_arg else 0
+        for j, r in enumerate(rows):
+            cont = pairs[r][1].reshape(-1).to(torch.long)
+            positions = torch.arange(plens[j] - 1, plens[j] - 1 + cont.shape[0]) - offset
+            row = logits[j, positions.to(logits.device)]
+            logp = torch.log_softmax(row if row.dtype == torch.float64 else row.float(), dim=-1)
+            out[r] = logp[torch.arange(cont.shape[0], device=logp.device), cont.to(logp.device)].double().cpu().numpy()
+        del logits
+    return out
+
+
+@torch.no_grad()
 def answer_logprobs(
     model,
     tokenizer,
@@ -519,39 +558,13 @@ def answer_logprobs(
                 raise ValueError(f"answer {text!r} has no tokens")
             answer_tokens[i].append(_decode_tokens(tokenizer, ans))
             pairs.append((i, a, ids.to(torch.long), torch.tensor(ans, dtype=torch.long)))
-    order = sorted(range(len(pairs)), key=lambda r: int(pairs[r][2].shape[0] + pairs[r][3].shape[0]))
+    per_token = _continuation_logprobs(model, [(p, ans) for _, _, p, ans in pairs], pad=_pad_id(tokenizer),
+                                       batch_size=batch_size, intervention=intervention)
     logprobs = np.zeros((len(prompts), k))
     n_tokens = np.zeros((len(prompts), k), dtype=np.int64)
-    pad = _pad_id(tokenizer)
-    keep_arg = _forward_accepts(model, "logits_to_keep")
-    step = max(1, int(batch_size))
-    for b in range(0, len(order), step):
-        batch = [pairs[r] for r in order[b:b + step]]
-        plens = [int(p.shape[0]) for _, _, p, _ in batch]
-        full = [torch.cat([p, a]) for _, _, p, a in batch]
-        lens = [int(x.shape[0]) for x in full]
-        width = max(lens)
-        input_ids = torch.full((len(full), width), pad, dtype=torch.long)
-        attn = torch.zeros((len(full), width), dtype=torch.long)
-        for j, x in enumerate(full):
-            input_ids[j, :lens[j]] = x
-            attn[j, :lens[j]] = 1
-        lo, hi = min(plens) - 1, max(lens) - 1  # the positions whose logits predict answer tokens
-        kwargs: Dict[str, Any] = {}
-        if keep_arg:
-            kwargs["logits_to_keep"] = torch.arange(lo, hi, device=model.device)
-        applied = _Nothing() if intervention is None else intervene(model, intervention, prompt_lens=plens)
-        with applied:
-            logits = model(input_ids=input_ids.to(model.device), attention_mask=attn.to(model.device),
-                           use_cache=False, **kwargs).logits
-        offset = lo if keep_arg else 0
-        logp = torch.log_softmax(logits.float(), dim=-1)
-        for j, (i, a, p, ans) in enumerate(batch):
-            positions = torch.arange(plens[j] - 1, plens[j] - 1 + ans.shape[0]) - offset
-            picked = logp[j, positions.to(logp.device), ans.to(logp.device)]
-            logprobs[i, a] = float(picked.sum())
-            n_tokens[i, a] = int(ans.shape[0])
-        del logits, logp
+    for (i, a, _, ans), lp in zip(pairs, per_token):
+        logprobs[i, a] = float(lp.sum())
+        n_tokens[i, a] = int(ans.shape[0])
     result = AnswerLogprobs(prompts, per_prompt, logprobs, n_tokens, answer_tokens,
                             None if intervention is None else intervention.describe())
     if _should_save(save):

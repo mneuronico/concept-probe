@@ -122,7 +122,7 @@ def _manual_logprob(model, tok, prompt, answer):
     ids = tok.apply_chat_template([{"role": "user", "content": prompt}], add_generation_prompt=True,
                                   return_tensors="pt")[0]
     ans = torch.tensor([ord(c) for c in answer])
-    logp = torch.log_softmax(model(torch.cat([ids, ans])[None]).logits[0].float(), dim=-1)
+    logp = torch.log_softmax(model(torch.cat([ids, ans])[None]).logits[0].double(), dim=-1)
     return float(sum(logp[len(ids) - 1 + j, a] for j, a in enumerate(ans)))
 
 

@@ -2,7 +2,6 @@ import json
 import os
 import shutil
 import sys
-import zlib
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
@@ -36,7 +35,7 @@ from .generation import (
     generate,
 )
 from .interventions import Add
-from .scoring import ScoreInput, Scores, batch_dir, score_inputs
+from .scoring import Condition, ScoreInput, Scores, batch_dir, generate_and_score, score_inputs
 from .linear_probe import Calibration, _token_references, calibrations_from_tensors, sigmoid, steer_directions_for
 from .directions import (  # re-exported: they lived here before
     DIRECTION_NORMALIZATIONS,
@@ -106,43 +105,6 @@ from .utils import (
 )
 from .visuals import plot_score_hist, plot_sweep
 from .console import ConsoleLogger
-
-def _resolve_random_control_seed(explicit_seed: Optional[int], config_seed: Any) -> int:
-    if explicit_seed is not None:
-        return int(explicit_seed)
-    if config_seed is None:
-        return 0
-    try:
-        return int(config_seed)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"random.seed in config must be an integer; got {config_seed!r}") from exc
-
-
-def _mix_random_control_seed(base_seed: int, salt: int) -> int:
-    x = int(base_seed) & 0xFFFFFFFFFFFFFFFF
-    s = int(salt) & 0xFFFFFFFFFFFFFFFF
-    x ^= (s + 0x9E3779B97F4A7C15 + ((x << 6) & 0xFFFFFFFFFFFFFFFF) + (x >> 2)) & 0xFFFFFFFFFFFFFFFF
-    return int(x & 0x7FFFFFFFFFFFFFFF)
-
-
-def _random_vectors_same_norm(base_vectors: np.ndarray, seed: int) -> np.ndarray:
-    """A random-direction control for ``base_vectors``: one random direction, used at every layer
-    with that layer's norm.
-
-    One shared direction keeps the control comparable to the concept vectors, which point nearly
-    the same way at adjacent layers: independent directions per layer would partly cancel when
-    steering several layers, so the control would push the residual stream about half as far.
-    """
-    src = np.asarray(base_vectors, dtype=np.float32)
-    if src.ndim != 2:
-        raise ValueError(f"base_vectors must be 2D [num_layers, hidden_dim], got shape={src.shape}")
-    rng = np.random.default_rng(int(seed))
-    direction = rng.standard_normal(src.shape[1])
-    direction = (direction / np.linalg.norm(direction)).astype(np.float32)
-    norms = np.linalg.norm(src, axis=1)
-    norms = np.where(np.isfinite(norms), norms, 0.0)
-    return (norms[:, None] * direction[None, :]).astype(np.float32)
-
 
 def _render_progress(current: int, total: int, *, width: int = 28) -> str:
     if total <= 0:
@@ -1335,18 +1297,6 @@ class ConceptProbe:
             selection = deep_merge(selection, override)
         return select_layers(selection, int(self.layer), self.num_layers)
 
-    def _random_control_vectors(self, random_vector_seed: Optional[int]) -> Tuple[np.ndarray, int]:
-        """Same-norm random vectors per layer: this probe's random-direction control.
-
-        The seed combines ``random_vector_seed`` (or ``random.seed``) with the probe's identity
-        (concept name and run directory), so score_texts, score_prompts (scoring and steering)
-        and multi_probe_score_prompts all use the same control vectors for the same probe.
-        """
-        base = _resolve_random_control_seed(random_vector_seed, self.config.get("random", {}).get("seed", 0))
-        run = os.path.basename(os.path.normpath(self.run_dir)) if self.run_dir else ""
-        seed = _mix_random_control_seed(base, zlib.crc32(f"{self.concept.name}|{run}".encode("utf-8")))
-        return _random_vectors_same_norm(self.directions, seed=seed), seed
-
     # ------------------------------------------------------------------ calibrations and z
     def calibration_for(self, context: Optional[Union[ReadContext, Dict[str, Any]]] = None) -> Optional[Calibration]:
         """The calibration measured on items read like ``context`` (a :class:`ReadContext` or its
@@ -1762,8 +1712,6 @@ class ConceptProbe:
         output_subdir: str = "scores",
         save_html: Optional[bool] = None,
         batch_subdir: Optional[str] = None,
-        random_scoring_vector: bool = False,
-        random_vector_seed: Optional[int] = None,
         reference_layer: Optional[int] = None,
         role: str = "raw",
         prompt: Optional[str] = None,
@@ -1785,8 +1733,7 @@ class ConceptProbe:
         between the poles, which is not "without the concept"; 1 the within-pole SD of single
         tokens). ``score_mean`` is the text's mean token score and ``score_mean_z`` its z with the
         per-item references. Without such a calibration only raw projections are given, and
-        ``z_missing`` says why. ``random_scoring_vector`` scores with same-norm random directions
-        instead (a control); ``reference_layer`` reads every layer with one layer's direction.
+        ``z_missing`` says why. ``reference_layer`` reads every layer with one layer's direction.
 
         Saved by default (``save``, or the session's setting) to
         ``<run_dir>/<output_subdir>/<batch_subdir>``: ``scores.npz``, ``scores.jsonl``,
@@ -1797,18 +1744,14 @@ class ConceptProbe:
         sys_prompt = self._system_for(role, system_prompt, prompt)
         read_context = _text_context(role, sys_prompt, prompt, "assistant_all_mean")
         save_html = self.config["plots"].get("heatmap_html", True) if save_html is None else save_html
-        vectors, scoring_seed = None, None
-        if random_scoring_vector:
-            vectors, scoring_seed = self._random_control_vectors(random_vector_seed)
-            self._warn(f"score_texts using random scoring vector control (same-norm per layer, seed={scoring_seed}).")
-        scorer = self._token_scorer(context=read_context, layer_selection=layer_selection, vectors=vectors,
+        scorer = self._token_scorer(context=read_context, layer_selection=layer_selection,
                                     reference_layer=reference_layer)
         z_missing = None
-        if not random_scoring_vector and reference_layer is None and scorer.calibration is None:
+        if reference_layer is None and scorer.calibration is None:
             z_missing = self._missing_z_reason(read_context)
             self._warn(f"score_texts: only raw projections are given: {z_missing}")
         elif scorer.calibration is None:
-            z_missing = "random scoring vectors" if random_scoring_vector else "read with one layer's direction"
+            z_missing = "read with one layer's direction"
 
         inputs = []
         for i, text in enumerate(texts):
@@ -1825,9 +1768,7 @@ class ConceptProbe:
         self._status(f"Scoring {len(texts)} texts")
         items = score_inputs(model, tokenizer, inputs, [scorer], batch_size=bs)
         run_settings = {"role": role, "system_prompt": sys_prompt, "prompt": prompt, "layers": scorer.layers,
-                        "aggregate": scorer.aggregate, "reference_layer": reference_layer,
-                        "random_scoring_vector": bool(random_scoring_vector),
-                        "random_scoring_vector_seed": scoring_seed, "batch_size": bs,
+                        "aggregate": scorer.aggregate, "reference_layer": reference_layer, "batch_size": bs,
                         "calibration": None if scorer.calibration is None else scorer.calibration.context.to_dict()}
         result = Scores("texts", [scorer.name], items, run_settings, {scorer.name: z_missing})
         if settings().save if save is None else save:
@@ -1932,9 +1873,8 @@ class ConceptProbe:
         save_segments: Optional[bool] = None,
         keep_logits: Union[None, int, str] = None,
         batch_subdir: Optional[str] = None,
-        random_scoring_vector: bool = False,
-        random_steering_vector: bool = False,
-        random_vector_seed: Optional[int] = None,
+        n_random: int = 0,
+        random_seed: Optional[int] = None,
         seed: Optional[int] = None,
         overwrite: bool = False,
         batch_size: Optional[int] = None,
@@ -1961,6 +1901,11 @@ class ConceptProbe:
         Generation is greedy by default (``steering.steer_sampling``). When sampling, the
         generators are seeded with ``seed``, or else ``random.seed``, so completions are
         reproducible for the same batch size (best-effort: GPU kernels are not bit-deterministic).
+        ``n_random`` adds, at each non-zero alpha, that many random controls: the same steering with
+        a random direction of the same length at each layer (control ``k`` is the same direction at
+        every alpha; ``random_seed``, else ``random.seed``, seeds them). Their items have
+        ``info["control"] = k`` (None for the probe's own steering). To compare the steering with
+        them, see :func:`concept_probe.evaluate_steering`.
         ``on_token`` gets each step's scores while generating (see :func:`concept_probe.generate`);
         ``keep_logits`` keeps the steered model's logits of each generated token (``"all"`` or the
         top ``k``, default ``output.generation_logits``).
@@ -1974,8 +1919,7 @@ class ConceptProbe:
             [self], prompts, steer=self, alphas=alphas, alpha_unit=alpha_unit, steer_layers=steer_layers,
             steer_window_radius=steer_window_radius, steer_distribute=steer_distribute, system_prompt=system_prompt,
             max_new_tokens=max_new_tokens, greedy=greedy, temperature=temperature, top_p=top_p, seed=seed,
-            batch_size=batch_size, layer_selection=layer_selection, random_scoring_vector=random_scoring_vector,
-            random_steering_vector=random_steering_vector, random_vector_seed=random_vector_seed,
+            batch_size=batch_size, layer_selection=layer_selection, n_random=n_random, random_seed=random_seed,
             keep_logits=keep_logits, on_token=on_token, warn=self._warn, status=self._status,
         )
         if settings().save if save is None else save:
@@ -2045,6 +1989,38 @@ def _shared_setting(probes: List["ConceptProbe"], section: str, key: str, explic
     return values[0]
 
 
+def _control_seed(probes: List["ConceptProbe"], random_seed: Optional[int]) -> int:
+    """The base seed of the random controls: ``random_seed``, else the probes' ``random.seed``."""
+    if random_seed is not None:
+        return int(random_seed)
+    seed = _shared_setting(probes, "random", "seed", None, "random_seed")
+    return 0 if seed is None else int(seed)
+
+
+def _steering_conditions(steer: Optional["ConceptProbe"], alphas: List[float], alpha_unit: str,
+                         steer_layer_list: List[int], steer_distribute: Optional[bool], n_random: int,
+                         base_seed: int) -> List[Condition]:
+    """One condition per alpha (the probe's steering at that alpha), and after each non-zero one,
+    its ``n_random`` random controls: the same intervention with a random direction of the same
+    length (control k uses the seed ``[base_seed, k]`` at every alpha, so it is the same direction)."""
+    conditions = []
+    for j, alpha in enumerate(alphas):
+        info = {"alpha": alpha, "alpha_unit": alpha_unit, "alpha_index": j, "alpha_value": 0.0,
+                "steer_alpha_per_layer": {}, "steer_layer_scales": None, "control": None}
+        intervention = None
+        if steer is not None:
+            value, scales = steer._steering_alpha(alpha, alpha_unit, steer_layer_list)
+            info.update(alpha_value=float(value), steer_layer_scales=scales)
+            if abs(value) > 1e-12:
+                intervention = steer.steering(alpha, alpha_unit, layers=steer_layer_list, distribute=steer_distribute)
+                info["steer_alpha_per_layer"] = intervention.alpha_per_layer
+        conditions.append(Condition(info, intervention))
+        if intervention is not None:
+            for k in range(int(n_random)):
+                conditions.append(Condition(dict(info, control=k), intervention.random_like([base_seed, k])))
+    return conditions
+
+
 def _score_generations(
     probes: List["ConceptProbe"],
     prompts: List[PromptLike],
@@ -2063,16 +2039,16 @@ def _score_generations(
     seed: Optional[int],
     batch_size: Optional[int],
     layer_selection: Optional[Dict[str, Any]],
-    random_scoring_vector: bool,
-    random_steering_vector: bool,
-    random_vector_seed: Optional[int],
+    n_random: int,
+    random_seed: Optional[int],
     keep_logits: Union[None, int, str],
     on_token: Optional[Callable[[TokenStep], Any]],
     warn: Callable[[str], None],
     status: Callable[[str], None],
 ) -> Scores:
-    """Generate each prompt at each alpha (steered with ``steer``) and score the completions with
-    every probe: what :meth:`ConceptProbe.score_prompts` and ``multi_probe_score_prompts`` do."""
+    """Generate each prompt at each alpha (steered with ``steer``, and with ``n_random`` random
+    controls at each non-zero alpha) and score the completions with every probe: what
+    :meth:`ConceptProbe.score_prompts` and ``multi_probe_score_prompts`` do."""
     alpha_unit = _validate_alpha_unit(alpha_unit)
     alphas = [0.0] if alphas is None else [float(a) for a in alphas]
     if not alphas:
@@ -2080,6 +2056,8 @@ def _score_generations(
     steering_on = any(abs(a) > 1e-12 for a in alphas)
     if steering_on and steer is None:
         raise ValueError("Non-zero alphas need steer_probe: the probe (index, name or object) whose vectors steer.")
+    if int(n_random) < 0:
+        raise ValueError(f"n_random must be >= 0; got {n_random}")
     first = probes[0]
     model, tokenizer = first.model_bundle.model, first.model_bundle.tokenizer
 
@@ -2100,67 +2078,34 @@ def _score_generations(
     if keep_logits is None:
         keep_logits = _shared_setting(probes, "output", "generation_logits", None, "keep_logits")
 
-    scorers, scoring_seeds, z_missing = [], {}, {}
+    scorers, z_missing = [], {}
     for probe in probes:
-        vectors, probe_seed = (probe._random_control_vectors(random_vector_seed) if random_scoring_vector
-                               else (None, None))
-        scorer = probe._token_scorer(generated=True, layer_selection=layer_selection, vectors=vectors)
+        scorer = probe._token_scorer(generated=True, layer_selection=layer_selection)
         scorers.append(scorer)
-        scoring_seeds[scorer.name] = probe_seed
         z_missing[scorer.name] = None
-        if random_scoring_vector:
-            z_missing[scorer.name] = "random scoring vectors"
-        elif scorer.calibration is None:
+        if scorer.calibration is None:
             z_missing[scorer.name] = probe._missing_z_reason(GENERATED_CONTEXT)
             warn(f"{probe.concept.name}: score_mean_z is None: {z_missing[scorer.name]}")
-    if random_scoring_vector:
-        warn(f"scoring with random vectors as a control (same norm per layer, seeds {scoring_seeds}).")
 
-    steer_vectors, steering_seed, steer_layer_list = None, None, []
+    steer_layer_list = []
     if steer is not None:
         steer_layer_list = steer.steer_layer_list(steer_layers, steer_window_radius)
         if steering_on:
             steer._check_alpha_unit(alpha_unit)
-        if random_steering_vector:
-            if steering_on:
-                steer_vectors, steering_seed = steer._random_control_vectors(random_vector_seed)
-                warn(f"steering with a random vector as a control (same norm per layer, seed={steering_seed}).")
-            else:
-                warn("random_steering_vector=true but all alphas are zero; no steering is applied.")
-
-    total = len(prompts) * len(alphas)
-    status(f"Generating {len(prompts)} prompts x {len(alphas)} alphas ({total} generations), "
-           f"{batch_size} at a time")
-    generated: List[Tuple[int, int, Any, Dict[str, Any]]] = []  # (prompt, alpha index, generation, info)
-    if not greedy:
-        set_seed(int(seed))
-    for j, alpha in enumerate(alphas):
-        intervention, info = None, {"alpha": alpha, "alpha_unit": alpha_unit, "alpha_value": 0.0,
-                                    "steer_alpha_per_layer": {}, "steer_layer_scales": None}
-        if steer is not None:
-            value, scales = steer._steering_alpha(alpha, alpha_unit, steer_layer_list)
-            info.update(alpha_value=float(value), steer_layer_scales=scales)
-            if abs(value) > 1e-12:
-                intervention = steer.steering(alpha, alpha_unit, layers=steer_layer_list,
-                                              distribute=steer_distribute, vectors=steer_vectors)
-                info["steer_alpha_per_layer"] = intervention.alpha_per_layer
-        gens = generate(model, tokenizer, prompts, system=sys_prompt, max_new_tokens=max_new_tokens, greedy=greedy,
-                        temperature=temperature, top_p=top_p, batch_size=batch_size, intervention=intervention,
-                        on_token=on_token, watch=probes if on_token is not None else (), keep_logits=keep_logits,
-                        save=False, warn=warn)
-        for g in gens:
-            generated.append((g.index, j, g, dict(info, intervention=g.intervention)))
-        status(f"Generated alpha {j + 1}/{len(alphas)} ({alpha:g} {alpha_unit})")
-
-    generated.sort(key=lambda x: (x[0], x[1]))  # prompt by prompt, each prompt's alphas in order
-    inputs = []
-    for i, j, g, info in generated:
-        info = dict(info, prompt=g.prompt, alpha_index=j, prompt_len=g.prompt_len, completion_end=g.completion_end,
-                    system_prompt_overridden=g.own_system)
-        inputs.append(ScoreInput(torch.as_tensor(g.token_ids), (g.prompt_len, g.completion_end), g.text, i, info,
-                                 logits=g.logits))
-    status(f"Scoring {len(inputs)} completions")
-    items = score_inputs(model, tokenizer, inputs, scorers, batch_size=read_batch_size)
+    if n_random and not steering_on:
+        warn("n_random random controls need a non-zero alpha; none are generated.")
+    base_seed = _control_seed(probes, random_seed)
+    conditions = _steering_conditions(steer, alphas, alpha_unit, steer_layer_list, steer_distribute, n_random,
+                                      base_seed)
+    status(f"Generating {len(prompts)} prompts x {len(conditions)} conditions ({len(alphas)} alphas"
+           + (f", {n_random} random controls each" if n_random and steering_on else "")
+           + f"), {batch_size} at a time")
+    items = generate_and_score(
+        model, tokenizer, prompts, conditions, scorers, system=sys_prompt, max_new_tokens=max_new_tokens,
+        greedy=greedy, temperature=temperature, top_p=top_p, seed=seed if not greedy else None,
+        batch_size=batch_size, read_batch_size=read_batch_size, on_token=on_token, watch=probes,
+        keep_logits=keep_logits, warn=warn, status=status,
+    )
     run_settings = {
         "system_prompt": sys_prompt, "alphas": alphas, "alpha_unit": alpha_unit,
         "steer_probe": None if steer is None else str(steer.concept.name), "steer_layers": steer_layer_list,
@@ -2171,8 +2116,8 @@ def _score_generations(
                        "temperature": None if greedy else temperature, "top_p": None if greedy else top_p,
                        "seed": None if greedy else seed, "batch_size": batch_size},
         "layers": {s.name: s.layers for s in scorers}, "aggregate": {s.name: s.aggregate for s in scorers},
-        "random_scoring_vector": bool(random_scoring_vector), "random_scoring_vector_seed": scoring_seeds,
-        "random_steering_vector": bool(random_steering_vector), "random_steering_vector_seed": steering_seed,
+        "n_random": int(n_random) if steering_on else 0,
+        "random_seed": base_seed if (n_random and steering_on) else None,
         "keep_logits": keep_logits,
     }
     return Scores("generations", [s.name for s in scorers], items, run_settings, z_missing)

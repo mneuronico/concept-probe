@@ -195,7 +195,7 @@ def _item_z(it, name):
 def test_score_texts(probes):
     out = {}
     for key, kwargs in (("texts", {}), ("texts_user", {"role": "user", "system_prompt": "x y z"}),
-                        ("shared", {"random_scoring_vector": True}), ("texts", {"reference_layer": 0})):
+                        ("texts", {"reference_layer": 0})):
         texts = TEXTS_TO_SCORE if kwargs.get("role") == "user" else TEXTS_TO_SCORE[:3]
         name = f"{key}_" + "_".join(sorted(kwargs)) if kwargs else key
         scores = probes[key].score_texts(texts, batch_subdir=name, save=True, **kwargs)
@@ -204,7 +204,6 @@ def test_score_texts(probes):
             dict(input_text=it.info["input_text"], text_span=it.info["text_span"], layers=it.layers[n],
                  score_mean=it.score_mean[n], score_mean_z=it.score_mean_z[n],
                  scores_standardized=it.token_z[n] is not None,
-                 random_scoring_vector_seed=scores.settings["random_scoring_vector_seed"],
                  system_prompt=it.info["system_prompt"], scores_per_layer=it.scores[n], scores_agg=it.token_scores[n],
                  **_item_z(it, n))
             for it in scores
@@ -221,8 +220,7 @@ def _prompt_record(scores, it, tok):
         steer_layers=scores.settings["steer_layers"], steer_layer_scales=i["steer_layer_scales"],
         steer_alpha_per_layer=i["steer_alpha_per_layer"], layers=it.layers[n], score_mean=it.score_mean[n],
         score_mean_z=it.score_mean_z[n], do_steering=bool(i["steer_alpha_per_layer"]),
-        random_scoring_vector_seed=scores.settings["random_scoring_vector_seed"][n],
-        random_steering_vector_seed=scores.settings["random_steering_vector_seed"],
+        control=i["control"], control_seed=(i["intervention"] or {}).get("control_seed"),
         sampling_seed=scores.settings["generation"]["seed"], scores_per_layer=it.scores[n],
         scores_agg=it.token_scores[n], **_item_z(it, n))
 
@@ -232,8 +230,7 @@ def test_score_prompts(probes):
         "raw": dict(alphas=[0.0, 4.0, -4.0]),
         "sigma_window": dict(alphas=[0.0, 2.0], alpha_unit="sigma", steer_layers="window", steer_window_radius=1),
         "resid_norm_list": dict(alphas=[0.3], alpha_unit="resid_norm", steer_layers=[1, 2], steer_distribute=False),
-        "random_steering": dict(alphas=[4.0], random_steering_vector=True),
-        "random_scoring": dict(alphas=[0.0], random_scoring_vector=True),
+        "random_controls": dict(alphas=[0.0, 4.0], n_random=2),
         "sampled": dict(alphas=[0.0, 0.0], greedy=False, seed=3, temperature=0.8),
         "texts_probe": dict(alphas=[0.0]),
     }

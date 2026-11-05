@@ -120,12 +120,18 @@ def test_questions_with_their_own_system_message_raise(tmp_path, monkeypatch):
 
 
 def test_the_random_control_is_one_direction_at_every_layer():
+    from concept_probe import Add
+
     vectors = np.array([[3.0, 0, 0, 0], [0, 2.0, 0, 0], [0, 0, 1.0, 0]], dtype=np.float32)
-    r = probe_mod._random_vectors_same_norm(vectors, seed=0)
+    control = Add(vectors, alpha={0: 1.0, 1: 0.5, 2: 2.0}).random_like([0, 3])
+    r = np.stack([v for _, v in control._entries])
     np.testing.assert_allclose(np.linalg.norm(r, axis=1), [3, 2, 1], rtol=1e-6)
     unit = r / np.linalg.norm(r, axis=1, keepdims=True)
     np.testing.assert_allclose(unit[0], unit[1], atol=1e-6)
     np.testing.assert_allclose(unit[0], unit[2], atol=1e-6)
+    assert control.alpha_per_layer == {0: 1.0, 1: 0.5, 2: 2.0} and control.control_seed == [0, 3]
+    again = Add(vectors * 5).random_like([0, 3])  # the same seed: the same direction, whatever the lengths
+    np.testing.assert_allclose(again._entries[0][1] / 15.0, unit[0], atol=1e-6)
 
 
 # ------------------------------------------------------------- scoring outputs

@@ -224,6 +224,8 @@ class Add(Intervention):
         self.label = label
         self._by_layer: Optional[Dict[int, Tuple[float, torch.Tensor]]] = None
         self._devices: Dict[Tuple[int, Any, Any], torch.Tensor] = {}
+        #: the seed of a random control (see :meth:`random_like`); None for anything else
+        self.control_seed: Any = None
 
     def prepare(self, n_blocks: int) -> None:
         vectors = _resolve(self._entries, n_blocks, "Add")
@@ -269,8 +271,40 @@ class Add(Intervention):
             norms = {l: float(v.norm()) for l, (_, v) in self._by_layer.items()}
         else:
             norms = {int(l): float(np.linalg.norm(v)) for l, v in self._entries}
-        return {"type": "add", "label": self.label, "layers": sorted(norms), "alpha": self.alpha_per_layer,
-                "vector_norm": norms, "positions": _describe_positions(self.positions)}
+        out = {"type": "add", "label": self.label, "layers": sorted(norms), "alpha": self.alpha_per_layer,
+               "vector_norm": norms, "positions": _describe_positions(self.positions)}
+        if self.control_seed is not None:
+            out["control_seed"] = self.control_seed
+        return out
+
+    def _alphas_as_given(self) -> Union[float, Dict[int, float]]:
+        return dict(self._alpha) if isinstance(self._alpha, dict) else float(self._alpha)
+
+    def scaled(self, factor: float) -> "Add":
+        """The same intervention with every alpha multiplied by ``factor``: a dose of it."""
+        alpha = ({l: float(a) * float(factor) for l, a in self._alpha.items()} if isinstance(self._alpha, dict)
+                 else float(self._alpha) * float(factor))
+        out = Add({l: v for l, v in self._entries}, alpha, positions=self.positions, label=self.label)
+        out.control_seed = self.control_seed
+        return out
+
+    def random_like(self, seed: Any) -> "Add":
+        """A control for this intervention: the same layers, alphas and positions, with each layer's
+        vector replaced by one random direction (from ``seed``, an int or a sequence of ints), at
+        that layer's vector norm.
+
+        One direction for every layer keeps the control comparable to concept vectors, which point
+        nearly the same way at adjacent layers: independent random directions would partly cancel
+        when several layers are steered, and push the stream about half as far.
+        """
+        dim = self._entries[0][1].shape[-1]
+        direction = np.random.default_rng(seed).standard_normal(dim)
+        direction /= np.linalg.norm(direction)
+        vectors = {l: (direction * np.linalg.norm(v)).astype(np.float32) for l, v in self._entries}
+        out = Add(vectors, self._alphas_as_given(), positions=self.positions,
+                  label=f"random control of {self.label or 'an addition'}")
+        out.control_seed = list(seed) if isinstance(seed, (list, tuple)) else seed
+        return out
 
 
 def _orthonormal_rows(vectors: np.ndarray) -> np.ndarray:

@@ -445,6 +445,22 @@ leen de memoria.
 
 **Etapa 5 — Evaluar el empuje (capa 6c).** Entradas 23 y 24.
 - Al terminar: `shared/steer.py` y las medidas de coherencia de `shared/measure.py` sobran.
+- *Hecha el 2026-11-05 (`steering_eval.py`). `evaluate_steering` barre las dosis de un empuje (de
+  una probe, de un `Add` o de una función de la dosis) con n controles al azar del mismo largo en
+  la misma llamada, mide la coherencia localmente (perplejidad bajo el modelo sin empujar, como
+  respuesta a su pedido; repetición; largo) y el efecto con probes y con cualquier función de los
+  textos (el juez de Groq es una más, `coherence_judge`), y devuelve la tabla, la mayor dosis
+  coherente de cada lado según una regla reemplazable (por defecto la de B8b) y un gráfico.
+  `score_prompts` y `multi_probe_score_prompts` toman `n_random` en lugar de
+  `random_steering_vector`; el control tiene ahora el largo de los vectores de empujar, no el de
+  los de leer. Probada con Qwen 2.5 0.5B y el juez de valencia del workshop: 8 pedidos, 5 dosis y 5
+  controles (248 generaciones) en un minuto; a +6 la probe sube 0.72 z (controles: p95 0.24) y el
+  texto sigue coherente; a +12 y -6 la perplejidad pasa del doble y la regla corta. Cambios
+  respecto de la propuesta: `random_scoring_vector` (puntuar con una dirección al azar) se saca en
+  vez de convertirse en n controles: el nulo de la lectura ya está en la evaluación (etapa 3). La
+  perplejidad se mide sobre los tokens generados como respuesta a su pedido, no sobre el texto
+  vuelto a tokenizar como en `shared/measure.py`; la regla compara contra la dosis 0, así que el
+  cambio de definición no la mueve, pero los valores absolutos no son los del workshop.*
 
 **Etapa 6 — Datasets y extras.** Entrada 10 y diversidad; clasificadores de superficie junto a la
 probe; probes de confounds y quitarlos (proyección, LEACE); curvas de aprendizaje; multiclase,

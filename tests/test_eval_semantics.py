@@ -131,3 +131,12 @@ def test_an_explicit_env_file_wins_over_the_environment(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="stop"):
         coherence.rate_batch_coherence(scores.dir, env_path=str(env))
     assert used == ["from-file"]
+
+
+def test_random_controls_are_kept_apart_from_the_steering(tmp_path, monkeypatch):
+    probe = _probe(tmp_path, monkeypatch)
+    run = E.run_scored_eval(probe, [{"prompt": "a", "expected": "pp"}], alphas=[0.0, 1.0], n_random=2,
+                            save_html=False, save=True)
+    assert [r["control"] for r in run.per_sample] == [None, None, 0, 1]
+    analysed = json.loads(open(os.path.join(run.analysis_dir, "per_sample.json"), encoding="utf-8").read())["items"]
+    assert [r["control"] for r in analysed] == [None, None]

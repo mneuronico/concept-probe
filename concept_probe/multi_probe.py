@@ -58,9 +58,8 @@ def multi_probe_score_prompts(
     save_segments: Optional[bool] = None,
     keep_logits: Union[None, int, str] = None,
     batch_subdir: Optional[str] = None,
-    random_scoring_vector: bool = False,
-    random_steering_vector: bool = False,
-    random_vector_seed: Optional[int] = None,
+    n_random: int = 0,
+    random_seed: Optional[int] = None,
     seed: Optional[int] = None,
     overwrite: bool = False,
     batch_size: Optional[int] = None,
@@ -71,7 +70,8 @@ def multi_probe_score_prompts(
 
     All probes must come from the same model and model settings, and have distinct names (scores
     are keyed by name). Prompts, alphas, generation and scoring follow
-    :meth:`ConceptProbe.score_prompts`. Settings of the generation (system prompt,
+    :meth:`ConceptProbe.score_prompts`, including ``n_random`` random controls of the steering
+    probe's steering. Settings of the generation (system prompt,
     max_new_tokens, sampling, temperature, top_p, batch size) come from the arguments, or else from
     the probes' configs, which must then agree; the steering layers and their distribution come
     from the steering probe's config.
@@ -139,8 +139,7 @@ def multi_probe_score_prompts(
         probes, prompts, steer=steer, alphas=alphas, alpha_unit=alpha_unit, steer_layers=steer_layers,
         steer_window_radius=steer_window_radius, steer_distribute=steer_distribute, system_prompt=system_prompt,
         max_new_tokens=max_new_tokens, greedy=greedy, temperature=temperature, top_p=top_p, seed=seed,
-        batch_size=batch_size, layer_selection=layer_selection, random_scoring_vector=random_scoring_vector,
-        random_steering_vector=random_steering_vector, random_vector_seed=random_vector_seed,
+        batch_size=batch_size, layer_selection=layer_selection, n_random=n_random, random_seed=random_seed,
         keep_logits=keep_logits, on_token=on_token, warn=warn, status=status,
     )
     probes_info = [{"name": p.concept.name, "pos_label": p.concept.pos_label, "neg_label": p.concept.neg_label,
