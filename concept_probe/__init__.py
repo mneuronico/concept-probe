@@ -1,6 +1,7 @@
 from .config import ConceptSpec, load_defaults, resolve_config
 from .probe import (
     ConceptProbe,
+    NonFiniteActivationsError,
     ProbeWorkspace,
     concept_direction,
     extract_completion_reps,
@@ -42,6 +43,7 @@ __all__ = [
     "resolve_config",
     "ConceptProbe",
     "ProbeWorkspace",
+    "NonFiniteActivationsError",
     "score_text_tokens",
     "extract_completion_reps",
     "concept_direction",

@@ -40,7 +40,9 @@ class CharChatTok:
         ids = [ord(c) for c in text]
         out = {"input_ids": torch.tensor([ids], dtype=torch.long) if return_tensors == "pt" else ids}
         if return_offsets_mapping:
-            out["offset_mapping"] = [(i, i + 1) for i in range(len(text))]
+            offsets = [(i, i + 1) for i in range(len(text))]
+            # batched like input_ids when tensors are asked for, as Hugging Face tokenizers do
+            out["offset_mapping"] = torch.tensor([offsets], dtype=torch.long) if return_tensors == "pt" else offsets
         return out
 
     def decode(self, ids, skip_special_tokens=False):
@@ -57,7 +59,7 @@ def fake_forward(model, input_ids, **kwargs):
 class _Block(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.p = torch.nn.Parameter(torch.zeros(1))  # steering hooks read the device from a parameter
+        self.p = torch.nn.Parameter(torch.zeros(1))  # a parameter, as real blocks have
 
     def forward(self, x):
         return x

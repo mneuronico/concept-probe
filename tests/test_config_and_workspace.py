@@ -6,8 +6,9 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
-from concept_probe import coherence
+from concept_probe import coherence, modeling
 from concept_probe.config import ConceptSpec, resolve_config
 from concept_probe.console import ConsoleLogger
 from concept_probe.modeling import ModelBundle
@@ -49,6 +50,98 @@ def test_requested_4bit_without_bitsandbytes_fails_instead_of_loading_full_preci
 
 def test_4bit_is_off_by_default():
     assert resolve_config()["model"]["use_4bit"] is False
+
+
+def _fake_from_pretrained(monkeypatch, model_type="llama"):
+    """Replace transformers' loaders with stand-ins that record where and how they were called."""
+    calls = {}
+
+    def tokenizer_from_pretrained(source, **kwargs):
+        calls["tokenizer"] = (source, kwargs)
+        return SimpleNamespace(pad_token_id=0, eos_token="</s>", chat_template=None)
+
+    def model_from_pretrained(source, **kwargs):
+        calls["model"] = (source, kwargs)
+        return SimpleNamespace(config=SimpleNamespace(model_type=model_type), eval=lambda: None)
+
+    monkeypatch.setattr(modeling, "AutoTokenizer", SimpleNamespace(from_pretrained=tokenizer_from_pretrained))
+    monkeypatch.setattr(modeling, "AutoModelForCausalLM", SimpleNamespace(from_pretrained=model_from_pretrained))
+    return calls
+
+
+def _online(monkeypatch):
+    import huggingface_hub.constants
+
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_OFFLINE", False)
+
+
+@pytest.mark.parametrize("version, key", [("4.57.3", "dtype"), ("4.56.0", "dtype"), ("4.55.4", "torch_dtype"),
+                                          ("4.45.0", "torch_dtype")])
+def test_dtype_argument_follows_the_transformers_version(monkeypatch, version, key):
+    # transformers 4.56 renamed torch_dtype to dtype and deprecated the old name.
+    _online(monkeypatch)
+    calls = _fake_from_pretrained(monkeypatch)
+    monkeypatch.setattr(modeling.transformers, "__version__", version)
+    ModelBundle.load({"model_id": "org/model", "dtype": "float32"})
+    kwargs = calls["model"][1]
+    assert kwargs[key] is torch.float32
+    assert ({"dtype", "torch_dtype"} - {key}).pop() not in kwargs
+
+
+def test_online_loading_uses_the_repo_id(monkeypatch):
+    _online(monkeypatch)
+    calls = _fake_from_pretrained(monkeypatch)
+    ModelBundle.load({"model_id": "org/model", "dtype": "float32"})
+    assert calls["tokenizer"][0] == calls["model"][0] == "org/model"
+
+
+def test_offline_loading_uses_the_cached_snapshot(monkeypatch):
+    # Loading by repo id fails offline in transformers 4.57.3 even when everything is cached.
+    import huggingface_hub
+
+    calls = _fake_from_pretrained(monkeypatch)
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    asked = []
+    monkeypatch.setattr(huggingface_hub, "snapshot_download",
+                        lambda repo_id, **kw: asked.append((repo_id, kw)) or "/cache/org--model/snap")
+    bundle = ModelBundle.load({"model_id": "org/model", "dtype": "float32"})
+    assert asked[0][0] == "org/model" and asked[0][1]["local_files_only"] is True
+    assert calls["tokenizer"][0] == calls["model"][0] == "/cache/org--model/snap"
+    assert bundle.model_id == "org/model"  # the identity is still the repo id
+
+
+def test_offline_loading_of_an_uncached_model_says_so(monkeypatch):
+    import huggingface_hub
+
+    _fake_from_pretrained(monkeypatch)
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+
+    def not_cached(repo_id, **kwargs):
+        raise FileNotFoundError(repo_id)
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", not_cached)
+    with pytest.raises(OSError, match="not in the local Hugging Face cache"):
+        ModelBundle.load({"model_id": "org/model", "dtype": "float32"})
+
+
+def test_a_local_directory_is_loaded_as_is_offline(monkeypatch, tmp_path):
+    calls = _fake_from_pretrained(monkeypatch)
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    ModelBundle.load({"model_id": str(tmp_path), "dtype": "float32"})
+    assert calls["model"][0] == str(tmp_path)
+
+
+@pytest.mark.parametrize("model_type, dtype, warns", [
+    ("gemma3_text", "float16", True), ("gemma3", "float16", True),
+    ("gemma3_text", "bfloat16", False), ("llama", "float16", False),
+])
+def test_gemma3_in_float16_warns(monkeypatch, recwarn, model_type, dtype, warns):
+    _online(monkeypatch)
+    _fake_from_pretrained(monkeypatch, model_type=model_type)
+    ModelBundle.load({"model_id": "org/model", "dtype": dtype})
+    overflow = [w for w in recwarn if "overflow" in str(w.message)]
+    assert bool(overflow) == warns
 
 
 # ------------------------------------------------------------- workspaces

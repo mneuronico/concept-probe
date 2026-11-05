@@ -8,9 +8,9 @@ from concept_probe.steering import MultiLayerSteererLayerwise
 
 
 class _Block(torch.nn.Module):
-    def __init__(self, return_tuple: bool = False):
+    def __init__(self, return_tuple: bool = False, param_device: str = "cpu"):
         super().__init__()
-        self.p = torch.nn.Parameter(torch.zeros(1))  # hook needs a parameter for device
+        self.p = torch.nn.Parameter(torch.zeros(1, device=param_device))
         self.return_tuple = return_tuple
 
     def forward(self, x):
@@ -18,11 +18,11 @@ class _Block(torch.nn.Module):
 
 
 class _FakeModel(torch.nn.Module):
-    def __init__(self, n_layers: int = 3, return_tuple: bool = False):
+    def __init__(self, n_layers: int = 3, return_tuple: bool = False, param_device: str = "cpu"):
         super().__init__()
         self.model = torch.nn.Module()
         self.model.layers = torch.nn.ModuleList(
-            [_Block(return_tuple=return_tuple) for _ in range(n_layers)]
+            [_Block(return_tuple=return_tuple, param_device=param_device) for _ in range(n_layers)]
         )
 
 
@@ -88,3 +88,21 @@ def test_layer_scales_multiply_each_layers_alpha():
         out1 = _run_layer(model, 1)
     np.testing.assert_allclose(out0.numpy()[0, 0], [3, 0, 0, 0])    # alpha/2 * 3 * e0
     np.testing.assert_allclose(out1.numpy()[0, 0], [0, 0.5, 0, 0])  # alpha/2 * 0.5 * e1
+
+
+def test_steering_follows_the_output_device_not_the_parameters():
+    # With CPU offload (accelerate), a block's parameters sit on the "meta" device outside its
+    # forward pass; the steering offset must go where the block's output is.
+    model = _FakeModel(param_device="meta")
+    with MultiLayerSteererLayerwise(model, [1], VECS, alpha=3.0, distribute=False):
+        out = _run_layer(model, 1)
+    assert out.device.type == "cpu"
+    np.testing.assert_allclose(out.numpy()[0, 0], [0, 3, 0, 0])
+
+
+def test_steering_offset_takes_the_output_dtype():
+    model = _FakeModel()
+    with MultiLayerSteererLayerwise(model, [0], VECS, alpha=2.0, distribute=False):
+        out = get_transformer_layers(model)[0](X.to(torch.float16))
+    assert out.dtype == torch.float16
+    np.testing.assert_allclose(out.float().numpy()[0, 0], [2, 0, 0, 0])

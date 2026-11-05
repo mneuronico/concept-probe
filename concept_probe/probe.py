@@ -52,6 +52,10 @@ def concept_direction(pos_reps: np.ndarray, neg_reps: np.ndarray, normalization:
     Variances are population variances (``ddof=0``), computed in float64. The result is
     normalized to unit length, so scoring and steering use it exactly like an unnormalized
     direction. ``"none"`` is computed in the input dtype, as training always did.
+
+    In a trained probe, ``training.direction_normalization`` sets the one direction used both to
+    read and to steer: ``"var"`` tends to read better and steer less than ``"none"`` (see the
+    README, "Variance-normalized directions").
     """
     if normalization not in DIRECTION_NORMALIZATIONS:
         raise ValueError(
@@ -410,8 +414,8 @@ def _select_best_layer(
         best = int(np.argmax(masked))
         if not np.isfinite(masked[best]):
             raise ValueError(
-                "No finite Cohen's d in the best_layer_search range. This typically means "
-                "fewer than 2 eval samples per side; add eval data or disable the layer sweep."
+                "No finite Cohen's d in the best_layer_search range: d needs at least 2 eval items per pole "
+                "(on each side of evaluation.selection_split, if set); add eval data or disable the layer sweep."
             )
         return best
     candidates = np.flatnonzero(allowed & (d > 0) & np.isfinite(p))
@@ -661,8 +665,10 @@ def _encode_text_for_read(
         messages.append({"role": "user", "content": str(prompt)})
     if not messages:
         raise ValueError(
-            f"{warn_prefix}: reading a text as the assistant's reply needs a system prompt or a user "
-            "prompt before it; chat templates cannot format a conversation that starts with the reply."
+            f"{warn_prefix}: reading a text as the assistant's reply needs a turn before it, since chat "
+            "templates cannot format a conversation that starts with the reply: pass prompt= (a user turn) "
+            "or system= (in training: training.train_text_prompt, or training.train_text_system / "
+            "prompts.neutral_system)."
         )
     ids, plen = _completion_input_ids(tokenizer, messages, text)
     return ids, plen, int(ids.shape[-1])
@@ -892,6 +898,40 @@ def _get_final_norm_module(model):
     )
 
 
+class NonFiniteActivationsError(FloatingPointError):
+    """The model produced NaN or inf hidden states, typically an overflow of half precision."""
+
+
+def _model_dtype(model) -> Optional[torch.dtype]:
+    dtype = getattr(model, "dtype", None)
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    try:
+        return next(model.parameters()).dtype
+    except Exception:
+        return None
+
+
+def check_finite_hidden_states(hs_layers: Sequence[torch.Tensor], model) -> None:
+    """Raise :class:`NonFiniteActivationsError` if any layer holds NaN or inf.
+
+    Nothing downstream can tell such a layer from a real one: its directions, scores and d come
+    out NaN and the layer sweep would skip it in silence. The message names the model's dtype,
+    since the usual cause is half precision overflowing (Gemma 3 in float16, for one).
+    """
+    bad = [l for l, h in enumerate(hs_layers) if not bool(torch.isfinite(h).all())]
+    if not bad:
+        return
+    where = f"layers {bad}" if len(bad) <= 8 else f"{len(bad)} layers ({bad[0]} to {bad[-1]})"
+    quantized = getattr(getattr(model, "config", None), "quantization_config", None) is not None
+    raise NonFiniteActivationsError(
+        f"The model's hidden states are not finite (NaN or inf) at {where} of {len(hs_layers)}; the model "
+        f"runs in {_model_dtype(model)}{' (quantized)' if quantized else ''}. This is usually half precision "
+        "overflowing (Gemma 3 does in float16): load the model in bfloat16 if the GPU supports it, or in "
+        "float32" + (", and use that as the quantization's compute dtype." if quantized else ".")
+    )
+
+
 @torch.no_grad()
 def forward_hidden_states_all_layers(
     model,
@@ -900,6 +940,8 @@ def forward_hidden_states_all_layers(
     return_generation_logits: bool = False,
     generation_prompt_len: Optional[int] = None,
 ) -> Union[List[torch.Tensor], Tuple[List[torch.Tensor], torch.Tensor]]:
+    """Per-layer hidden states ``(seq_len, hidden_dim)`` (CPU float32) of one input: entry ``l`` is
+    the output of block ``l``. Raises :class:`NonFiniteActivationsError` on NaN or inf."""
     attn = attention_mask_from_ids(input_ids).to(model.device)
 
     final_norm = _get_final_norm_module(model)
@@ -934,6 +976,7 @@ def forward_hidden_states_all_layers(
 
     num_layers = len(hs) - 1
     hs_layers = [hs[l + 1][0].detach().float().cpu() for l in range(num_layers)]
+    check_finite_hidden_states(hs_layers, model)
     if not return_generation_logits:
         return hs_layers
 
@@ -1475,10 +1518,21 @@ class ConceptProbe:
             and eval_mode != "skip"
             and not (train_prompt_mode == "texts" and eval_mode == "generate")
         )
+        if (
+            train_prompt_mode == "texts" and text_role == "assistant" and not train_text_system
+            and text_prompt is None
+        ):
+            raise ValueError(
+                "training.train_text_role='assistant' reads each training text as the model's reply, and a chat "
+                "template needs a turn before a reply. Set training.train_text_prompt (a user turn before every "
+                "text, e.g. a neutral request) or a system prompt (training.train_text_system or "
+                "prompts.neutral_system). preview_input shows the resulting input."
+            )
         if reads_eval_texts and text_role == "assistant" and not eval_system and text_prompt is None:
             raise ValueError(
-                "Eval texts are read as the assistant's reply, which needs a system prompt or a user prompt "
-                "before them: set evaluation.eval_system or prompts.neutral_system, or training.train_text_prompt."
+                "Eval texts are read as the assistant's reply, which needs a turn before them: set "
+                "training.train_text_prompt (a user turn), or a system prompt (evaluation.eval_system or "
+                "prompts.neutral_system)."
             )
 
         if ttest_ind is None:
@@ -2336,7 +2390,8 @@ class ConceptProbe:
         The npz holds raw projections (``scores_per_layer``, ``scores_agg``) and, when the probe
         has eval references, standardized single-token scores (``scores_z_per_layer``,
         ``scores_agg_z``: 0 is the midpoint between the eval poles, 1 the within-pole SD of single
-        tokens), which the heatmaps then show. Each record has the text's mean score over its own
+        tokens), which the heatmaps then show. The midpoint is not "without the concept": text that
+        belongs to neither pole can land well away from 0. Each record has the text's mean score over its own
         tokens, ``score_mean``, and ``score_mean_z``, standardized with the per-item references.
         z scores need references measured on texts read the same way (role, system prompt, prompt):
         the evaluation's in texts mode, the transfer check's (eval texts) in shared/opposed mode.
@@ -2520,8 +2575,9 @@ class ConceptProbe:
 
         ``score_mean`` averages the completion's tokens, up to and not including the
         end-of-sequence token; ``score_mean_z`` standardizes that mean with the per-item references
-        (0 is the midpoint between the eval poles, 1 their pooled within-pole SD). The npz and the
-        heatmaps carry single-token z scores, standardized with the per-token references.
+        (0 is the midpoint between the eval poles, not "without the concept"; 1 their pooled
+        within-pole SD). The npz and the heatmaps carry single-token z scores, standardized with
+        the per-token references.
 
         Steering: by default only the probe's layer is steered (``steering.steer_layers =
         "probe"``). With several layers (``"window"`` or a list), each layer adds its own probe

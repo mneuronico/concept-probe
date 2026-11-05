@@ -15,11 +15,13 @@ class LayerSteerer:
     handle: Optional[torch.utils.hooks.RemovableHandle] = None
 
     def _hook(self, module, inputs, output):
-        d = self.direction_cpu.to(next(module.parameters()).device)
+        hidden = output[0] if isinstance(output, tuple) else output
+        # The device of the block's output, not of its parameters: with CPU offload (accelerate),
+        # a block's parameters sit on the "meta" device outside its forward pass.
+        offset = (self.alpha * self.direction_cpu).view(1, 1, -1).to(device=hidden.device, dtype=hidden.dtype)
         if isinstance(output, tuple):
-            hs = output[0] + (self.alpha * d).view(1, 1, -1).to(output[0].dtype)
-            return (hs,) + output[1:]
-        return output + (self.alpha * d).view(1, 1, -1).to(output.dtype)
+            return (hidden + offset,) + output[1:]
+        return hidden + offset
 
     def __enter__(self):
         layer = get_transformer_layers(self.model)[self.layer_idx]

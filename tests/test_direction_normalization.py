@@ -88,7 +88,7 @@ def test_assistant_role_puts_the_text_after_the_assistant_header():
 def test_assistant_role_without_system_or_prompt_is_rejected():
     # Chat templates cannot format a conversation that starts with the reply (real tokenizers
     # raise IndexError on an empty message list), so this fails with a clear message instead.
-    with pytest.raises(ValueError, match="system prompt or a user prompt"):
+    with pytest.raises(ValueError, match="needs a turn before it.*prompt=.*system="):
         _encode_text_for_read(_ChatTok(), "one two", "", role="assistant", prompt=None)
     ids, start, end = _encode_text_for_read(_ChatTok(), "one two", "", role="assistant", prompt="q")
     assert ids[0, start:end].tolist() == [7, 7]

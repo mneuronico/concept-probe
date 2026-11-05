@@ -184,7 +184,12 @@ probe = workspace.train_concept(concept)
 
 `training.train_text_role` (`"raw"`, `"user"` or `"assistant"`) sets how the labelled texts are
 read, with `training.train_text_system` (null: `prompts.neutral_system`) and, for the assistant
-role, `training.train_text_prompt`. The `assistant_*` readouts pool over the text's own tokens
+role, `training.train_text_prompt`. The assistant role reads each text as the model's reply, and a
+chat template cannot start a conversation with a reply, so it needs a turn before the text: set
+`training.train_text_prompt` (a user turn, the same before every text) or a system prompt.
+Without one, training stops before running anything. The library does not add one for you,
+because whatever goes there is part of what the model reads; `preview_input` shows the result.
+The `assistant_*` readouts pool over the text's own tokens
 in every role: they leave out the BOS, the system block and role headers before the text, and
 the end-of-turn tokens after it. The `sequence_*` readouts pool from the start of the input to
 the end of the text, template included (the tokens after the text are left out, as in every
@@ -296,6 +301,14 @@ with its own reference: per-token z (`scores_z_per_layer`, `scores_agg_z`, shown
 and the z of an item's mean (`score_mean_z`). In both, 0 is the midpoint between the poles, so
 positive leans toward the positive pole, and 1 is a within-pole SD.
 
+**z = 0 does not mean "without the concept".** It is the midpoint between the mean scores of the
+two poles' eval items, and text that belongs to neither pole need not land there. With a valence
+probe on Llama 3.2 3B (layer 11), 50 neutral texts scored z = +0.54 on average, and texts about
+food, cars, days of the week or plain statements between +0.3 and +0.7. Where neutral text lands
+also depends on the training texts: valence probes trained on other sources put the same neutral
+texts between -0.45 and -0.16. So z > 0 on a neutral text is not "positive"; to know where text
+without the concept sits, score a set of it with the same probe.
+
 References only apply to inputs read the way they were measured (`reference_context` in
 `metrics.json`). In shared and opposed modes the evaluation's references come from completions
 generated in a chat, and they standardize `score_prompts`; texts read raw sit elsewhere entirely
@@ -358,6 +371,15 @@ of the probe (scoring, steering, `ConceptProbe.load`) reads the stored vector, s
 with `"var"` stays variance-normalized wherever it is used. The layer sweep, and therefore
 `best_layer`, is computed with the normalized directions. `concept_direction(pos, neg,
 normalization)` exposes the same estimator for representations computed elsewhere.
+
+**This setting changes the steering direction too.** A probe has one direction per layer, used
+both to read and to steer, and the two uses do not favor the same estimator. Across Llama, Qwen
+and Gemma 3 models, `"var"` read better (by a wide margin in Gemma and Qwen) but steered less: with
+a valence probe, the change in an external classifier's positivity between steering at +alpha and
+at -alpha (at the largest alpha that kept the text coherent) fell from +0.22 to +0.12 in Llama
+3.2 3B and from +0.18 to +0.03 in Qwen 2.5 3B, and some models lost coherence at smaller alphas.
+If you use `"var"` to read, steer with a probe trained with `"none"`. A later version will keep
+the reading and steering directions apart.
 
 ```python
 config_overrides = {"training": {"direction_normalization": "var", "best_layer_search": {"frac": [0.2, 0.8]}}}
@@ -506,6 +528,24 @@ GitHub Actions CI runs the same lightweight checks and also builds source and wh
 
 ### Unreleased
 
+- **NaN or inf hidden states stop the run** with `NonFiniteActivationsError`, which names the
+  layers and the model's dtype; loading a Gemma 3 model in float16 warns that it overflows.
+  Previously the non-finite layers gave NaN directions and scores, and the layer sweep skipped
+  them without saying so.
+- **Loading works offline**: with `HF_HUB_OFFLINE` set, a repo id loads from its snapshot in the
+  local cache (transformers 4.57.3 failed to load a tokenizer by repo id offline). Models load
+  with `dtype=` on transformers 4.56 and later, which deprecate `torch_dtype=`.
+- **Steering follows the device of each block's output** instead of its parameters, so it works
+  on models offloaded to the CPU, whose parameters sit on the `meta` device between passes.
+- **`pip install concept-probe[quantization]` installs bitsandbytes on Windows too**; it was
+  excluded there, although bitsandbytes supports Windows since 0.43.
+- **Assistant-role training texts with no turn before them stop before anything runs**, with a
+  message naming `training.train_text_prompt` and the system prompt settings.
+- Documented that `training.direction_normalization` also changes the steering direction, and that
+  z = 0 is the midpoint between the poles, not "without the concept".
+- `tests/test_reference_outputs.py` pins what the existing API returns and writes on a tiny
+  deterministic model, so the redesign in [docs/DESIGN.md](docs/DESIGN.md) can show that it keeps
+  the same results.
 - **Steering touches only the probe's layer by default** (`steering.steer_layers = "probe"`).
   It used to steer a window of 5 layers around it with alpha split among them. With several
   layers, each adds its own probe direction (unchanged); records now say so and include

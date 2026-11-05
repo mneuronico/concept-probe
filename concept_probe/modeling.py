@@ -1,9 +1,12 @@
 import datetime
 import os
+import re
+import warnings
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
 
 import torch
+import transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from .utils import torch_dtype_from_str
@@ -80,6 +83,64 @@ def apply_tokenizer_overrides(tokenizer, model_cfg: Dict[str, Any]) -> None:
     setattr(tokenizer, _CHAT_TEMPLATE_DATE_ATTR, date)
 
 
+def _transformers_version() -> tuple:
+    return tuple(int(x) for x in re.findall(r"\d+", transformers.__version__)[:2])
+
+
+def _dtype_kwargs(dtype: torch.dtype) -> Dict[str, Any]:
+    """The dtype argument of ``from_pretrained``: ``dtype`` from transformers 4.56, which deprecates
+    ``torch_dtype``; ``torch_dtype`` before."""
+    return {"dtype": dtype} if _transformers_version() >= (4, 56) else {"torch_dtype": dtype}
+
+
+_TRUE_VALUES = {"1", "ON", "YES", "TRUE"}
+
+
+def _hub_offline() -> bool:
+    """Whether ``HF_HUB_OFFLINE`` is set, now or when huggingface_hub was imported."""
+    if os.environ.get("HF_HUB_OFFLINE", "").strip().upper() in _TRUE_VALUES:
+        return True
+    try:
+        from huggingface_hub import constants
+    except Exception:
+        return False
+    return bool(getattr(constants, "HF_HUB_OFFLINE", False))
+
+
+def resolve_model_source(model_id: str, token: Optional[str] = None) -> str:
+    """Where to load ``model_id`` from.
+
+    A local directory, or a repo id while the Hub is reachable, is returned as is. With
+    ``HF_HUB_OFFLINE`` set, a repo id resolves to its snapshot in the local Hugging Face cache:
+    loading by repo id fails offline in some transformers versions (4.57.3 asks the Hub whether
+    the tokenizer comes from Mistral), even when every file is cached.
+    """
+    if os.path.isdir(model_id) or not _hub_offline():
+        return model_id
+    from huggingface_hub import snapshot_download
+
+    try:
+        return snapshot_download(model_id, local_files_only=True, token=token)
+    except Exception as exc:
+        raise OSError(
+            f"HF_HUB_OFFLINE is set and {model_id!r} is not in the local Hugging Face cache; download it "
+            "first, or unset HF_HUB_OFFLINE."
+        ) from exc
+
+
+def _warn_if_gemma3_float16(model: Any, dtype: torch.dtype, model_id: str) -> None:
+    """Gemma 3 overflows in float16: its hidden states become inf/NaN (seen with 270M unquantized,
+    and 4B and 12B in NF4 with float16 compute)."""
+    model_type = str(getattr(getattr(model, "config", None), "model_type", "") or "")
+    if dtype == torch.float16 and model_type.startswith("gemma3"):
+        warnings.warn(
+            f"{model_id} is a Gemma 3 model loaded with float16 (compute) dtype, in which its activations "
+            "overflow to inf/NaN. Use bfloat16 if the GPU supports it, or float32.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
+
 @dataclass
 class ModelBundle:
     model_id: str
@@ -92,7 +153,8 @@ class ModelBundle:
 
         ``use_4bit`` loads NF4 4-bit weights with ``dtype`` as the compute dtype. It needs
         bitsandbytes, and it fails loudly rather than loading the full-precision model instead,
-        since the two give different activations.
+        since the two give different activations. With ``HF_HUB_OFFLINE`` set, a repo id is loaded
+        from its cached snapshot (see :func:`resolve_model_source`).
         """
         model_id = model_cfg["model_id"]
         hf_token = os.environ.get(model_cfg.get("hf_token_env", "HF_TOKEN"), None)
@@ -109,19 +171,21 @@ class ModelBundle:
                 ) from exc
             quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=dtype)
 
-        tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token)
+        source = resolve_model_source(model_id, token=hf_token)
+        tokenizer = AutoTokenizer.from_pretrained(source, token=hf_token)
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token = tokenizer.eos_token
         apply_tokenizer_overrides(tokenizer, model_cfg)
 
         model = AutoModelForCausalLM.from_pretrained(
-            model_id,
+            source,
             token=hf_token,
             device_map=model_cfg.get("device_map", "auto"),
-            torch_dtype=dtype,
             quantization_config=quant,
+            **_dtype_kwargs(dtype),
         )
         model.eval()
+        _warn_if_gemma3_float16(model, dtype, model_id)
         return cls(model_id=model_id, tokenizer=tokenizer, model=model)
 
     @property

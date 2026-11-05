@@ -227,4 +227,7 @@ def patched_forward_hidden_states(
 
     if any(c is None for c in captured):
         raise RuntimeError("Block-output capture hook did not fire for every layer; unexpected model layout.")
+    from .probe import check_finite_hidden_states
+
+    check_finite_hidden_states(captured, model)
     return captured

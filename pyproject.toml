@@ -42,7 +42,7 @@ plots = [
   "matplotlib>=3.8",
 ]
 quantization = [
-  "bitsandbytes>=0.43; platform_system != 'Windows'",
+  "bitsandbytes>=0.43",
 ]
 coherence = [
   "groq>=0.11",
@@ -57,7 +57,7 @@ full = [
   "scikit-learn>=1.4",
   "matplotlib>=3.8",
   "groq>=0.11",
-  "bitsandbytes>=0.43; platform_system != 'Windows'",
+  "bitsandbytes>=0.43",
 ]
 
 [tool.setuptools]

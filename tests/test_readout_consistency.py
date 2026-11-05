@@ -242,6 +242,20 @@ def test_settings_that_would_be_ignored_or_misread_raise_before_anything_runs(tm
     assert not (tmp_path / "config.json").exists()
 
 
+def test_assistant_role_training_texts_without_a_turn_before_raise_saying_what_to_set(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="training.train_text_prompt"):
+        _train(tmp_path, monkeypatch, "texts", {"training": {"train_text_role": "assistant"}})
+    assert not (tmp_path / "config.json").exists()
+
+
+def test_assistant_role_training_texts_with_a_prompt_train(tmp_path, monkeypatch):
+    tok, metrics, _, _ = _train(tmp_path, monkeypatch, "texts", {
+        "training": {"train_text_role": "assistant", "train_text_prompt": "say"},
+    })
+    assert metrics["train_text_role"] == "assistant"
+    assert "^<u>say|<a>" in tok.rendered  # the user turn, then the reply header the text follows
+
+
 def test_identical_system_prompts_raise_in_contrastive_modes(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="pos_system == concept.neg_system"):
         _train(tmp_path, monkeypatch, "shared", concept=_concept(pos_system="", neg_system=""))
