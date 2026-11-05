@@ -292,35 +292,64 @@ by a confound in the data.
 
 ## Evaluation
 
-The evaluation that picks the layer and measures the effect uses the same kind of data as
-training, read the same way:
+Training measures how well the probe reads on **named eval sets**. One of them, the primary set,
+chooses the layer and gives the numbers reported for the probe; every other set is measured at
+that layer. `metrics.json` has them all under `evaluation.sets`, and the primary set's numbers
+also at the top (`best_d`, `best_auroc`, ...).
 
-- **Texts mode**: the concept's `eval_pos_texts` / `eval_neg_texts`, read with the training
-  texts' role and system prompt and pooled with `readout.read_mode`. `evaluation.eval_system`
-  (null by default) overrides the system prompt, with a warning. With
-  `evaluation.eval_mode = "generate"` it evaluates on generated completions instead, also pooled
-  with `readout.read_mode`, the readout the vector was trained with.
+- **Texts mode**: the primary set `"eval"` is the concept's `eval_pos_texts` / `eval_neg_texts`,
+  read with the training texts' role and system prompt and pooled with `readout.read_mode`.
+  `evaluation.eval_system` (null by default) overrides the system prompt, with a warning.
 - **Shared and opposed modes**: completions generated for `prompts.eval_questions` under
-  `pos_system` / `neg_system`, pooled with `readout.train_mode`, like the training completions.
-  `eval_questions` (20 by default) should not repeat the training questions; training warns if
-  they do.
+  `pos_system` / `neg_system`. The primary set `"eval"` reads each completion as the reply to its
+  question alone, without that system prompt: the prompt itself pushes the score toward its pole,
+  so reading the completions after it inflates d (in the workshop's valence probes, about 10 with
+  it against about 2.5 for the same probe on written texts). Reading them after it, as they were
+  generated, is the set `"eval_with_system_prompt"`; `evaluation.primary_set =
+  "eval_with_system_prompt"` makes it the primary one, as before. Eval texts given with such a
+  concept are the set `"texts"`. `eval_questions` (20 by default) should not repeat the training
+  questions; training warns if they do.
+- **More sets**: `concept.eval_sets` = `{name: {"pos": [...], "neg": [...]}}` (optionally with
+  `"paired"`, `"role"`, `"system"`, `"prompt"`), read like the eval texts, for out-of-distribution
+  checks next to the main number.
+
+For every set: Cohen's d at the probe's layer, its p and a bootstrap interval, the AUROC with its
+interval, and **what random directions give** on the same items (`null_d95`: the 95th percentile of
+|d| over `evaluation.n_random_directions` = 50 random directions). A d inside that is what any
+direction would give: how far apart the sets are on their own, which varies a lot from one set of
+texts to another. The primary set also has the **accuracy** with the calibrated threshold and its
+interval. As a control of the whole procedure, training also refits the direction with the
+training labels shuffled (`evaluation.n_label_shuffles`; by default 10 for the difference of
+means, where it is quick, and none for slower estimators) and reports the |d| those directions get
+(`label_shuffle`).
+
+**Pairs.** Generated completions come in pairs: both poles answer the same question. Eval texts can
+too (`evaluation.eval_pairs = true`: `eval_pos_texts[i]` and `eval_neg_texts[i]` are a minimal pair).
+Paired items are split, resampled and permuted by pair, and their p-values come from the paired
+t-test; an item whose pair-mate is empty is left out with it. Splitting the poles independently
+would let a pair help choose the layer through one pole and then be measured through the other.
 
 With fewer than 10 eval items per pole, training warns that the layer choice and `best_d` rest
 on very few items. An item with no tokens of its own (a completion that ends right away, or an
 empty text) is left out with a warning and listed under `dropped_items` in `metrics.json`; it is
 never pooled over the prompt in its place, which would put the system prompt into the vector.
+Generated completions are pooled up to and not including their end-of-sequence token.
 
-In shared and opposed modes, eval texts given with the concept are a **transfer check**: they are
-read with `training.train_text_role` (raw by default), scored at the chosen layer and reported
-under `transfer_eval` in `metrics.json` (`d_at_best_layer`, its p and bootstrap interval), plus a
-`transfer_sweep.png` plot. They do not take part in choosing the layer. The check matters
-because a generated completion has the system prompt that defines the concept in its context: a
-vector could partly encode that context, which the generated eval shares and plain texts do not.
-`evaluation.eval_mode = "read"` chooses the layer on the eval texts instead, with a warning.
+The same evaluation works on representations already read, with no training run:
 
-`metrics.json` records each readout (`eval_readout`, `transfer_eval.readout`). Generated
-completions (training, evaluation, scoring) are pooled up to and not including their
-end-of-sequence token, whichever generation path produced them.
+```python
+from concept_probe import EvalSet, evaluate_reading, compare_scorers, cross_reading, auroc
+
+ev = evaluate_reading(directions, [EvalSet("main", pos, neg, paired=True), EvalSet("ood", pos2, neg2)])
+ev.layer, ev.sets["ood"].d, ev.sets["ood"].null_d95
+compare_scorers(auroc, probe_pos, probe_neg, judge_pos, judge_neg)   # paired difference with its interval
+cross_reading([valence_probe, interest_probe], {"valence": (vp, vn), "interest": (ip, inn)})
+```
+
+`compare_scorers` compares two ways of scoring the same items (two probes, or a probe and a judge)
+with a paired bootstrap interval. `cross_reading` reads each probe on each set, with the
+random-direction null and the cosine between the probes' directions: a probe can encode another
+concept without anything showing it until it is read on that concept's texts.
 
 ## Layers
 
@@ -335,32 +364,24 @@ config_overrides = {"training": {"best_layer_search": {"frac": [0.2, 0.8]}}}  # 
 
 ## Layer selection and its statistics
 
-`best_layer` is chosen by a sweep over `training.best_layer_search` on the eval items, by
-largest Cohen's d (`sweep_select = "effect_size"`) or smallest p among layers with d > 0
-(`"p_value"`). Choosing the layer and measuring its effect on the same items overstates the
-effect, so by default (`evaluation.selection_split = 0.5`) the layer is chosen on half of the
-eval items and `best_d`, `best_p` and `best_d_ci95` (bootstrap, `evaluation.n_bootstrap`) are
-measured on the other half.
+The layer is chosen by a sweep over `training.best_layer_search` on the primary set, by largest
+Cohen's d (`sweep_select = "effect_size"`) or smallest p among layers with d > 0 (`"p_value"`).
+Choosing the layer and measuring its effect on the same items overstates the effect, so by default
+(`evaluation.selection_split = 0.5`) the layer is chosen on half of the items and the reported
+numbers come from the other half. `metrics.json` also reports:
 
-Generated eval items are paired: both poles answer the same `eval_questions`, and a question
-moves both of its answers the same way. So in shared and opposed modes (`eval_paired` in
-`metrics.json`) the split, the bootstrap and the permutations keep each question's two answers
-together, and p-values come from the paired t-test; a question whose answer is empty on one pole
-is left out on both. Splitting the poles independently would let a question help pick the layer
-on one pole and then be measured on the other, which biases the held-out d (toward negative
-values when there is no effect). Eval texts, which are independent items, use Welch's test and
-independent resampling. `metrics.json` also reports:
-
-- `selection`: `"split"`, `"all_eval"` (too few items to split, or `selection_split = null`:
-  `best_d` is then post-selection and a warning says so) or `"fixed_layer"`.
-- `best_d_all_eval`: d at that layer on all eval items (post-selection).
+- `selection`: `"split"`, `"all_eval"` (too few items to split, or `selection_split = null`: the
+  numbers are then post-selection and a warning says so) or `"fixed_layer"`.
+- `best_d_all_eval`: d at that layer on all of the primary set's items (post-selection).
 - `sweep_max_d` and `sweep_max_d_perm_p`: the largest d over the searched layers and its
   permutation p-value (`evaluation.n_permutations`), which accounts for having searched them.
-  It is computed on all eval items: it tests whether any searched layer separates the poles, not
-  the held-out `best_d`.
+  It is computed on all items: it tests whether any searched layer separates the poles, not the
+  held-out `best_d`.
 
-`plots/sweep.png` shows d per layer on all eval items and, dashed, on the selection half that
-chose the layer.
+`plots/sweep.png` draws d per layer on the held-out items (the curve the reported d comes from,
+with that d marked), dashed on the items that chose the layer, and the random-direction null as a
+gray band; `plots/score_hist.png` the held-out items' scores at the layer, and `sweep_<set>.png`
+each other set.
 
 Without evaluation, `best_d`/`best_p` are null and the sweep is NaN.
 
@@ -403,14 +424,14 @@ neg_texts, as_reply_to=prompts)` measures references on texts read as replies to
 which is how generations are read; with `role` / `system_prompt` / `prompt` instead, it calibrates
 texts read that way.
 
-References only apply to inputs read the way they were measured (`reference_context` in
-`metrics.json`). In shared and opposed modes the evaluation's references come from completions
-generated in a chat, and they standardize `score_prompts`; texts read raw sit elsewhere entirely
-(in a 1B Llama, the eval texts of the negative pole came out on the positive side of the
-generated-completion midpoint). `score_texts` therefore standardizes only with references
-measured on texts read with the same role, system prompt and prompt: the evaluation's in texts
-mode, the transfer check's (the concept's eval texts) in shared and opposed modes. Without them it
-saves only raw projections, with a warning.
+References only apply to inputs read the way they were measured: each calibration says how its
+items were read. In shared and opposed modes the primary set's calibration comes from completions
+read as replies to their question, which is how `score_prompts` reads generations; texts read raw
+sit elsewhere entirely (in a 1B Llama, the eval texts of the negative pole came out on the positive
+side of the generated-completion midpoint). `score_texts` therefore standardizes only with a
+calibration measured on texts read with the same role, system prompt and prompt: the primary
+set's in texts mode, the `texts` set's in shared and opposed modes. Without one it saves only raw
+projections, with a warning.
 
 ### Steering
 
@@ -662,6 +683,8 @@ from concept_probe import (
     read_encoded,
     Readout,
     ReadContext,
+    evaluate_reading,
+    EvalSet,
     fit_directions,
     message_spans,
     ModelBundle,
@@ -737,6 +760,18 @@ GitHub Actions CI runs the same lightweight checks and also builds source and wh
 - **Training** also reports a threshold fitted on the selection half of the eval items, where a
   concept's `neutral_texts` fall, and can train on every token as a sample
   (`readout.read_mode = "assistant_tokens"`; eval items are then scored by their mean).
+- **Evaluation on named eval sets** (`metrics.json` `evaluation.sets`): each with d, p, a bootstrap
+  interval, the AUROC with its interval and the d random directions give on the same items
+  (`null_d95`, also drawn in `plots/sweep.png`); the primary set also has the accuracy with the
+  calibrated threshold. In shared and opposed modes the primary set now reads the eval completions
+  without the pole's system prompt (which inflated d); the old reading is the set
+  `eval_with_system_prompt` (`evaluation.primary_set` picks it), and eval texts are the set `texts`
+  (this replaces `transfer_eval`). `concept.eval_sets` adds more sets; `evaluation.eval_pairs` pairs
+  the eval texts; `label_shuffle` reports directions refitted with shuffled training labels. The
+  sweep plot draws the held-out curve the reported d comes from. `evaluate_reading`,
+  `compare_scorers` (a paired difference between two scorers) and `cross_reading` (probes read on
+  each other's sets) work on representations. `tensors.npz` holds the calibrations instead of
+  `score_center` and the other reference arrays.
 - **z in another context.** `score_prompts` and `multi_probe_score_prompts` say why `score_mean_z`
   is None (`z_missing`, and a warning), and `ConceptProbe.calibrate(...)` adds references for
   generated completions or for texts read another way.

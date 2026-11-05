@@ -142,21 +142,30 @@ def test_shared_mode_evaluates_on_completions_generated_like_the_training_ones(t
     np.testing.assert_allclose(t["eval_neg_scores_mat"][:, 0], [-1.0, -2 / 3], atol=1e-6)
 
 
-def test_eval_texts_of_a_shared_concept_are_a_transfer_check(tmp_path, monkeypatch):
+def _sets(metrics):
+    return metrics["evaluation"]["sets"]
+
+
+def _eval_calibration(t):
+    return next(c for c in json.loads(str(t["calibrations"][0])) if c["source"] == "evaluation")
+
+
+def test_eval_texts_of_a_shared_concept_are_an_eval_set_of_their_own(tmp_path, monkeypatch):
     _, metrics, t, events = _train(tmp_path, monkeypatch, "shared")
-    transfer = metrics["transfer_eval"]
-    assert (transfer["readout"]["role"], transfer["readout"]["system"]) == ("raw", None)
-    assert (transfer["n_pos"], transfer["n_neg"]) == (2, 2)
-    assert [e["text"] for e in events if e["event"] == "transfer_read_pos"] == ["^ppp", "^ppx"]
-    np.testing.assert_allclose(t["transfer_pos_scores_mat"][:, 0], [1.0, 2 / 3], atol=1e-6)
-    np.testing.assert_allclose(t["transfer_neg_scores_mat"][:, 0], [-1.0, -2 / 3], atol=1e-6)
-    assert transfer["d_at_best_layer"] == pytest.approx(float(t["transfer_sweep_d"][metrics["best_layer"]]), rel=1e-5)
+    texts = _sets(metrics)["texts"]
+    assert (texts["context"]["role"], texts["context"]["system"]) == ("raw", None)
+    assert (texts["n_pos"], texts["n_neg"]) == (2, 2)
+    assert [e["text"] for e in events if e["event"] == "texts_read_pos"] == ["^ppp", "^ppx"]
+    np.testing.assert_allclose(t["set_texts_pos_scores"][:, 0], [1.0, 2 / 3], atol=1e-6)
+    np.testing.assert_allclose(t["set_texts_neg_scores"][:, 0], [-1.0, -2 / 3], atol=1e-6)
+    assert texts["d"] == pytest.approx(float(t["set_texts_d"][metrics["best_layer"]]), rel=1e-5)
+    assert metrics["evaluation"]["primary"] == "eval" and "eval_with_system_prompt" in _sets(metrics)
 
 
 def test_choosing_the_layer_on_eval_texts_in_shared_mode_is_explicit_and_warned(tmp_path, monkeypatch):
     _, metrics, _, events = _train(tmp_path, monkeypatch, "shared", {"evaluation": {"eval_mode": "read"}})
     assert metrics["eval_mode_used"] == "read" and metrics["eval_readout"]["role"] == "raw"
-    assert metrics["transfer_eval"] is None
+    assert list(_sets(metrics)) == ["eval"]
     assert any("eval_mode=read with train_prompt_mode=shared" in w for w in _warnings(events))
 
 
@@ -175,7 +184,7 @@ def test_generated_completions_are_pooled_without_their_end_of_sequence_token(tm
 def test_texts_mode_reads_raw_texts_by_default(tmp_path, monkeypatch):
     _, metrics, t, events = _train(tmp_path, monkeypatch, "texts")
     assert (metrics["eval_readout"]["role"], metrics["eval_readout"]["system"]) == ("raw", None)
-    assert metrics["transfer_eval"] is None
+    assert list(_sets(metrics)) == ["eval"]
     assert [e["text"] for e in events if e["event"] == "train_read_pos"] == ["^pp", "^px"]
     assert [e["text"] for e in events if e["event"] == "eval_read_pos"] == ["^ppp", "^ppx"]
     np.testing.assert_allclose(t["train_pos_reps"][:, 0, 0], [1.0, 0.5])
@@ -186,17 +195,17 @@ def test_user_role_reads_texts_after_the_system_prompt(tmp_path, monkeypatch):
     _, metrics, t, events = _train(tmp_path, monkeypatch, "shared", {
         "prompts": {"neutral_system": "neutral"}, "training": {"train_text_role": "user"},
     })
-    readout = metrics["transfer_eval"]["readout"]
-    assert (readout["role"], readout["system"]) == ("user", "neutral")
-    assert [e["text"] for e in events if e["event"] == "transfer_read_pos"][0] == "^<s>neutral|<u>ppp|"
-    np.testing.assert_allclose(t["transfer_pos_scores_mat"][:, 0], [1.0, 2 / 3], atol=1e-6)  # text tokens only
+    context = _sets(metrics)["texts"]["context"]
+    assert (context["role"], context["system"]) == ("user", "neutral")
+    assert [e["text"] for e in events if e["event"] == "texts_read_pos"][0] == "^<s>neutral|<u>ppp|"
+    np.testing.assert_allclose(t["set_texts_pos_scores"][:, 0], [1.0, 2 / 3], atol=1e-6)  # text tokens only
 
 
 def test_assistant_role_reads_texts_as_the_reply(tmp_path, monkeypatch):
     tok, metrics, _, _ = _train(tmp_path, monkeypatch, "shared", {
         "prompts": {"neutral_system": "neutral"}, "training": {"train_text_role": "assistant"},
     })
-    assert metrics["transfer_eval"]["readout"]["role"] == "assistant"
+    assert _sets(metrics)["texts"]["context"]["role"] == "assistant"
     assert "^<s>neutral|<a>" in tok.rendered
 
 
@@ -308,23 +317,24 @@ def test_too_few_eval_items_to_split_fall_back_with_a_warning(tmp_path, monkeypa
 
 def test_item_and_token_references(tmp_path, monkeypatch):
     _, metrics, t, _ = _train(tmp_path, monkeypatch, "shared")
+    cal = _eval_calibration(t)
     # per item (a completion's mean): pos 1, 2/3; neg -1, -2/3
     pos, neg = np.array([1.0, 2 / 3]), np.array([-1.0, -2 / 3])
-    assert t["score_center"][0] == pytest.approx(0.0, abs=1e-6)
-    assert t["score_scale"][0] == pytest.approx(np.sqrt((pos.var(ddof=1) + neg.var(ddof=1)) / 2), rel=1e-5)
+    assert cal["center"][0] == pytest.approx(0.0, abs=1e-6)
+    assert cal["scale"][0] == pytest.approx(np.sqrt((pos.var(ddof=1) + neg.var(ddof=1)) / 2), rel=1e-5)
     # per token: pos tokens p p | p p x = 1 1 1 1 0; neg mirrored. Single tokens spread more than means.
     pos_tok = np.array([1.0, 1, 1, 1, 0])
-    assert t["token_center"][0] == pytest.approx(0.0, abs=1e-6)
-    assert t["token_scale"][0] == pytest.approx(pos_tok.std(ddof=1), rel=1e-5)
-    assert t["token_scale"][0] > t["score_scale"][0]
-    assert metrics["sigma_best_layer"] == pytest.approx(t["score_scale"][metrics["best_layer"]])
+    assert cal["token_center"][0] == pytest.approx(0.0, abs=1e-6)
+    assert cal["token_scale"][0] == pytest.approx(pos_tok.std(ddof=1), rel=1e-5)
+    assert cal["token_scale"][0] > cal["scale"][0]
+    assert metrics["sigma_best_layer"] == pytest.approx(cal["scale"][metrics["best_layer"]])
     assert t["resid_norm"].shape == (2,) and np.all(t["resid_norm"] > 0)
 
 
 def test_without_eval_the_metrics_are_null_not_zero(tmp_path, monkeypatch):
     _, metrics, t, _ = _train(tmp_path, monkeypatch, "texts", concept=_concept(eval_pos_texts=[], eval_neg_texts=[]))
     assert metrics["best_d"] is None and metrics["best_p"] is None and metrics["selection"] is None
-    assert np.all(np.isnan(t["sweep_d"])) and np.all(np.isnan(t["token_scale"]))
+    assert np.all(np.isnan(t["sweep_d"])) and json.loads(str(t["calibrations"][0])) == []
 
 
 def test_few_eval_items_warn(tmp_path, monkeypatch):

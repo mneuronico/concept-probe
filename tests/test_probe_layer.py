@@ -254,7 +254,7 @@ def test_training_with_another_estimator(tmp_path):
 def test_training_reports_a_threshold_and_where_neutral_texts_fall(tmp_path):
     _, probe, metrics = _train(tmp_path, neutral_texts=["xyz", "zy x", "yy", "x z y"])
     assert metrics["threshold"]["layer"] == metrics["best_layer"]
-    assert metrics["threshold"]["fit_on"] == "the selection part of the eval items"
+    assert metrics["threshold"]["fit_on"] == "the selection part of the primary set"
     report = metrics["neutral_texts"]
     assert report["n"] == 4 and report["calibration"] == "evaluation" and np.isfinite(report["z_at_best_layer"])
 

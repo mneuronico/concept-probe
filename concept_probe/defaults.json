@@ -18,7 +18,8 @@
     "eval_neg_texts": [],
     "train_pos_texts": [],
     "train_neg_texts": [],
-    "neutral_texts": []
+    "neutral_texts": [],
+    "eval_sets": {}
   },
   "prompts": {
     "train_questions": [
@@ -101,10 +102,14 @@
     "eval_top_p": 0.9,
     "eval_mode": "auto",
     "eval_system": null,
+    "primary_set": "eval",
+    "eval_pairs": false,
     "gen_batch_size": null,
     "selection_split": 0.5,
     "n_permutations": 1000,
     "n_bootstrap": 1000,
+    "n_random_directions": 50,
+    "n_label_shuffles": "auto",
     "layer_selection": {
       "mode": "best",
       "layers": [],

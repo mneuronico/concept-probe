@@ -13,6 +13,8 @@ from .multi_probe import multi_probe_score_prompts
 from .inputs import Encoded, ReadContext, encode_text, message_spans
 from .directions import fit_directions, make_estimator, register_estimator
 from .linear_probe import Calibration
+from .evaluation import EvalSet, ReadingEvaluation, cross_reading, evaluate_reading, label_shuffle_control
+from .stats import accuracy, auroc, compare_scorers, random_directions_null
 from .modeling import ModelBundle, QUANTIZATION_LEVELS
 from .reading import EmptySpanError, Readout, Reps, read_encoded, read_texts
 from .record import Choice
@@ -61,6 +63,15 @@ __all__ = [
     "Encoded",
     "ReadContext",
     "Calibration",
+    "EvalSet",
+    "ReadingEvaluation",
+    "evaluate_reading",
+    "label_shuffle_control",
+    "cross_reading",
+    "auroc",
+    "accuracy",
+    "compare_scorers",
+    "random_directions_null",
     "fit_directions",
     "make_estimator",
     "register_estimator",

@@ -565,6 +565,13 @@ def render_batch_heatmap(entries: List[Tuple[str, List[str], List[float]]], out_
         f.write(html_doc)
 
 
+D_COLOR = "#2b6cb0"      # Cohen's d of the probe
+NULL_COLOR = "#9a9a9a"   # what random directions give
+P_COLOR = "#553c9a"      # p-values
+POS_COLOR = "#2b6cb0"    # the positive pole's items
+NEG_COLOR = "#dd8452"    # the negative pole's items
+
+
 def plot_sweep(
     sweep_d: Iterable[float],
     sweep_p: Iterable[float],
@@ -573,40 +580,66 @@ def plot_sweep(
     best_layer: Optional[int] = None,
     search_intervals: Optional[Iterable[Tuple[int, int]]] = None,
     selection_d: Optional[Iterable[float]] = None,
+    report_d: Optional[Iterable[float]] = None,
+    null_d95: Optional[Iterable[float]] = None,
+    best_d: Optional[float] = None,
+    title: Optional[str] = None,
 ) -> bool:
-    """d and p per layer on all eval items. ``selection_d`` (the d on the selection half of the
-    eval items, which chose ``best_layer``) is drawn dashed when given."""
+    """Cohen's d and its p per layer.
+
+    With ``report_d`` (the d on the held-out items, which the reported number comes from) the top
+    panel draws that curve, with the reported ``best_d`` marked on it, and ``selection_d`` (the
+    items that chose the layer) dashed; otherwise it draws ``sweep_d``, all eval items. ``null_d95``
+    (the 95th percentile of |d| over random directions on the same items) is the gray band: a d
+    inside it is what any direction would give. The bottom panel has the p-values on all items.
+    """
     try:
         import matplotlib.pyplot as plt
     except Exception:
         return False
 
-    d = np.array(list(sweep_d), dtype=np.float32)
+    d = np.array(list(sweep_d), dtype=np.float64)
     p = np.array(list(sweep_p), dtype=np.float64)
     layers = np.arange(len(d))
 
-    fig, ax = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+    fig, ax = plt.subplots(2, 1, figsize=(8, 6), sharex=True, gridspec_kw={"height_ratios": [2, 1]})
     if search_intervals:
         for lo, hi in search_intervals:
             for axis in ax:
                 axis.axvspan(lo - 0.5, hi + 0.5, color="#f2e6b0", alpha=0.35, zorder=0)
-    ax[0].plot(layers, d, color="#cc3d3d", label="all eval items")
-    if selection_d is not None:
-        sel = np.array(list(selection_d), dtype=np.float32)
-        ax[0].plot(layers, sel, color="#cc3d3d", linestyle="--", alpha=0.6, label="selection half (chose the layer)")
-        ax[0].legend(fontsize=8)
+    if null_d95 is not None:
+        null = np.array(list(null_d95), dtype=np.float64)
+        ax[0].fill_between(layers, 0, null, color=NULL_COLOR, alpha=0.35, linewidth=0,
+                           label="random directions (95th percentile of |d|)")
+    if report_d is not None:
+        ax[0].plot(layers, np.array(list(report_d), dtype=np.float64), color=D_COLOR,
+                   label="held-out items (the reported d)")
+        if selection_d is not None:
+            ax[0].plot(layers, np.array(list(selection_d), dtype=np.float64), color=D_COLOR, linestyle="--",
+                       alpha=0.6, label="selection items (chose the layer)")
+    else:
+        ax[0].plot(layers, d, color=D_COLOR, label="eval items")
+        if selection_d is not None:
+            ax[0].plot(layers, np.array(list(selection_d), dtype=np.float64), color=D_COLOR, linestyle="--",
+                       alpha=0.6, label="selection items (chose the layer)")
+    if best_layer is not None and best_d is not None and np.isfinite(best_d):
+        ax[0].plot([best_layer], [best_d], "o", color=D_COLOR)
+        ax[0].annotate(f"d = {best_d:.2f}", (best_layer, best_d), textcoords="offset points", xytext=(6, 6),
+                       fontsize=9, color=D_COLOR)
+    ax[0].axhline(0, color="#444444", linewidth=0.6)
     ax[0].set_ylabel("Cohen's d")
-    ax[0].set_title("Layer sweep")
+    ax[0].legend(fontsize=8, loc="best")
+    ax[0].set_title(title or "Cohen's d per layer")
 
     safe_p = np.where(p <= 0, np.nan, p)
-    ax[1].plot(layers, safe_p, color="#3d5acc")
+    ax[1].plot(layers, safe_p, color=P_COLOR)
     ax[1].set_yscale("log")
-    ax[1].set_ylabel("p-value (log)")
+    ax[1].set_ylabel("p-value (all items)")
     ax[1].set_xlabel("Layer")
 
     if best_layer is not None:
         for axis in ax:
-            axis.axvline(best_layer, color="#222222", linestyle=":", linewidth=1.5, alpha=0.9)
+            axis.axvline(best_layer, color="#222222", linestyle=":", linewidth=1.2, alpha=0.9)
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=160)
@@ -614,7 +647,9 @@ def plot_sweep(
     return True
 
 
-def plot_score_hist(pos_scores: Iterable[float], neg_scores: Iterable[float], out_path: str) -> bool:
+def plot_score_hist(pos_scores: Iterable[float], neg_scores: Iterable[float], out_path: str, *,
+                    title: Optional[str] = None, labels: Tuple[str, str] = ("positive", "negative")) -> bool:
+    """Histograms of the two poles' scores at one layer; ``title`` should say which items and layer."""
     try:
         import matplotlib.pyplot as plt
     except Exception:
@@ -622,11 +657,13 @@ def plot_score_hist(pos_scores: Iterable[float], neg_scores: Iterable[float], ou
 
     pos = np.array(list(pos_scores), dtype=np.float32)
     neg = np.array(list(neg_scores), dtype=np.float32)
-    fig, ax = plt.subplots(1, 1, figsize=(6, 4))
-    ax.hist(pos, bins=20, alpha=0.6, color="#cc3d3d", label="pos")
-    ax.hist(neg, bins=20, alpha=0.6, color="#3d5acc", label="neg")
-    ax.set_xlabel("Probe score")
-    ax.set_ylabel("Count")
+    fig, ax = plt.subplots(1, 1, figsize=(6.5, 4))
+    bins = np.histogram_bin_edges(np.concatenate([pos, neg]), bins=20) if len(pos) + len(neg) else 20
+    ax.hist(pos, bins=bins, alpha=0.6, color=POS_COLOR, label=labels[0])
+    ax.hist(neg, bins=bins, alpha=0.6, color=NEG_COLOR, label=labels[1])
+    ax.set_xlabel("Probe score (raw projection)")
+    ax.set_ylabel("Items")
+    ax.set_title(title or "Probe scores", fontsize=10)
     ax.legend()
     fig.tight_layout()
     fig.savefig(out_path, dpi=160)

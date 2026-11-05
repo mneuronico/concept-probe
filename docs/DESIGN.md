@@ -400,6 +400,16 @@ usar el lector nuevo.
 **Etapa 3 — Evaluar la lectura (capas 6a y 6b, y sus gráficos).** Grupos (13), 29, 18, 16, 17, 26
 (acierto en las métricas), 31, sets de evaluación con nombre, etiquetas mezcladas.
 - Al terminar: `metrics.json` y el gráfico por capa traen el nulo, y `shared/evaluate.py` sobra.
+- *Hecha el 2026-11-05 (`evaluation.py`, y AUROC, acierto, intervalos, comparación apareada y nulo
+  en `stats.py`). Los números de los modos con textos no cambiaron; en los modos con un system
+  prompt por polo el set principal pasó a leer las respuestas sin ese prompt (D2): en el modelo de
+  los tests, d de 20.4 a 13.8, y con `evaluation.primary_set = "eval_with_system_prompt"` vuelve el
+  20.4 de antes. Probada con Qwen 0.5B en modo compartido: en ese montaje chico la probe dio d 0.62
+  contra 0.84 de las direcciones al azar y 0.66 con las etiquetas mezcladas, y el gráfico lo muestra.
+  Cambios respecto de la propuesta: el apareamiento es un `paired` por set, no grupos generales
+  (alcanza para los pares de preguntas y los pares mínimos; los tokens como muestra se puntúan por
+  texto); el acierto se reporta solo para el set principal, porque el umbral calibrado no vale en
+  otro contexto de lectura; `transfer_eval` desaparece de `metrics.json` (es el set `texts`).*
 
 **Etapa 4 — Intervenir, generar y puntuar (capas 4 y 5).** Intervenciones (sumar, borrar,
 trasplantar, rotar, combinar), entradas 22, 21, 30 y 27. `score_prompts` y

@@ -57,6 +57,9 @@ class ConceptSpec:
     train_neg_texts: List[PromptLike] = field(default_factory=list)
     # Texts without the concept: training reports where they fall (z = 0 is not "without the concept").
     neutral_texts: List[PromptLike] = field(default_factory=list)
+    # More eval sets, measured at the probe's layer: {name: {"pos": [...], "neg": [...], and optionally
+    # "paired", "role", "system", "prompt", "description"}}; read like the eval texts by default.
+    eval_sets: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     @classmethod
     def from_config(cls, config: Dict[str, Any], overrides: Optional[Dict[str, Any]] = None) -> "ConceptSpec":
@@ -82,6 +85,7 @@ class ConceptSpec:
             train_pos_texts=list(base.get("train_pos_texts", [])),
             train_neg_texts=list(base.get("train_neg_texts", [])),
             neutral_texts=list(base.get("neutral_texts", [])),
+            eval_sets=dict(base.get("eval_sets") or {}),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -96,4 +100,5 @@ class ConceptSpec:
             "train_pos_texts": list(self.train_pos_texts),
             "train_neg_texts": list(self.train_neg_texts),
             "neutral_texts": list(self.neutral_texts),
+            "eval_sets": dict(self.eval_sets),
         }

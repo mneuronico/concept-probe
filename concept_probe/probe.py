@@ -25,6 +25,7 @@ from .modeling import (
 from .record import Choice, announce
 from .settings import settings
 from .directions import estimator_spec, fit_directions, make_estimator
+from .evaluation import EvalSet, ReadingEvaluation, evaluate_reading, label_shuffle_control
 from .linear_probe import Calibration, _token_references, calibrations_from_tensors, sigmoid, steer_directions_for
 from .directions import (  # re-exported: they lived here before
     DIRECTION_NORMALIZATIONS,
@@ -883,7 +884,7 @@ class ConceptProbe:
             run_choices.extend(fresh)
             announce(fresh, console=self.console is not None and self.console.enabled, logger=self.logger)
 
-        def pooled_reps(ids_list, starts, ends, mode, last_k, label, vectors=None):
+        def pooled_reps(ids_list, starts, ends, mode, last_k, label, vectors=None, report_dropped=True):
             """Pooled reps ``(n, layers, dim)`` and mean token norms ``(n, layers)`` over each span, and,
             given ``vectors``, each item's per-token projections ``(n_tokens, layers)``. The items go
             through the model ``readout.batch_size`` at a time, and through the representations cache
@@ -898,7 +899,7 @@ class ConceptProbe:
                            cache_dtype=rep_cache_dtype, identity=self.identity, skip_empty=True,
                            label=label)[0]
             note(result.choices)
-            if result.skipped:
+            if result.skipped and report_dropped:
                 dropped_items[label] = sorted(result.skipped)
                 self._warn(
                     f"{label}: items {dropped_items[label]} have no tokens to pool (an empty completion or text) "
@@ -1094,63 +1095,114 @@ class ConceptProbe:
         steer_differs = steer_vectors is not concept_vectors
         if steer_choice is not None:
             note([steer_choice])
-        steer_scores: Dict[str, np.ndarray] = {}
-
-        # ---- Evaluation: one score per eval item and layer, on the same kind of data as training.
-        # Texts mode evaluates on eval texts. Shared/opposed mode evaluates on completions generated
-        # for eval_questions, read like the training completions; eval texts given with such a concept
-        # are read too, but only to report how the vector transfers to them (not to pick the layer).
-        eval_pos_scores_mat = np.zeros((0, num_layers), dtype=np.float32)
-        eval_neg_scores_mat = np.zeros((0, num_layers), dtype=np.float32)
-        transfer_pos_scores_mat = np.zeros((0, num_layers), dtype=np.float32)
-        transfer_neg_scores_mat = np.zeros((0, num_layers), dtype=np.float32)
-        eval_pos_tokens: List[np.ndarray] = []
-        eval_neg_tokens: List[np.ndarray] = []
-        transfer_pos_tokens: List[np.ndarray] = []
-        transfer_neg_tokens: List[np.ndarray] = []
+        # ---- Evaluation (layer 6b): named sets of eval items. The primary one chooses the layer and
+        # gives the reported numbers; the others are measured at that layer.
+        # - texts mode: the eval texts ("eval").
+        # - shared/opposed mode: completions generated for eval_questions under each pole's system
+        #   prompt. The primary set reads them as replies to their question without that system prompt
+        #   (decision D2: the prompt itself pushes the score toward its pole); reading them after it, as
+        #   they were generated, is "eval_with_system_prompt"; the eval texts, if any, are "texts".
+        # - every set in concept.eval_sets is read like the eval texts.
         eval_prompts = list(prompts_cfg["eval_questions"])
-        # Generated eval items are pairs: row i of both poles answers eval question eval_question_idx[i].
-        eval_paired = False
+        neutral_system = prompts_cfg.get("neutral_system")
+        primary_name = str(eval_cfg.get("primary_set", "eval"))
+        texts_paired = bool(eval_cfg.get("eval_pairs", False))
+        eval_sets: List[EvalSet] = []
+        set_tokens: Dict[str, Tuple[List[np.ndarray], List[np.ndarray]]] = {}
         eval_question_idx: List[int] = []
-        did_eval = False
         eval_readout: Optional[Dict[str, Any]] = None
-        transfer_readout: Optional[Dict[str, Any]] = None
-        text_readout = {
-            "role": text_role,
-            "prompt": text_prompt,
-            "system": eval_system,
-            "mode": eval_readout_mode,
-            "last_k": eval_readout_last_k,
-        }
+        text_readout = {"role": text_role, "prompt": text_prompt, "system": eval_system, "mode": eval_readout_mode,
+                        "last_k": eval_readout_last_k}
 
-        def read_eval_texts(event: str) -> Dict[str, Tuple[np.ndarray, List[np.ndarray]]]:
-            """Per-item scores ``(n, layers)`` and per-item token projections of the eval texts."""
-            out = {}
-            for side, texts in (("pos", self.concept.eval_pos_texts), ("neg", self.concept.eval_neg_texts)):
+        def keep_pairs(name: str, kept_pos: List[int], kept_neg: List[int]) -> List[int]:
+            """The pairs whose two items were both read; the other item of a pair with an empty one is
+            left out too, so the poles stay paired."""
+            both = sorted(set(kept_pos) & set(kept_neg))
+            for side, kept in (("pos", kept_pos), ("neg", kept_neg)):
+                unpaired = sorted(set(kept) - set(both))
+                if unpaired:
+                    dropped_items.setdefault(f"{name}_{side}", []).extend(unpaired)
+                    self._warn(f"{name}_{side}: items {unpaired} are left out because the other pole's item of their "
+                               "pair is empty; the poles are compared pair by pair.")
+            return both
+
+        def text_set(name: str, pos_texts: List[PromptLike], neg_texts: List[PromptLike], *, paired: bool,
+                     description: str, role: str = text_role, system: Optional[str] = eval_system,
+                     prompt: Optional[str] = text_prompt) -> EvalSet:
+            """Read two lists of texts as an eval set."""
+            if paired and len(pos_texts) != len(neg_texts):
+                raise ValueError(f"eval set {name!r} is paired but has {len(pos_texts)} positive and "
+                                 f"{len(neg_texts)} negative texts.")
+            sides = {}
+            for side, texts in (("pos", pos_texts), ("neg", neg_texts)):
                 ids_list, starts, ends = [], [], []
                 for i, s in enumerate(texts):
-                    input_ids, text_start, text_end = _encode_text_for_read(
-                        tokenizer,
-                        s,
-                        eval_system,
-                        role=text_role,
-                        prompt=text_prompt,
-                        warn=self._warn,
-                        warn_prefix=f"eval_{side}_texts[{i}]",
-                    )
+                    input_ids, a, b = _encode_text_for_read(tokenizer, s, system, role=role, prompt=prompt, warn=self._warn,
+                                                            warn_prefix=f"{name}_{side}_texts[{i}]")
                     ids_list.append(input_ids[0])
-                    starts.append(text_start)
-                    ends.append(text_end)
-                    self.logger.log(
-                        f"{event}_{side}", {"i": i, "text": tokenizer.decode(input_ids[0], skip_special_tokens=False)}
-                    )
-                reps, _, tokens, _ = pooled_reps(ids_list, starts, ends, eval_readout_mode, eval_readout_last_k,
-                                                 f"{event.split('_')[0]}_{side}", vectors=concept_vectors)
-                out[side] = (np.einsum("nld,ld->nl", reps, concept_vectors).astype(np.float32), tokens)
-                if steer_differs:
-                    steer_scores[f"{event}_{side}"] = np.einsum("nld,ld->nl", reps, steer_vectors)
-                self._status(f"Read {len(texts)} eval {side} texts")
-            return out
+                    starts.append(a)
+                    ends.append(b)
+                    self.logger.log(f"{name}_read_{side}",
+                                    {"i": i, "text": tokenizer.decode(input_ids[0], skip_special_tokens=False)})
+                sides[side] = pooled_reps(ids_list, starts, ends, eval_readout_mode, eval_readout_last_k,
+                                          f"{name}_{side}", vectors=concept_vectors)
+                self._status(f"Read {len(texts)} {name} {side} texts")
+            (rp, _, tp, kp), (rn, _, tn, kn) = sides["pos"], sides["neg"]
+            if paired:
+                both = keep_pairs(name, kp, kn)
+                rp, tp = rp[[kp.index(i) for i in both]], [tp[kp.index(i)] for i in both]
+                rn, tn = rn[[kn.index(i) for i in both]], [tn[kn.index(i)] for i in both]
+            set_tokens[name] = (tp, tn)
+            ctx = ReadContext(kind="text", role=role, system=system or None, prompt=prompt, readout=eval_readout_mode)
+            return EvalSet(name, rp, rn, context=ctx, paired=paired, description=description)
+
+        def generated_sets() -> None:
+            """The eval completions, read without and with each pole's system prompt (see above)."""
+            nonlocal eval_question_idx, eval_readout
+            eval_bs = eval_cfg.get("gen_batch_size")
+            eval_bs = gen_bs if eval_bs is None else int(eval_bs)
+            read: Dict[str, Dict[str, Any]] = {"eval": {}, "eval_with_system_prompt": {}}
+            for side, system in (("pos", self.concept.pos_system), ("neg", self.concept.neg_system)):
+                results = generate_batch(model, tokenizer, system, eval_prompts, eval_cfg["eval_max_new_tokens"],
+                                         eval_cfg["eval_greedy"], temperature=eval_cfg.get("eval_temperature", 0.7),
+                                         top_p=eval_cfg.get("eval_top_p", 0.9), batch_size=eval_bs, warn=self._warn,
+                                         warn_prefix=f"eval_questions ({side}_system)")
+                ends = [_completion_end(ids, plen, eos_ids) for ids, plen in results]
+                plain_ids, plain_starts = [], []
+                for i, ((ids, plen), end) in enumerate(zip(results, ends)):
+                    self.logger.log(f"eval_gen_{side}", {
+                        "i": i, "question": eval_prompts[i], "text": tokenizer.decode(ids, skip_special_tokens=False),
+                        "completion": tokenizer.decode(ids[plen:], skip_special_tokens=True)})
+                    # the same completion tokens, after the question alone
+                    messages, _ = _normalize_messages(eval_prompts[i], neutral_system)
+                    prompt_ids = apply_chat(tokenizer, messages, add_generation_prompt=True)[0]
+                    plain_ids.append(torch.cat([prompt_ids, ids[plen:end].to(prompt_ids.dtype)]))
+                    plain_starts.append(int(prompt_ids.shape[-1]))
+                read["eval"][side] = pooled_reps(plain_ids, plain_starts, [int(x.shape[-1]) for x in plain_ids],
+                                                 eval_readout_mode, eval_readout_last_k, f"eval_{side}",
+                                                 vectors=concept_vectors)
+                read["eval_with_system_prompt"][side] = pooled_reps(
+                    [ids for ids, _ in results], [plen for _, plen in results], ends, eval_readout_mode,
+                    eval_readout_last_k, f"eval_with_system_prompt_{side}", vectors=concept_vectors,
+                    report_dropped=False)  # the same completions: their empty ones are already reported
+            # Keep the questions answered on both poles, so the two poles stay paired by question.
+            eval_question_idx = keep_pairs("eval", read["eval"]["pos"][3], read["eval"]["neg"][3])
+            descriptions = {
+                "eval": "completions generated for eval_questions under each pole's system prompt, read as replies "
+                        "to the question alone",
+                "eval_with_system_prompt": "the same completions read after the pole's system prompt they were "
+                                           "generated with (the system prompt pushes the score toward its pole)",
+            }
+            for name, sides in read.items():
+                (rp, _, tp, kp), (rn, _, tn, kn) = sides["pos"], sides["neg"]
+                rows_p, rows_n = [kp.index(q) for q in eval_question_idx], [kn.index(q) for q in eval_question_idx]
+                set_tokens[name] = ([tp[r] for r in rows_p], [tn[r] for r in rows_n])
+                context = ReadContext.generated(eval_readout_mode)
+                eval_sets.append(EvalSet(name, rp[rows_p], rn[rows_n], context=context, paired=True,
+                                         description=descriptions[name]))
+            eval_readout = {"role": "assistant", "source": descriptions[primary_name] if primary_name in descriptions
+                            else descriptions["eval"], "system": neutral_system if primary_name == "eval" else "pole",
+                            "mode": eval_readout_mode, "last_k": eval_readout_last_k}
 
         if eval_cfg.get("do_eval", True):
             if eval_mode == "auto":
@@ -1165,7 +1217,6 @@ class ConceptProbe:
                         "pos_system vs neg_system, which texts-mode concepts typically leave identical)."
                     )
                     eval_mode = "skip"
-
             if eval_mode == "read":
                 if eval_texts_given:
                     self._status("[Phase 3/4] Reading eval texts")
@@ -1186,13 +1237,8 @@ class ConceptProbe:
                                 f"mode: eval texts are pooled with readout.train_mode={readout['train_mode']}, "
                                 "the readout the vector was trained with."
                             )
-                    read = read_eval_texts("eval_read")
-                    eval_pos_scores_mat, eval_pos_tokens = read["pos"]
-                    eval_neg_scores_mat, eval_neg_tokens = read["neg"]
-                    if steer_differs:
-                        steer_scores["eval_pos"] = steer_scores["eval_read_pos"]
-                        steer_scores["eval_neg"] = steer_scores["eval_read_neg"]
-                    did_eval = True
+                    eval_sets.append(text_set("eval", self.concept.eval_pos_texts, self.concept.eval_neg_texts,
+                                              paired=texts_paired, description="the concept's eval texts"))
                     eval_readout = dict(text_readout)
                 else:
                     self._warn("eval_mode=read but eval_pos_texts/eval_neg_texts are empty.")
@@ -1206,80 +1252,28 @@ class ConceptProbe:
                     )
                 if len(eval_prompts) > 0:
                     self._status("[Phase 3/4] Generating eval completions")
-                    eval_bs = eval_cfg.get("gen_batch_size")
-                    eval_bs = gen_bs if eval_bs is None else int(eval_bs)
-                    side_scores = {}
-                    for side, system in (("pos", self.concept.pos_system), ("neg", self.concept.neg_system)):
-                        results = generate_batch(
-                            model,
-                            tokenizer,
-                            system,
-                            eval_prompts,
-                            eval_cfg["eval_max_new_tokens"],
-                            eval_cfg["eval_greedy"],
-                            temperature=eval_cfg.get("eval_temperature", 0.7),
-                            top_p=eval_cfg.get("eval_top_p", 0.9),
-                            batch_size=eval_bs,
-                            warn=self._warn,
-                            warn_prefix=f"eval_questions ({side}_system)",
-                        )
-                        for i, (ids, plen) in enumerate(results):
-                            self.logger.log(
-                                f"eval_gen_{side}",
-                                {
-                                    "i": i,
-                                    "question": eval_prompts[i],
-                                    "text": tokenizer.decode(ids, skip_special_tokens=False),
-                                    "completion": tokenizer.decode(ids[plen:], skip_special_tokens=True),
-                                },
-                            )
-                        reps, _, tokens, kept = pooled_reps(
-                            [ids for ids, _ in results],
-                            [plen for _, plen in results],
-                            [_completion_end(ids, plen, eos_ids) for ids, plen in results],
-                            eval_readout_mode,
-                            eval_readout_last_k,
-                            f"eval_{side}",
-                            vectors=concept_vectors,
-                        )
-                        side_scores[side] = (np.einsum("nld,ld->nl", reps, concept_vectors).astype(np.float32), tokens, kept)
-                        if steer_differs:
-                            steer_scores[f"eval_gen_{side}"] = np.einsum("nld,ld->nl", reps, steer_vectors)
-                    # Keep the questions answered on both poles, so the two poles stay paired.
-                    eval_question_idx = sorted(set(side_scores["pos"][2]) & set(side_scores["neg"][2]))
-                    for side in ("pos", "neg"):
-                        unpaired = sorted(set(side_scores[side][2]) - set(eval_question_idx))
-                        if unpaired:
-                            dropped_items.setdefault(f"eval_{side}", []).extend(unpaired)
-                            self._warn(
-                                f"eval_{side}: questions {unpaired} are left out because the other pole's "
-                                "completion is empty; the poles are compared question by question."
-                            )
-                    rows = {side: [side_scores[side][2].index(q) for q in eval_question_idx] for side in ("pos", "neg")}
-                    eval_pos_scores_mat = side_scores["pos"][0][rows["pos"]]
-                    eval_neg_scores_mat = side_scores["neg"][0][rows["neg"]]
-                    eval_pos_tokens = [side_scores["pos"][1][r] for r in rows["pos"]]
-                    eval_neg_tokens = [side_scores["neg"][1][r] for r in rows["neg"]]
-                    if steer_differs:
-                        steer_scores["eval_pos"] = steer_scores["eval_gen_pos"][rows["pos"]]
-                        steer_scores["eval_neg"] = steer_scores["eval_gen_neg"][rows["neg"]]
-                    eval_paired = True
-                    did_eval = len(eval_question_idx) > 0
-                    eval_readout = {
-                        "role": "assistant",
-                        "source": "completions generated for eval_questions under pos_system/neg_system",
-                        "mode": eval_readout_mode,
-                        "last_k": eval_readout_last_k,
-                    }
+                    generated_sets()
                 if eval_texts_given and train_prompt_mode != "texts":
-                    self._status("Reading eval texts (transfer check)")
-                    read = read_eval_texts("transfer_read")
-                    (transfer_pos_scores_mat, transfer_pos_tokens), (transfer_neg_scores_mat, transfer_neg_tokens) = (
-                        read["pos"], read["neg"]
-                    )
-                    transfer_readout = dict(text_readout)
+                    self._status("Reading eval texts")
+                    eval_sets.append(text_set(
+                        "texts", self.concept.eval_pos_texts, self.concept.eval_neg_texts, paired=texts_paired,
+                        description="the concept's eval texts, read on their own: whether the direction finds the concept "
+                                    "outside the chat it was trained in"))
+            if eval_mode != "skip":
+                for name, spec in (getattr(self.concept, "eval_sets", None) or {}).items():
+                    eval_sets.append(text_set(
+                        name, list(spec["pos"]), list(spec["neg"]), paired=bool(spec.get("paired", False)),
+                        description=str(spec.get("description", f"eval set {name}")),
+                        role=spec.get("role", text_role), system=spec.get("system", eval_system),
+                        prompt=spec.get("prompt", text_prompt)))
 
-        n_eval_pos, n_eval_neg = eval_pos_scores_mat.shape[0], eval_neg_scores_mat.shape[0]
+        main_set = next((s for s in eval_sets if s.name == primary_name), None)
+        if eval_sets and main_set is None:
+            raise ValueError(f"evaluation.primary_set={primary_name!r} is not among the eval sets "
+                             f"{[s.name for s in eval_sets]}.")
+        did_eval = main_set is not None and len(main_set.pos) > 0 and len(main_set.neg) > 0
+        n_eval_pos = len(main_set.pos) if main_set is not None else 0
+        n_eval_neg = len(main_set.neg) if main_set is not None else 0
         if did_eval and min(n_eval_pos, n_eval_neg) < MIN_EVAL_ITEMS_PER_POLE:
             self._warn(
                 f"Only {n_eval_pos} positive and {n_eval_neg} negative eval items: the layer choice and best_d "
@@ -1298,180 +1292,72 @@ class ConceptProbe:
             self._warn(reason)
             self.logger.log("eval_skipped", {"reason": reason})
 
-        # ---- Layer sweep on all eval items (diagnostic curves and the plot).
-        P = eval_pos_scores_mat.astype(np.float64)
-        N = eval_neg_scores_mat.astype(np.float64)
-        nan_layers = np.full((num_layers,), np.nan)
-        if did_eval:
-            eval_pos_mean, eval_neg_mean = P.mean(axis=0), N.mean(axis=0)
-            eval_pos_std = P.std(axis=0, ddof=1) if n_eval_pos > 1 else nan_layers.copy()
-            eval_neg_std = N.std(axis=0, ddof=1) if n_eval_neg > 1 else nan_layers.copy()
-            sweep_d = _cohen_d_columns(P, N)
-            # float64: p-values of well-separated sets underflow to 0 in float32.
-            sweep_p = _welch_p_columns(P, N, paired=eval_paired)
-            # Scores are raw projections with an arbitrary offset. The midpoint between the eval
-            # poles and the pooled within-pole SD give each layer's zero and unit (scores_z).
-            score_center = 0.5 * (eval_pos_mean + eval_neg_mean)
-            score_scale = _pooled_sd_columns(P, N)
-            token_center, token_scale = _token_references(eval_pos_tokens, eval_neg_tokens)
-        else:
-            eval_pos_mean, eval_neg_mean, eval_pos_std, eval_neg_std = (nan_layers.copy() for _ in range(4))
-            sweep_d, sweep_p, score_center, score_scale = (nan_layers.copy() for _ in range(4))
-            token_center, token_scale = nan_layers.copy(), nan_layers.copy()
-
-        # ---- Best layer, and the statistics reported for it.
-        search_intervals = None
-        search_layers = None
-        search_default = None
+        # ---- The layer, and the numbers at it.
+        search_info = None
         search_intervals_plot = None
-        selection: Optional[str] = None
-        best_d = best_p = best_d_selection = best_d_all_eval = sweep_max_d = sweep_max_d_perm_p = None
-        selection_d: Optional[np.ndarray] = None
-        best_d_ci95: Optional[List[float]] = None
-        pos_sel = neg_sel = np.zeros((0,), dtype=np.int64)
-        est_pos, est_neg = P, N
-        if train_cfg["do_layer_sweep"] and did_eval:
-            search_info = _normalize_best_layer_search(train_cfg.get("best_layer_search"), num_layers)
-            search_intervals = search_info["intervals"]
-            search_layers = search_info["layers"]
-            search_default = search_info["is_default"]
-            if not search_default:
-                search_intervals_plot = search_intervals
-            selection = "all_eval"
-            if selection_split is not None:
-                split_rng = np.random.default_rng([seed, 1])
-                pos_sel, pos_est = _split_indices(n_eval_pos, selection_split, split_rng)
-                if eval_paired:
-                    # Both poles of a question go to the same side of the split; split independently,
-                    # a question can help pick the layer on one pole and then be measured on the other.
-                    neg_sel, neg_est = pos_sel, pos_est
-                else:
-                    neg_sel, neg_est = _split_indices(n_eval_neg, selection_split, split_rng)
-                if min(len(pos_sel), len(pos_est), len(neg_sel), len(neg_est)) < 2:
-                    self._warn(
-                        "evaluation.selection_split needs at least 2 eval items per pole on each side of the "
-                        "split; choosing the layer and reporting d on all eval items (post-selection)."
-                    )
-                    pos_sel = neg_sel = np.zeros((0,), dtype=np.int64)
-                else:
-                    selection = "split"
-            if selection == "split":
-                sel_d = _cohen_d_columns(P[pos_sel], N[neg_sel])
-                selection_d = sel_d
-                sel_p = _welch_p_columns(P[pos_sel], N[neg_sel], paired=eval_paired)
-                best_layer = _select_best_layer(sel_d, sel_p, search_layers, sweep_select)
-                best_d_selection = float(sel_d[best_layer])
-                est_pos, est_neg = P[pos_est], N[neg_est]
+        evaluation: Optional[ReadingEvaluation] = None
+        if did_eval:
+            fixed_layer = None
+            if train_cfg["do_layer_sweep"]:
+                search_info = _normalize_best_layer_search(train_cfg.get("best_layer_search"), num_layers)
+                if not search_info["is_default"]:
+                    search_intervals_plot = search_info["intervals"]
             else:
-                best_layer = _select_best_layer(sweep_d, sweep_p, search_layers, sweep_select)
-                self._warn(
-                    f"best_layer was chosen over {len(search_layers)} layers on the same eval items that "
-                    "measure best_d/best_p, so those are optimistic. Set evaluation.selection_split for a "
-                    "held-out estimate."
-                )
-            n_permutations = int(eval_cfg.get("n_permutations") or 0)
-            if n_permutations > 0:
-                sweep_max_d, sweep_max_d_perm_p = _max_d_permutation_p(
-                    P[:, search_layers], N[:, search_layers], n_permutations, np.random.default_rng([seed, 2]),
-                    paired=eval_paired,
-                )
+                fixed_layer = pick_layer(num_layers, train_cfg.get("layer_idx"), train_cfg.get("layer_frac", 0.75))
+            evaluation = evaluate_reading(
+                concept_vectors, eval_sets, primary=primary_name, layer=fixed_layer, selection_split=selection_split,
+                search_layers=None if search_info is None else search_info["layers"], sweep_select=sweep_select,
+                n_random=int(eval_cfg.get("n_random_directions", 50) or 0),
+                n_bootstrap=int(eval_cfg.get("n_bootstrap") or 0), n_permutations=int(eval_cfg.get("n_permutations") or 0),
+                seed=seed,
+            )
+            for message in evaluation.warnings:
+                self._warn(message)
+            best_layer = evaluation.layer
         else:
             best_layer = pick_layer(num_layers, train_cfg.get("layer_idx"), train_cfg.get("layer_frac", 0.75))
-            if did_eval:
-                selection = "fixed_layer"
+
+        # ---- Control: the same training with the labels shuffled.
+        label_shuffle = None
+        n_shuffles = eval_cfg.get("n_label_shuffles", "auto")
+        if n_shuffles == "auto":
+            n_shuffles = 10 if read_spec.get("kind") == "mean_diff" else 0
+            note([Choice("evaluation.n_label_shuffles", "auto", n_shuffles,
+                         "refitting the difference of means is quick, so ten shuffles run by default"
+                         if n_shuffles else
+                         f"refitting a {read_spec.get('kind')} direction for every shuffle is slow; set "
+                         "evaluation.n_label_shuffles to run them")])
+        if did_eval and int(n_shuffles) > 0:
+            report_pos, report_neg = evaluation.report_idx
+            label_shuffle = label_shuffle_control(read_estimator, reps_pos, reps_neg, main_set.pos[report_pos],
+                                                  main_set.neg[report_neg], best_layer, int(n_shuffles), seed=seed)
+
+        # ---- Calibrations (layer 3): the primary set's, with the threshold, and one for each set read
+        # in another context.
+        nan_layers = np.full((num_layers,), np.nan)
+        calibrations: List[Calibration] = []
         if did_eval:
-            best_d = float(cohen_d_np(est_pos[:, best_layer], est_neg[:, best_layer]))
-            best_p_arr = _welch_p_columns(est_pos[:, [best_layer]], est_neg[:, [best_layer]], paired=eval_paired)
-            best_p = None if np.isnan(best_p_arr[0]) else float(best_p_arr[0])
-            best_d_all_eval = float(sweep_d[best_layer])
-            best_d_ci95 = _bootstrap_d_ci(
-                est_pos[:, best_layer], est_neg[:, best_layer],
-                int(eval_cfg.get("n_bootstrap") or 0), np.random.default_rng([seed, 3]), paired=eval_paired,
-            )
-        notes = {
-            "split": "best_layer was chosen on the selection part of the eval items; best_d, best_p and "
-                     "best_d_ci95 are measured on the held-out rest (split by question when the poles are "
-                     "paired by question).",
-            "all_eval": "best_d/best_p are post-selection values: best_layer was chosen on the same eval items. "
-                        "Set evaluation.selection_split for a held-out estimate.",
-            "fixed_layer": "best_layer was fixed in advance (training.layer_idx / layer_frac); best_d/best_p use "
-                           "all eval items.",
-        }
-
-        def _opt(x: Any) -> Optional[float]:
-            return None if x is None or not np.isfinite(x) else float(x)
-
-        # ---- Transfer check: the eval texts of a shared/opposed concept, at the layer chosen above.
-        TP = transfer_pos_scores_mat.astype(np.float64)
-        TN = transfer_neg_scores_mat.astype(np.float64)
-        transfer_d, transfer_p = nan_layers.copy(), nan_layers.copy()
-        transfer_eval: Optional[Dict[str, Any]] = None
-        if TP.shape[0] > 0 and TN.shape[0] > 0:
-            transfer_d, transfer_p = _cohen_d_columns(TP, TN), _welch_p_columns(TP, TN)
-            transfer_eval = {
-                "readout": transfer_readout,
-                "n_pos": int(TP.shape[0]),
-                "n_neg": int(TN.shape[0]),
-                "d_at_best_layer": _opt(transfer_d[best_layer]),
-                "p_at_best_layer": _opt(transfer_p[best_layer]),
-                "d_ci95_at_best_layer": _bootstrap_d_ci(
-                    TP[:, best_layer], TN[:, best_layer],
-                    int(eval_cfg.get("n_bootstrap") or 0), np.random.default_rng([seed, 4]),
-                ),
-                "note": "The concept's eval texts, read on their own and scored with the vector at best_layer. "
-                        "They do not take part in choosing the layer. They test whether the vector finds the "
-                        "concept outside the generation context it was trained in (where the system prompt "
-                        "that defines the concept is in context).",
-            }
-
-        # z references only apply to inputs read in the context they were measured in: completions
-        # generated in a chat, or texts read with a given role and system prompt.
-        reference_context: Optional[Dict[str, Any]] = None
-        if did_eval:
-            reference_context = (
-                {"kind": "generated", "mode": eval_readout_mode} if eval_mode == "generate"
-                else _text_context(text_role, eval_system, text_prompt, eval_readout_mode)
-            )
-        transfer_refs: Optional[Dict[str, Any]] = None
-        if transfer_eval is not None:
-            t_token_center, t_token_scale = _token_references(transfer_pos_tokens, transfer_neg_tokens)
-            transfer_refs = {
-                "context": _text_context(text_role, eval_system, text_prompt, eval_readout_mode),
-                "score_center": 0.5 * (TP.mean(axis=0) + TN.mean(axis=0)),
-                "score_scale": _pooled_sd_columns(TP, TN),
-                "token_center": t_token_center,
-                "token_scale": t_token_scale,
-            }
-            transfer_eval["reference_context"] = transfer_refs["context"]
-
+            P, N = evaluation.main.pos_scores, evaluation.main.neg_scores
+            main_cal = Calibration.from_scores(P, N, main_set.context, pos_tokens=set_tokens[primary_name][0],
+                                               neg_tokens=set_tokens[primary_name][1], source="evaluation")
+            main_cal.threshold = evaluation.threshold
+            calibrations.append(main_cal)
+            for s in eval_sets:
+                result = evaluation.sets.get(s.name)
+                if s.name == primary_name or result is None or any(c.context.matches(s.context) for c in calibrations):
+                    continue
+                calibrations.append(Calibration.from_scores(
+                    result.pos_scores, result.neg_scores, s.context, pos_tokens=set_tokens[s.name][0],
+                    neg_tokens=set_tokens[s.name][1], source=s.name))
+        score_scale = calibrations[0].scale if calibrations else nan_layers.copy()
         sigma = float(score_scale[best_layer])
         # The unit of alpha_unit="sigma" is measured on the direction that steers (D1).
         steer_sigma = sigma
-        if steer_differs and did_eval and "eval_pos" in steer_scores:
-            steer_sigma = float(_pooled_sd_columns(steer_scores["eval_pos"][:, [best_layer]],
-                                                   steer_scores["eval_neg"][:, [best_layer]])[0])
-
-        # The references above as calibrations (layer 3): the evaluation's, with a classifier's
-        # threshold (entry 26), and the transfer check's.
-        calibrations: List[Calibration] = []
-        threshold: Optional[Dict[str, Any]] = None
-        if did_eval:
-            main_cal = Calibration(context=ReadContext.from_dict(reference_context), center=score_center,
-                                   scale=score_scale, token_center=token_center, token_scale=token_scale,
-                                   n_pos=n_eval_pos, n_neg=n_eval_neg, source="evaluation")
-            if selection == "split":
-                threshold = main_cal.add_threshold(P[pos_sel, best_layer], N[neg_sel, best_layer], best_layer,
-                                                   "the selection part of the eval items")
-            else:
-                threshold = main_cal.add_threshold(P[:, best_layer], N[:, best_layer], best_layer, "all eval items")
-            calibrations.append(main_cal)
-        if transfer_refs is not None:
-            calibrations.append(Calibration(
-                context=ReadContext.from_dict(transfer_refs["context"]), center=transfer_refs["score_center"],
-                scale=transfer_refs["score_scale"], token_center=transfer_refs["token_center"],
-                token_scale=transfer_refs["token_scale"], n_pos=int(TP.shape[0]), n_neg=int(TN.shape[0]),
-                source="transfer check",
-            ))
+        if steer_differs and did_eval:
+            steer_sigma = float(_pooled_sd_columns(
+                np.einsum("nd,d->n", main_set.pos[:, best_layer].astype(np.float64), steer_vectors[best_layer])[:, None],
+                np.einsum("nd,d->n", main_set.neg[:, best_layer].astype(np.float64), steer_vectors[best_layer])[:, None],
+            )[0])
 
         # Where texts without the concept fall (entry 19): read like the eval texts, reported with the
         # calibration of that reading, not used as the zero.
@@ -1487,13 +1373,14 @@ class ConceptProbe:
             neutral_scores = np.einsum("nld,ld->nl", reps_neutral, concept_vectors)
             text_ctx = ReadContext.from_dict(_text_context(text_role, eval_system, text_prompt, eval_readout_mode))
             cal = next((c for c in calibrations if c.context.matches(text_ctx)), None)
-            mean_score = float(neutral_scores[:, best_layer].mean())
-            neutral_report = {"n": int(neutral_scores.shape[0]), "mean_score_at_best_layer": mean_score,
+            neutral_report = {"n": int(neutral_scores.shape[0]),
+                              "mean_score_at_best_layer": float(neutral_scores[:, best_layer].mean()),
                               "z_at_best_layer": None, "z_sd_at_best_layer": None, "calibration": None}
             if cal is not None and cal.usable([best_layer]):
                 cal.add_neutral(neutral_scores)
                 z = cal.items_z(neutral_scores[:, [best_layer]], [best_layer])
-                neutral_report.update(z_at_best_layer=float(z.mean()), z_sd_at_best_layer=float(z.std(ddof=1)) if len(z) > 1 else None,
+                neutral_report.update(z_at_best_layer=float(z.mean()),
+                                      z_sd_at_best_layer=float(z.std(ddof=1)) if len(z) > 1 else None,
                                       calibration=cal.source)
             else:
                 neutral_report["note"] = ("no calibration was measured on texts read like these, so only the raw "
@@ -1506,123 +1393,112 @@ class ConceptProbe:
         self.steer_sigma = steer_sigma if np.isfinite(steer_sigma) else None
         self.resid_norm = resid_norm
         self.estimator, self.steer_estimator = read_spec, steer_spec
-        self.sweep_d = sweep_d
-        self.sweep_p = sweep_p
+        main = evaluation.main if evaluation is not None else None
+        self.sweep_d = main.d_curve if main is not None else nan_layers.copy()
+        self.sweep_p = main.p_curve if main is not None else nan_layers.copy()
+
+        def _opt(x: Any) -> Optional[float]:
+            return None if x is None or not np.isfinite(x) else float(x)
 
         self._status("[Phase 4/4] Sweep + artifact saving")
-        self.logger.log(
-            "sweep_full",
-            {
-                "best_layer": best_layer,
-                "best_d": _opt(best_d),
-                "best_p": _opt(best_p),
-                "selection": selection,
-                "best_layer_search": train_cfg.get("best_layer_search"),
-                "best_layer_search_intervals": search_intervals,
-                "best_layer_search_layers": search_layers,
-                "best_layer_search_default": search_default,
-                "sweep_d": sweep_d.tolist(),
-                "sweep_p": [_opt(x) for x in sweep_p],
-                "eval_pos_mean": eval_pos_mean.tolist(),
-                "eval_neg_mean": eval_neg_mean.tolist(),
-                "eval_pos_std": eval_pos_std.tolist(),
-                "eval_neg_std": eval_neg_std.tolist(),
-                "sigma_best_layer": _opt(sigma),
-            },
-        )
+        self.logger.log("sweep_full", {
+            "best_layer": best_layer, "best_d": None if main is None else main.d, "best_p": None if main is None else main.p,
+            "selection": None if evaluation is None else evaluation.selection,
+            "best_layer_search": train_cfg.get("best_layer_search"),
+            "sweep_d": self.sweep_d.tolist(), "sweep_p": [_opt(x) for x in self.sweep_p], "sigma_best_layer": _opt(sigma),
+        })
 
         plots_dir = os.path.join(self.run_dir, "plots")
         ensure_dir(plots_dir)
         if plot_cfg.get("enabled", True) and did_eval:
             if plot_cfg.get("sweep_plot", True):
                 ok = plot_sweep(
-                    sweep_d,
-                    sweep_p,
-                    os.path.join(plots_dir, "sweep.png"),
-                    best_layer=best_layer,
-                    search_intervals=search_intervals_plot,
-                    selection_d=selection_d,
+                    main.d_curve, main.p_curve, os.path.join(plots_dir, "sweep.png"), best_layer=best_layer,
+                    search_intervals=search_intervals_plot, selection_d=evaluation.selection_d_curve,
+                    report_d=evaluation.report_d_curve if evaluation.selection == "split" else None,
+                    null_d95=evaluation.report_null_d95_curve, best_d=main.d,
+                    title=f"{self.concept.name}: Cohen's d per layer on the {main_set.name} items",
                 )
                 self.logger.log("plot_sweep", {"ok": ok})
             if plot_cfg.get("score_hist", True):
+                rp, rn = evaluation.report_idx
                 ok = plot_score_hist(
-                    eval_pos_scores_mat[:, best_layer],
-                    eval_neg_scores_mat[:, best_layer],
+                    main.pos_scores[rp, best_layer], main.neg_scores[rn, best_layer],
                     os.path.join(plots_dir, "score_hist.png"),
+                    title=f"Scores at layer {best_layer}: {main.measured_on} of the {main_set.name} items "
+                          f"({len(rp)} {self.concept.pos_label}, {len(rn)} {self.concept.neg_label})",
+                    labels=(self.concept.pos_label, self.concept.neg_label),
                 )
                 self.logger.log("plot_score_hist", {"ok": ok})
-        if plot_cfg.get("enabled", True) and plot_cfg.get("sweep_plot", True) and transfer_eval is not None:
-            ok = plot_sweep(transfer_d, transfer_p, os.path.join(plots_dir, "transfer_sweep.png"), best_layer=best_layer)
-            self.logger.log("plot_transfer_sweep", {"ok": ok})
+            if plot_cfg.get("sweep_plot", True):
+                for name, result in evaluation.sets.items():
+                    if name == primary_name:
+                        continue
+                    ok = plot_sweep(result.d_curve, result.p_curve, os.path.join(plots_dir, f"sweep_{safe_slug(name)}.png"),
+                                    best_layer=best_layer, null_d95=result.null_d95_curve, best_d=result.d,
+                                    title=f"{self.concept.name}: Cohen's d per layer on the {name} items")
+                    self.logger.log("plot_sweep_set", {"set": name, "ok": ok})
 
-        tensors = {
+        tensors: Dict[str, Any] = {
             "best_layer": np.array([best_layer], dtype=np.int32),
             "best_v": concept_vectors[best_layer].astype(np.float32),
             "concept_vectors": concept_vectors.astype(np.float32),
-            "sweep_d": sweep_d.astype(np.float32),
-            "sweep_p": sweep_p.astype(np.float64),
-            "eval_pos_mean": eval_pos_mean.astype(np.float32),
-            "eval_neg_mean": eval_neg_mean.astype(np.float32),
-            "eval_pos_std": eval_pos_std.astype(np.float32),
-            "eval_neg_std": eval_neg_std.astype(np.float32),
-            "eval_pos_scores_mat": eval_pos_scores_mat.astype(np.float32),
-            "eval_neg_scores_mat": eval_neg_scores_mat.astype(np.float32),
-            "eval_selection_pos_idx": np.asarray(pos_sel, dtype=np.int32),
-            "eval_selection_neg_idx": np.asarray(neg_sel, dtype=np.int32),
-            "score_center": score_center.astype(np.float64),
-            "score_scale": score_scale.astype(np.float64),
-            "token_center": token_center.astype(np.float64),
-            "token_scale": token_scale.astype(np.float64),
-            "reference_context": np.array([json.dumps(reference_context)]),
-            "transfer_references": np.array([json.dumps(
-                None if transfer_refs is None
-                else {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in transfer_refs.items()}
-            )]),
-            "eval_paired": np.array([eval_paired]),
-            "eval_question_idx": np.asarray(eval_question_idx, dtype=np.int32),
+            "sweep_d": self.sweep_d.astype(np.float32),
+            "sweep_p": self.sweep_p.astype(np.float64),
             "resid_norm": resid_norm.astype(np.float64),
-            "transfer_pos_scores_mat": transfer_pos_scores_mat.astype(np.float32),
-            "transfer_neg_scores_mat": transfer_neg_scores_mat.astype(np.float32),
-            "transfer_sweep_d": transfer_d.astype(np.float32),
-            "transfer_sweep_p": transfer_p.astype(np.float64),
             "steer_vectors": np.asarray(steer_vectors, dtype=np.float32),
             "steer_sigma_best_layer": np.array([steer_sigma], dtype=np.float64),
             "calibrations": np.array([json.dumps([c.to_dict() for c in calibrations])]),
+            "eval_question_idx": np.asarray(eval_question_idx, dtype=np.int32),
         }
+        if evaluation is not None:
+            sel_p, sel_n = evaluation.selection_idx
+            tensors.update({
+                "eval_pos_scores_mat": main.pos_scores.astype(np.float32),
+                "eval_neg_scores_mat": main.neg_scores.astype(np.float32),
+                "eval_selection_pos_idx": np.asarray(sel_p, dtype=np.int32),
+                "eval_selection_neg_idx": np.asarray(sel_n, dtype=np.int32),
+                "eval_null_d95": main.null_d95_curve.astype(np.float64),
+            })
+            if evaluation.report_d_curve is not None:
+                tensors["eval_report_d"] = evaluation.report_d_curve.astype(np.float64)
+            for name, result in evaluation.sets.items():
+                if name == primary_name:
+                    continue
+                key = safe_slug(name)
+                tensors.update({f"set_{key}_pos_scores": result.pos_scores.astype(np.float32),
+                                f"set_{key}_neg_scores": result.neg_scores.astype(np.float32),
+                                f"set_{key}_d": result.d_curve.astype(np.float32),
+                                f"set_{key}_p": result.p_curve.astype(np.float64),
+                                f"set_{key}_null_d95": result.null_d95_curve.astype(np.float64)})
         if out_cfg.get("save_reps_to_npz", True):
-            tensors.update(
-                {
-                    "train_pos_reps": reps_pos.astype(np.float32),
-                    "train_neg_reps": reps_neg.astype(np.float32),
-                }
-            )
+            tensors.update({"train_pos_reps": reps_pos.astype(np.float32), "train_neg_reps": reps_neg.astype(np.float32)})
         npz_path = os.path.join(self.run_dir, "tensors.npz")
         np.savez_compressed(npz_path, **tensors)
 
         n_train_pos = len(train_pos_kept)
         n_train_neg = len(train_neg_kept)
-        if train_prompt_mode == "shared":
-            n_train = n_train_pos
-        else:
-            n_train = n_train_pos + n_train_neg
-
+        n_train = n_train_pos if train_prompt_mode == "shared" else n_train_pos + n_train_neg
         metrics = {
             "best_layer": best_layer,
-            "best_d": _opt(best_d),
-            "best_p": _opt(best_p),
-            "best_d_ci95": best_d_ci95,
-            "selection": selection,
-            "best_layer_selection_note": notes.get(selection),
-            "best_d_selection": _opt(best_d_selection),
-            "best_d_all_eval": _opt(best_d_all_eval),
-            "n_eval_selection": {"pos": int(len(pos_sel)), "neg": int(len(neg_sel))} if selection == "split" else None,
-            "sweep_max_d": _opt(sweep_max_d),
-            "sweep_max_d_perm_p": _opt(sweep_max_d_perm_p),
-            "n_permutations": int(eval_cfg.get("n_permutations") or 0) if sweep_max_d is not None else None,
+            "best_d": None if main is None else main.d,
+            "best_p": None if main is None else main.p,
+            "best_d_ci95": None if main is None else main.d_ci95,
+            "best_auroc": None if main is None else main.auroc,
+            "best_auroc_ci95": None if main is None else main.auroc_ci95,
+            "best_accuracy": None if main is None else main.accuracy,
+            "best_accuracy_ci95": None if main is None else main.accuracy_ci95,
+            "null_d95_at_best_layer": None if main is None else main.null_d95,
+            "selection": None if evaluation is None else evaluation.selection,
+            "best_d_selection": None if evaluation is None else evaluation.d_selection,
+            "best_d_all_eval": None if main is None else _opt(main.d_curve[best_layer]),
+            "n_eval_selection": ({"pos": int(len(evaluation.selection_idx[0])), "neg": int(len(evaluation.selection_idx[1]))}
+                                 if evaluation is not None and evaluation.selection == "split" else None),
+            "sweep_max_d": None if evaluation is None else evaluation.sweep_max_d,
+            "sweep_max_d_perm_p": None if evaluation is None else evaluation.sweep_max_d_perm_p,
             "best_layer_search": train_cfg.get("best_layer_search"),
-            "best_layer_search_intervals": search_intervals,
-            "best_layer_search_layers": search_layers,
-            "best_layer_search_default": search_default,
+            "best_layer_search_intervals": None if search_info is None else search_info["intervals"],
+            "label_shuffle": label_shuffle,
             "sigma_best_layer": _opt(sigma),
             "num_layers": num_layers,
             "n_train": n_train,
@@ -1632,7 +1508,7 @@ class ConceptProbe:
             "estimator": read_spec,
             "steer_direction": steer_spec,
             "steer_sigma_best_layer": _opt(steer_sigma),
-            "threshold": threshold,
+            "threshold": None if evaluation is None else evaluation.threshold,
             "neutral_texts": neutral_report,
             "train_samples": ({"pos": int(reps_pos.shape[0]), "neg": int(reps_neg.shape[0])}
                               if str(train_readout_mode).endswith("_tokens") else None),
@@ -1642,10 +1518,10 @@ class ConceptProbe:
             "n_eval_pos": n_eval_pos,
             "n_eval_neg": n_eval_neg,
             "eval_mode_used": eval_mode if did_eval else None,
-            "eval_paired": eval_paired,
-            "reference_context": reference_context,
+            "eval_paired": bool(main_set.paired) if main_set is not None else False,
+            "reference_context": calibrations[0].context.to_dict() if calibrations else None,
             "eval_readout": eval_readout,
-            "transfer_eval": transfer_eval,
+            "evaluation": None if evaluation is None else evaluation.to_metrics(),
             "dropped_items": dropped_items or None,
             "model_identity": self.identity,
             "read_batch_size": read_batch_size,

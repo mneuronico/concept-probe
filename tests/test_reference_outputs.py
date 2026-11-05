@@ -158,14 +158,26 @@ def _run_summary(probe):
     # the normalization of the difference of means, as the reference recorded it before the estimator
     # had its own setting
     out["direction_normalization"] = metrics["estimator"].get("normalization")
-    transfer = metrics.get("transfer_eval")
-    out["transfer_eval"] = None if transfer is None else {
-        k: transfer.get(k) for k in ("n_pos", "n_neg", "d_at_best_layer", "p_at_best_layer", "d_ci95_at_best_layer")
+    # The eval texts of a concept trained on generated completions, measured at the probe's layer: once
+    # metrics' "transfer_eval", now the eval set "texts".
+    texts = ((metrics.get("evaluation") or {}).get("sets") or {}).get("texts")
+    out["transfer_eval"] = None if texts is None else {
+        "n_pos": texts["n_pos"], "n_neg": texts["n_neg"], "d_at_best_layer": texts["d"],
+        "p_at_best_layer": texts["p"], "d_ci95_at_best_layer": texts["d_ci95"],
     }
-    for key in ("concept_vectors", "sweep_d", "sweep_p", "score_center", "score_scale", "token_center",
-                "token_scale", "resid_norm", "eval_pos_scores_mat", "eval_neg_scores_mat", "eval_question_idx",
-                "transfer_sweep_d", "train_pos_reps", "train_neg_reps"):
+    n_layers = tensors["concept_vectors"].shape[0]
+    nan = np.full(n_layers, np.nan)
+    cals = json.loads(str(tensors["calibrations"][0]))
+    main = next((c for c in cals if c["source"] == "evaluation"), None)
+    for key, field in (("score_center", "center"), ("score_scale", "scale"), ("token_center", "token_center"),
+                       ("token_scale", "token_scale")):
+        out[key] = nan if main is None else np.asarray(main[field])
+    for key in ("concept_vectors", "sweep_d", "sweep_p", "resid_norm", "eval_question_idx", "train_pos_reps",
+                "train_neg_reps"):
         out[key] = tensors[key]
+    for key in ("eval_pos_scores_mat", "eval_neg_scores_mat"):
+        out[key] = tensors[key] if key in tensors.files else np.zeros((0, n_layers))
+    out["transfer_sweep_d"] = tensors["set_texts_d"] if "set_texts_d" in tensors.files else nan
     out["files"] = _files(run)
     return out
 

@@ -85,11 +85,11 @@ def test_paired_statistics():
 def test_transfer_references_are_kept_and_used_for_raw_texts(tmp_path, monkeypatch):
     probe, metrics, t = _train(tmp_path, monkeypatch)
     assert metrics["reference_context"]["kind"] == "generated"
-    assert metrics["transfer_eval"]["reference_context"]["role"] == "raw"
+    assert metrics["evaluation"]["sets"]["texts"]["context"]["role"] == "raw"
     loaded = ConceptProbe.load(str(tmp_path))
-    assert [c.source for c in loaded.calibrations] == ["evaluation", "transfer check"]
+    assert [c.source for c in loaded.calibrations] == ["evaluation", "texts"]
     raw = probe_mod._text_context("raw", None, None, "assistant_all_mean")
-    assert loaded.calibration_for(raw).source == "transfer check"
+    assert loaded.calibration_for(raw).source == "texts"
     assert loaded.calibration_for(probe_mod._text_context("user", "S", None, "assistant_all_mean")) is None
 
 

@@ -1,6 +1,6 @@
 """Statistics on scores (layer 6a of docs/DESIGN.md): effect sizes, tests, splits, permutation and
 bootstrap. Pure functions on arrays."""
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -145,3 +145,95 @@ def _select_best_layer(
         )
     order = np.lexsort((-d[candidates], p[candidates]))
     return int(candidates[order[0]])
+
+
+# ------------------------------------------------------------------------------------- stage 3
+def auroc(pos: np.ndarray, neg: np.ndarray) -> float:
+    """Area under the ROC curve of scores separating ``pos`` from ``neg``: the chance that a random
+    positive item scores above a random negative one (ties count half)."""
+    pos = np.asarray(pos, dtype=np.float64).ravel()
+    neg = np.asarray(neg, dtype=np.float64).ravel()
+    if pos.size == 0 or neg.size == 0:
+        return float("nan")
+    allv = np.concatenate([pos, neg])
+    order = np.argsort(allv, kind="mergesort")
+    ranks = np.empty_like(order, dtype=np.float64)
+    sorted_v = allv[order]
+    i = 0
+    while i < len(sorted_v):  # average ranks over ties
+        j = i
+        while j + 1 < len(sorted_v) and sorted_v[j + 1] == sorted_v[i]:
+            j += 1
+        ranks[order[i:j + 1]] = 0.5 * (i + j) + 1.0
+        i = j + 1
+    u = ranks[: pos.size].sum() - pos.size * (pos.size + 1) / 2.0
+    return float(u / (pos.size * neg.size))
+
+
+def accuracy(pos: np.ndarray, neg: np.ndarray, threshold: float) -> float:
+    """Share of items on the right side of ``threshold`` (positives above, negatives below)."""
+    pos = np.asarray(pos, dtype=np.float64).ravel()
+    neg = np.asarray(neg, dtype=np.float64).ravel()
+    n = pos.size + neg.size
+    return float(((pos > threshold).sum() + (neg <= threshold).sum()) / n) if n else float("nan")
+
+
+def bootstrap_ci(stat, pos: np.ndarray, neg: np.ndarray, n_bootstrap: int, rng: np.random.Generator,
+                 paired: bool = False, level: float = 0.95) -> Optional[List[float]]:
+    """Percentile bootstrap interval of ``stat(pos, neg)``. Independent items are resampled within
+    each group; ``paired`` items (row i of both groups is one pair) are resampled by pair."""
+    pos = np.asarray(pos, dtype=np.float64)
+    neg = np.asarray(neg, dtype=np.float64)
+    if not n_bootstrap or len(pos) < 2 or len(neg) < 2:
+        return None
+    values = []
+    for _ in range(int(n_bootstrap)):
+        if paired:
+            idx = rng.integers(0, len(pos), len(pos))
+            values.append(stat(pos[idx], neg[idx]))
+        else:
+            values.append(stat(pos[rng.integers(0, len(pos), len(pos))], neg[rng.integers(0, len(neg), len(neg))]))
+    lo, hi = np.nanpercentile(values, [100 * (1 - level) / 2, 100 * (1 + level) / 2])
+    return [float(lo), float(hi)]
+
+
+def compare_scorers(stat, a_pos: np.ndarray, a_neg: np.ndarray, b_pos: np.ndarray, b_neg: np.ndarray,
+                    n_bootstrap: int = 1000, seed: int = 0, paired: bool = False) -> Dict[str, Any]:
+    """How much better scorer ``a`` does than scorer ``b`` on the same items, by ``stat(pos, neg)``
+    (for example :func:`auroc`, or Cohen's d), with a paired bootstrap interval: every resample
+    takes the same items for both scorers, so what the items have in common cancels out.
+
+    ``a_pos[i]`` and ``b_pos[i]`` are two scores of the same item (two probes, or a probe and a
+    judge); ``paired`` says row i of the positive and negative items is one pair.
+    """
+    a_pos, a_neg, b_pos, b_neg = (np.asarray(x, dtype=np.float64) for x in (a_pos, a_neg, b_pos, b_neg))
+    if a_pos.shape != b_pos.shape or a_neg.shape != b_neg.shape:
+        raise ValueError("Both scorers must score the same items: a_pos/b_pos and a_neg/b_neg need equal shapes.")
+    rng = np.random.default_rng(seed)
+    diffs = []
+    for _ in range(int(n_bootstrap)):
+        ip = rng.integers(0, len(a_pos), len(a_pos))
+        ineg = ip if paired else rng.integers(0, len(a_neg), len(a_neg))
+        diffs.append(stat(a_pos[ip], a_neg[ineg]) - stat(b_pos[ip], b_neg[ineg]))
+    lo, hi = np.nanpercentile(diffs, [2.5, 97.5])
+    a, b = stat(a_pos, a_neg), stat(b_pos, b_neg)
+    return {"a": float(a), "b": float(b), "difference": float(a - b), "ci95": [float(lo), float(hi)],
+            "n_bootstrap": int(n_bootstrap)}
+
+
+def random_directions_null(pos: np.ndarray, neg: np.ndarray, n_random: int = 50, seed: int = 0,
+                           quantile: float = 95.0) -> np.ndarray:
+    """What Cohen's d is without a concept, on the same items: per layer, the ``quantile`` of |d|
+    between ``pos`` and ``neg`` representations ``(n, layers, dim)`` projected on ``n_random``
+    random unit directions (the same directions at every layer). A direction's length does not
+    change d, so random directions of any norm give the same null."""
+    pos = np.asarray(pos)
+    neg = np.asarray(neg)
+    w = np.random.default_rng(seed).standard_normal((pos.shape[2], int(n_random)))
+    w /= np.linalg.norm(w, axis=0, keepdims=True)
+    out = np.full(pos.shape[1], np.nan)
+    for l in range(pos.shape[1]):
+        a = pos[:, l, :].astype(np.float64) @ w
+        b = neg[:, l, :].astype(np.float64) @ w
+        out[l] = float(np.percentile(np.abs(_cohen_d_columns(a, b)), quantile))
+    return out
