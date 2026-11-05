@@ -77,9 +77,10 @@ def _trained_probe(tmp_path):
         run_dir=str(tmp_path),
         logger=JsonlLogger(str(tmp_path / "log.jsonl")),
     )
-    probe.concept_vectors = np.eye(4, dtype=np.float32)
-    probe.best_layer = 2
-    probe.sigma_best_layer = 0.5
+    probe.directions = np.eye(4, dtype=np.float32)
+    probe.steer_directions = probe.directions
+    probe.layer = 2
+    probe.steer_sigma = 0.5
     probe.resid_norm = np.ones(4)
     return probe
 
@@ -92,7 +93,7 @@ def test_score_prompts_rejects_bad_options_before_writing_outputs(tmp_path, kwar
     assert not (tmp_path / "scores").exists()
 
 
-@pytest.mark.parametrize("unit, missing", [("sigma", "sigma_best_layer"), ("resid_norm", "resid_norm")])
+@pytest.mark.parametrize("unit, missing", [("sigma", "steer_sigma"), ("resid_norm", "resid_norm")])
 def test_a_unit_without_its_reference_raises_before_writing_outputs(tmp_path, unit, missing):
     probe = _trained_probe(tmp_path)
     setattr(probe, missing, None)

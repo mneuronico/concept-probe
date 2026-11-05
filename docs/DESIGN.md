@@ -259,6 +259,9 @@ concept_probe/
   modeling.py           # 0  cargar: dtype automático, cuantización, identidad, modelo ya cargado
   inputs.py             # 1  codificar: roles, tramos de cada mensaje y del texto, caracteres de cada token
   reading.py            # 1  pasar por el modelo en lotes, readouts, caché (SQLite por identidad)
+  directions.py         # 2  estimadores (diferencia de medias y variantes, logística, LDA) y su registro
+  linear_probe.py       # 3  Calibration (el único cálculo de z) y el umbral; ReadContext vive en inputs.py
+  stats.py              # 6a la estadística básica, mudada de probe.py (la etapa 3 la completa)
   settings.py           #    ajustes de sesión: guardar, carpeta, consola
   record.py             #    registro de elecciones automáticas (consola, log, lo guardado)
 ```
@@ -267,9 +270,7 @@ Lo que falta, con los nombres provisionales de la propuesta:
 
 ```
 concept_probe/
-  core/                 # (etapas 2 a 6)
-    directions.py       # 2  estimadores
-    probe.py            # 3  Probe y calibraciones
+  core/                 # (etapas 3 a 6)
     interventions.py    # 4
     generate.py         # 5  generar, puntuar, probabilidad de respuestas
     stats.py            # 6a
@@ -380,6 +381,21 @@ usar el lector nuevo.
 `ConceptProbe.train` se reescribe como composición.
 - Al terminar: lo de `shared/estimators.py` y la probe de `shared/redteam.py` del workshop se hace
   con la librería.
+- *Hecha el 2026-11-05; los tests de referencia siguen iguales (ninguno empuja con una probe `var`,
+  que es lo único que D1 cambia). Probada con modelos reales: los cinco estimadores entrenan desde
+  arrays en Gemma 3 270M; con `mean_diff_var` en Qwen 0.5B, entrenar anuncia que empuja con la
+  diferencia de medias cruda (coseno 0.59 con la de leer) y mide "sigma" sobre ella; una probe de
+  textos explica por qué no da z al leer generaciones, y la da después de `calibrate()`; los textos
+  neutros cayeron en z = +5. Cambios respecto de la propuesta: **D3 cambió** (2026-11-05): no hay
+  una clase `Probe` aparte. La necesidad de la entrada 20 (entrenar desde activaciones ya leídas,
+  sin cargar el modelo de nuevo) la cubre la misma `ConceptProbe`, que siempre sabe de qué modelo es
+  (`identity`) pero necesita el modelo cargado solo para leer textos, generar y empujar (`attach`).
+  Se construye entrenando, con `fit` (desde activaciones), con `from_directions` o con `load`, y
+  guarda por defecto. Sus campos se simplificaron sin mantener los viejos (la librería es para
+  usuarios nuevos): `directions`, `layer`, `steer_directions`, `identity`, y `calibrations` en lugar
+  de los seis campos de referencias; todo z pasa por la única fórmula de `Calibration`. La probe de
+  dos polos y la de un polo contra una línea de base son la misma clase (`baseline=True`);
+  `ConceptSpec` suma `neutral_texts`.*
 
 **Etapa 3 — Evaluar la lectura (capas 6a y 6b, y sus gráficos).** Grupos (13), 29, 18, 16, 17, 26
 (acierto en las métricas), 31, sets de evaluación con nombre, etiquetas mezcladas.
@@ -442,8 +458,9 @@ estable; la 7 prueba el conjunto.
   hoy queda como otro set con nombre. Cambian la capa, el d, los z y "sigma" en esos modos. Queda
   abierta, sin proponerla ahora, una pregunta vecina: si el entrenamiento en esos modos también
   debería leer las respuestas sin el system prompt.
-- **D3. El objeto nuevo.** Una clase nueva, `Probe`, en memoria; `ConceptProbe` la envuelve y no
-  cambia.
+- **D3. El objeto nuevo.** Primero, una clase nueva `Probe` envuelta por `ConceptProbe`. Revisado
+  el 2026-11-05: una sola clase, `ConceptProbe`, que se arma también desde activaciones y necesita
+  el modelo cargado solo para leer textos, generar y empujar; sus campos se simplificaron.
 - **D4. Disco.** Todas las funciones, las de hoy y las nuevas, devuelven el resultado completo y
   además lo guardan por defecto; se apaga por llamada o para toda la sesión. Ante la duda, guardar
   de más.

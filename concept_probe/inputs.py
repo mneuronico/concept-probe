@@ -343,6 +343,69 @@ def encode_text(
     return Encoded(ids[0], plen, int(ids.shape[-1]), text, token_char_offsets(tokenizer, text))
 
 
+@dataclass(frozen=True)
+class ReadContext:
+    """How items were read: what a calibration (the zero and unit of z scores) applies to.
+
+    ``kind`` is ``"text"`` (texts read with ``role``, ``system`` and, for a reply, ``prompt``; see
+    :func:`encode_text`) or ``"generated"`` (completions the model generated, read after their
+    prompt). ``readout`` is how their tokens were pooled. Two contexts match when they read items
+    the same way: generated completions always match each other, texts match on role, system
+    prompt and prompt. The readout is recorded but not compared; item z scores need the mean
+    pooling they were measured with, which the scorers check.
+    """
+
+    kind: str = "text"
+    role: Optional[str] = "raw"
+    system: Optional[str] = None
+    prompt: Optional[str] = None
+    readout: Optional[str] = "assistant_all_mean"
+
+    def __post_init__(self):
+        if self.kind not in ("text", "generated"):
+            raise ValueError(f"ReadContext kind must be 'text' or 'generated'; got {self.kind!r}")
+        if self.kind == "text" and self.role not in TEXT_ROLES:
+            raise ValueError(f"ReadContext role must be one of {TEXT_ROLES}; got {self.role!r}")
+
+    @classmethod
+    def generated(cls, readout: Optional[str] = "assistant_all_mean") -> "ReadContext":
+        return cls(kind="generated", role=None, system=None, prompt=None, readout=readout)
+
+    @classmethod
+    def from_dict(cls, d: Optional[Dict[str, Any]]) -> "ReadContext":
+        """From the dict runs save (``{"kind", "role", "system", "prompt", "mode"}``)."""
+        d = dict(d or {})
+        if d.get("kind") == "generated":
+            return cls.generated(d.get("mode", d.get("readout")))
+        return cls(kind="text", role=d.get("role") or "raw", system=d.get("system") or None,
+                   prompt=d.get("prompt"), readout=d.get("mode", d.get("readout")))
+
+    def to_dict(self) -> Dict[str, Any]:
+        """The dict runs save, as before this class existed."""
+        if self.kind == "generated":
+            return {"kind": "generated", "mode": self.readout}
+        return {"kind": "text", "role": self.role, "system": self.system or None, "prompt": self.prompt,
+                "mode": self.readout}
+
+    def matches(self, other: "ReadContext") -> bool:
+        if self.kind != other.kind:
+            return False
+        if self.kind == "generated":
+            return True
+        return all((getattr(self, k) or None) == (getattr(other, k) or None) for k in ("role", "system", "prompt"))
+
+    def describe(self) -> str:
+        """A short description, for messages."""
+        if self.kind == "generated":
+            return "as generated completions"
+        parts = [f"as {'raw text' if self.role == 'raw' else self.role + ' turns'}"]
+        if self.system:
+            parts.append(f"after the system prompt {self.system!r}")
+        if self.prompt is not None:
+            parts.append(f"after the user turn {self.prompt!r}")
+        return " ".join(parts)
+
+
 def _encode_text_for_read(
     tokenizer,
     text: "PromptLike",

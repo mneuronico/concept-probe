@@ -145,19 +145,6 @@ def test_readout_names_round_trip_and_bad_combinations_raise():
         Readout.parse("assistant_median")
 
 
-def test_training_refuses_token_samples_for_now(tmp_path):
-    from concept_probe import ConceptSpec, ProbeWorkspace
-
-    ws = ProbeWorkspace(config_overrides={"output": {"root_dir": str(tmp_path), "console": False},
-                                          "training": {"train_prompt_mode": "texts"},
-                                          "readout": {"read_mode": "assistant_tokens"}},
-                        model=TinyCausalLM(), tokenizer=CharChatTok(), model_id="tiny-test")
-    concept = ConceptSpec(name="c", pos_label="p", neg_label="n", pos_system="", neg_system="",
-                          train_pos_texts=["pp"], train_neg_texts=["nn"])
-    with pytest.raises(ValueError, match="token samples"):
-        ws.train_concept(concept)
-
-
 # ----------------------------------------------------------------------------------------- cache
 @pytest.fixture
 def saving():

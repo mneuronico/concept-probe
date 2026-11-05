@@ -55,6 +55,8 @@ class ConceptSpec:
     eval_neg_texts: List[PromptLike] = field(default_factory=list)
     train_pos_texts: List[PromptLike] = field(default_factory=list)
     train_neg_texts: List[PromptLike] = field(default_factory=list)
+    # Texts without the concept: training reports where they fall (z = 0 is not "without the concept").
+    neutral_texts: List[PromptLike] = field(default_factory=list)
 
     @classmethod
     def from_config(cls, config: Dict[str, Any], overrides: Optional[Dict[str, Any]] = None) -> "ConceptSpec":
@@ -79,6 +81,7 @@ class ConceptSpec:
             eval_neg_texts=list(base.get("eval_neg_texts", [])),
             train_pos_texts=list(base.get("train_pos_texts", [])),
             train_neg_texts=list(base.get("train_neg_texts", [])),
+            neutral_texts=list(base.get("neutral_texts", [])),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -92,4 +95,5 @@ class ConceptSpec:
             "eval_neg_texts": list(self.eval_neg_texts),
             "train_pos_texts": list(self.train_pos_texts),
             "train_neg_texts": list(self.train_neg_texts),
+            "neutral_texts": list(self.neutral_texts),
         }

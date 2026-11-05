@@ -387,7 +387,22 @@ probe on Llama 3.2 3B (layer 11), 50 neutral texts scored z = +0.54 on average, 
 food, cars, days of the week or plain statements between +0.3 and +0.7. Where neutral text lands
 also depends on the training texts: valence probes trained on other sources put the same neutral
 texts between -0.45 and -0.16. So z > 0 on a neutral text is not "positive"; to know where text
-without the concept sits, score a set of it with the same probe.
+without the concept sits, score a set of it with the same probe. A concept's `neutral_texts`
+does that during training: `metrics.json` reports where they fall (`neutral_texts`, in z of the
+calibration measured on texts read the same way), without using them as the zero.
+
+**A threshold to classify.** The midpoint is not the best cut between the poles: a probe can
+order items well and cut them badly. Training fits a one-variable logistic regression of the pole
+on the item score at the best layer, on the half of the eval items that chose the layer (or all of
+them without a split), and saves it as `threshold` in `metrics.json` and in the calibration;
+`ConceptProbe.classify` uses it.
+
+**z for another reading context.** A probe trained on texts has no z references for the
+completions `score_prompts` generates (they are read differently), so their `score_mean_z` is
+None. The scorers now say why in each record (`z_missing`) and in a warning. `probe.calibrate(pos_texts,
+neg_texts, as_reply_to=prompts)` measures references on texts read as replies to those prompts,
+which is how generations are read; with `role` / `system_prompt` / `prompt` instead, it calibrates
+texts read that way.
 
 References only apply to inputs read the way they were measured (`reference_context` in
 `metrics.json`). In shared and opposed modes the evaluation's references come from completions
@@ -411,7 +426,8 @@ number of layers actually steered (3 instead of 5 for a window at the first laye
 `alpha_unit` sets what alpha is measured in:
 
 - `"raw"` (default everywhere): alpha as is.
-- `"sigma"`: alpha times `sigma_best_layer`, the pooled within-pole SD at the best layer. It is a
+- `"sigma"`: alpha times `steer_sigma`, the eval items' pooled within-pole SD on the steering
+  direction at the probe's layer. It is a
   scale knob, not "n standard deviations of behavior".
 - `"resid_norm"`: alpha times each steered layer's mean residual norm on the training tokens.
   With one steered layer, `alpha=0.1` adds 10% of a typical token's norm; distributed over n
@@ -434,36 +450,96 @@ stream about half as far as the concept.
 Each prompt and alpha gets its own files, so repeated alphas (several samples, with sampling on) do not overwrite
 each other. A `batch_subdir` that already holds files raises unless `overwrite=True`.
 
-## Variance-normalized directions
+## Directions: reading and steering
 
-`training.direction_normalization` chooses how the per-layer direction is estimated from the
-pole representations:
+`training.estimator` chooses how each layer's direction is estimated from the representations of
+the two poles:
 
-- `"none"` (default): the difference of means, `mu_pos - mu_neg`.
-- `"var"`: the difference of means divided coordinate-wise by the pooled within-pole variance,
-  `0.5 * (var_pos + var_neg)`. This is the diagonal form of the covariance correction of
-  mass-mean probing. It keeps a few very high-variance coordinates from dominating the
-  direction, as with the massive activations of Gemma 3.
-- `"sd"`: the same, divided by the pooled standard deviation.
+- `"mean_diff"` (default): the difference of means, `mu_pos - mu_neg`.
+- `"mean_diff_var"` / `"mean_diff_sd"`: the difference of means divided coordinate-wise by the
+  pooled within-pole variance (or SD), `0.5 * (var_pos + var_neg)`. This is the diagonal form of
+  the covariance correction of mass-mean probing; it keeps a few very high-variance coordinates
+  from dominating the direction, as with the massive activations of Gemma 3.
+- `"mean_diff_drop_outliers"`: the raw difference of means without the massive coordinates the
+  concept does not move (pooled SD more than 10 times the layer's median, |t| below 2).
+- `"logistic"`: L2-regularized logistic regression on standardized coordinates (`C` = 0.05).
+- `"lda"`: linear discriminant analysis with a Ledoit-Wolf shrunk covariance.
 
-The direction is always normalized to unit length and stored in `tensors.npz`. Every later use
-of the probe (scoring, steering, `ConceptProbe.load`) reads the stored vector, so a probe trained
-with `"var"` stays variance-normalized wherever it is used. The layer sweep, and therefore
-`best_layer`, is computed with the normalized directions. `concept_direction(pos, neg,
-normalization)` exposes the same estimator for representations computed elsewhere.
+A dict sets parameters (`{"kind": "logistic", "C": 1.0}`), and `register_estimator(kind, factory)`
+adds an estimator: any object with `fit(pos, neg)` returning a direction. Every direction has unit
+length and points toward the positive pole. `logistic` and `lda` need scikit-learn (the `stats`
+extra). `training.direction_normalization` is the old name of the difference of means'
+normalization and still works, with a deprecation warning.
 
-**This setting changes the steering direction too.** A probe has one direction per layer, used
-both to read and to steer, and the two uses do not favor the same estimator. Across Llama, Qwen
-and Gemma 3 models, `"var"` read better (by a wide margin in Gemma and Qwen) but steered less: with
-a valence probe, the change in an external classifier's positivity between steering at +alpha and
-at -alpha (at the largest alpha that kept the text coherent) fell from +0.22 to +0.12 in Llama
-3.2 3B and from +0.18 to +0.03 in Qwen 2.5 3B, and some models lost coherence at smaller alphas.
-If you use `"var"` to read, steer with a probe trained with `"none"`. A later version will keep
-the reading and steering directions apart.
+**Steering has its own direction.** Reading and steering do not favor the same estimator. Across
+Llama, Qwen and Gemma 3 models, `"mean_diff_var"` read better (by a wide margin in Gemma and Qwen)
+but steered less: with a valence probe, the change in an external classifier's positivity between
+steering at +alpha and at -alpha (at the largest alpha that kept the text coherent) fell from +0.22
+to +0.12 in Llama 3.2 3B and from +0.18 to +0.03 in Qwen 2.5 3B, and some models lost coherence at
+smaller alphas. So `steering.steer_direction` is a separate setting: `"mean_diff"` (default, the raw
+difference of means), `"read"` (the reading direction), or any estimator. When the two differ,
+training says so, saves both (`concept_vectors`, `steer_vectors` in `tensors.npz`), and measures the
+unit of `alpha_unit="sigma"` on the steering direction (`steer_sigma_best_layer`). Probes saved
+before this steer with the one direction they have, and loading one trained with another estimator
+says so.
 
 ```python
-config_overrides = {"training": {"direction_normalization": "var", "best_layer_search": {"frac": [0.2, 0.8]}}}
+config_overrides = {"training": {"estimator": "mean_diff_var"}, "steering": {"steer_direction": "mean_diff"}}
 ```
+
+## The probe object
+
+A `ConceptProbe` holds what a probe is: one direction per layer to read with (`directions`), the
+layer it reads at (`layer`), the directions it steers with (`steer_directions`), and its
+`calibrations`. It always belongs to a model (`identity`: the model, dtype, quantization and chat
+template its directions were computed on), but needs that model loaded only to read texts,
+generate and steer. A probe is built:
+
+- by training it from a concept (`ProbeWorkspace.train_concept`, as above);
+- from representations already read, without loading the model again:
+
+```python
+from concept_probe import ConceptProbe, ReadContext, read_texts
+
+pos = read_texts(model, tokenizer, pos_texts)           # records which model it read them with
+neg = read_texts(model, tokenizer, neg_texts)
+probe = ConceptProbe.fit(pos.data[:40], neg.data[:40], identity=pos.identity,
+                         estimator="mean_diff_var",
+                         select=(pos.data[40:60], neg.data[40:60]),  # chooses the layer
+                         calibrate=(pos.data[60:], neg.data[60:]),   # zero, unit and threshold of z
+                         context=ReadContext(role="raw"))            # how those items were read
+```
+
+  `fit` takes the arrays or what `read_texts` returns (then the model is known); otherwise
+  `identity=` (a dict or the model id) or `model=` says which model they come from, and one of
+  them is required. `baseline=True` reads the second group as a baseline (text without the
+  concept) rather than an opposite pole: the zero is then the baseline's mean;
+- from directions computed elsewhere: `ConceptProbe.from_directions(directions, layer=12, identity=...)`;
+- from a saved run: `ConceptProbe.load(run_dir)`, or `ProbeWorkspace.get_probe` (see below).
+
+With representations, a probe needs no model:
+
+```python
+probe.z(reps, context)          # z at the probe's layer, with the calibration of that reading context
+probe.classify(reps, context)   # positive?, and the probability, from the calibrated threshold
+probe.calibrate(pos, neg, context=...)   # a calibration for another reading context
+probe.project(reps)             # raw projections, every layer
+```
+
+Reading texts, generating and steering need the model: `probe.attach(model, tokenizer)` gives it
+one (a model of another identity raises unless `allow_model_mismatch=True`), and then
+`score_texts`, `score_prompts` and `calibrate(pos_texts, neg_texts, ...)` work as described above.
+
+A `ReadContext` says how items were read (texts with a role, system prompt and prompt, or
+generated completions). A `Calibration` holds the zero and unit of z measured on items read that
+way, a threshold, and where neutral texts fall; a probe has one per context it was calibrated in,
+and asking for z in another context raises, naming the contexts it has.
+
+Probes save to their run folder by default: `fit` and `from_directions` write one under
+`<root>/<concept name>/<run_name or timestamp>`, where `root` is their `root_dir` argument, or else
+the session's `output_root` (`concept_probe.configure(output_root=...)`), unless `save=False`. A
+probe without a folder gets one there the first time it saves scores, and `probe.save()` writes its
+current state (a new calibration, for instance) into its folder.
 
 ## Behavioral evals and reports
 
@@ -528,6 +604,8 @@ date: they are labels from another model, not ground truth.
 ```python
 workspace = ProbeWorkspace(project_directory="outputs/sad_vs_happy/<run>")
 probe = workspace.get_probe()
+# or, with a model already loaded, or none:
+probe = ConceptProbe.load("outputs/sad_vs_happy/<run>", model, tokenizer)
 ```
 
 This loads the run's own model settings. `get_probe` on a workspace created otherwise raises if
@@ -585,6 +663,8 @@ from concept_probe import (
     read_texts,
     read_encoded,
     Readout,
+    ReadContext,
+    fit_directions,
     message_spans,
     ModelBundle,
     configure,
@@ -638,6 +718,30 @@ GitHub Actions CI runs the same lightweight checks and also builds source and wh
   `assistant_max`, `assistant_first`, `sequence_max` and `assistant_tokens` are new readout names.
 - **Message spans.** `preview_input` returns the token span of every message, and
   `message_spans(tokenizer, messages)` does for any conversation.
+- **Estimators.** `training.estimator` takes `mean_diff` (default), `mean_diff_var`, `mean_diff_sd`,
+  `mean_diff_drop_outliers`, `logistic`, `lda`, a dict with parameters, or a registered estimator;
+  `training.direction_normalization` still works, as an alias with a deprecation warning.
+- **Steering has its own direction** (`steering.steer_direction`, default the raw difference of
+  means): a probe trained with `mean_diff_var` reads with it and steers with the raw difference,
+  which pushes further. Training announces it and saves both; `alpha_unit="sigma"` is measured on the
+  steering direction. Before, the one direction did both, so steering with a `var` probe changes.
+- **One probe object, which needs its model only to read texts, generate and steer.**
+  `ConceptProbe` is built by training, from representations already read (`ConceptProbe.fit`,
+  which chooses the layer on held-out items), from directions computed elsewhere
+  (`ConceptProbe.from_directions`) or from a run (`ConceptProbe.load(run_dir, model=None)`), and
+  `attach` gives it a model later. It always records which model it belongs to. Its fields are
+  renamed and simpler: `directions` (was `concept_vectors`), `layer` (was `best_layer`),
+  `steer_directions`, `identity` (was `model_identity`), and `calibrations`, a list of
+  `Calibration` objects that replaces `score_center`, `score_scale`, `token_center`, `token_scale`,
+  `reference_context` and `transfer_references`; `sigma_best_layer` is only reported in
+  `metrics.json`, and steering in "sigma" uses `steer_sigma`. `z`, `classify`, `project` and
+  `calibrate` work on representations; every z score goes through the calibration's one formula.
+- **Training** also reports a threshold fitted on the selection half of the eval items, where a
+  concept's `neutral_texts` fall, and can train on every token as a sample
+  (`readout.read_mode = "assistant_tokens"`; eval items are then scored by their mean).
+- **z in another context.** `score_prompts` and `multi_probe_score_prompts` say why `score_mean_z`
+  is None (`z_missing`, and a warning), and `ConceptProbe.calibrate(...)` adds references for
+  generated completions or for texts read another way.
 - **NaN or inf hidden states stop the run** with `NonFiniteActivationsError`, which names the
   layers and the model's dtype; loading a Gemma 3 model in float16 warns that it overflows.
   Previously the non-finite layers gave NaN directions and scores, and the layer sweep skipped

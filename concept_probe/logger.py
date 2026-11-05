@@ -17,3 +17,13 @@ class JsonlLogger:
         rec = dict(payload) if payload else {}
         rec["event"] = event  # the event name must not be clobbered by a payload key
         jsonl_append(self.path, rec)
+
+
+class NullLogger:
+    """A logger that writes nothing: for a probe with no run folder."""
+
+    enabled = False
+    path = None
+
+    def log(self, event: str, payload: Optional[Dict[str, Any]] = None) -> None:
+        return None

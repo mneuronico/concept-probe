@@ -18,7 +18,8 @@
     "eval_pos_texts": [],
     "eval_neg_texts": [],
     "train_pos_texts": [],
-    "train_neg_texts": []
+    "train_neg_texts": [],
+    "neutral_texts": []
   },
   "prompts": {
     "train_questions": [
@@ -87,7 +88,8 @@
     "train_text_role": "raw",
     "train_text_prompt": null,
     "do_layer_sweep": true,
-    "direction_normalization": "none",
+    "estimator": "mean_diff",
+    "direction_normalization": null,
     "sweep_select": "effect_size",
     "best_layer_search": null,
     "layer_idx": null,
@@ -114,6 +116,7 @@
   },
   "steering": {
     "do_steering": true,
+    "steer_direction": "mean_diff",
     "steer_sampling": false,
     "steer_temperature": 0.7,
     "steer_top_p": 0.9,

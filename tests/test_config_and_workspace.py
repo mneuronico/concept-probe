@@ -182,21 +182,22 @@ def test_get_probe_refuses_a_different_model(tmp_path):
     ws = _workspace(tmp_path, {"model_id": "model-b"})
     with pytest.raises(ValueError, match="model_id"):
         ws.get_probe(project_directory=run)
-    assert ws.get_probe(project_directory=run, allow_model_mismatch=True).best_layer == 1
+    assert ws.get_probe(project_directory=run, allow_model_mismatch=True).layer == 1
 
 
 def test_get_probe_loads_with_the_same_model(tmp_path):
     run = _saved_run(tmp_path, {"model_id": "model-a"})
     probe = _workspace(tmp_path, {"model_id": "model-a"}).get_probe(project_directory=run)
-    assert probe.sigma_best_layer == 2.0
+    assert probe.steer_sigma == 2.0  # a run saved before steering had its own unit: the eval SD at its layer
 
 
 def test_load_restores_every_reference(tmp_path):
     run = _saved_run(tmp_path, {"model_id": "model-a"})
-    probe = ConceptProbe.load(run, SimpleNamespace(model_id="model-a", num_layers=2))
-    np.testing.assert_allclose(probe.score_scale, [1.0, 2.0])
-    np.testing.assert_allclose(probe.token_scale, [3.0, 4.0])
-    assert probe.sigma_best_layer == 2.0 and probe.resid_norm is not None
+    probe = ConceptProbe.load(run)
+    cal = probe.calibration_for({"kind": "generated"})
+    np.testing.assert_allclose(cal.scale, [1.0, 2.0])
+    np.testing.assert_allclose(cal.token_scale, [3.0, 4.0])
+    assert probe.steer_sigma == 2.0 and probe.resid_norm is not None
 
 
 def test_a_repeated_run_name_raises_unless_overwriting(tmp_path, monkeypatch):

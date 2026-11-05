@@ -10,7 +10,9 @@ from .probe import (
     score_text_tokens,
 )
 from .multi_probe import multi_probe_score_prompts
-from .inputs import Encoded, encode_text, message_spans
+from .inputs import Encoded, ReadContext, encode_text, message_spans
+from .directions import fit_directions, make_estimator, register_estimator
+from .linear_probe import Calibration
 from .modeling import ModelBundle, QUANTIZATION_LEVELS
 from .reading import EmptySpanError, Readout, Reps, read_encoded, read_texts
 from .record import Choice
@@ -57,6 +59,11 @@ __all__ = [
     "encode_text",
     "message_spans",
     "Encoded",
+    "ReadContext",
+    "Calibration",
+    "fit_directions",
+    "make_estimator",
+    "register_estimator",
     "ModelBundle",
     "QUANTIZATION_LEVELS",
     "Readout",

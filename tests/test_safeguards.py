@@ -86,21 +86,21 @@ def test_transfer_references_are_kept_and_used_for_raw_texts(tmp_path, monkeypat
     probe, metrics, t = _train(tmp_path, monkeypatch)
     assert metrics["reference_context"]["kind"] == "generated"
     assert metrics["transfer_eval"]["reference_context"]["role"] == "raw"
-    loaded = ConceptProbe.load(str(tmp_path), probe.model_bundle)
-    assert loaded.transfer_references["context"]["role"] == "raw"
+    loaded = ConceptProbe.load(str(tmp_path))
+    assert [c.source for c in loaded.calibrations] == ["evaluation", "transfer check"]
     raw = probe_mod._text_context("raw", None, None, "assistant_all_mean")
-    assert loaded._reference_set(raw) is not None
-    assert loaded._reference_set(probe_mod._text_context("user", "S", None, "assistant_all_mean")) is None
+    assert loaded.calibration_for(raw).source == "transfer check"
+    assert loaded.calibration_for(probe_mod._text_context("user", "S", None, "assistant_all_mean")) is None
 
 
 def test_score_texts_has_no_z_without_references_from_the_same_reading(tmp_path, monkeypatch):
     probe, _, _ = _train(tmp_path, monkeypatch)
     probe.model_bundle.model = CharModel()
-    probe.transfer_references = None  # only the generated-completion references are left
+    probe.calibrations = [c for c in probe.calibrations if c.source == "evaluation"]  # generated completions only
     rec = probe.score_texts(["ppx"], save_html=False)[0]
     assert rec["scores_standardized"] is False and rec["score_mean_z"] is None
     events = [json.loads(line) for line in (tmp_path / "log.jsonl").read_text().splitlines()]
-    assert any("no z references" in e.get("message", "") for e in events)
+    assert any("no calibration for items read as raw text" in e.get("message", "") for e in events)
 
 
 # ------------------------------------------------------------- inputs and configs
@@ -138,8 +138,9 @@ def _scoring_probe(tmp_path, monkeypatch, name="c", config=None):
     probe = ConceptProbe(model_bundle=bundle, config=resolve_config(config or {"output": {"console": False}}),
                          concept=ConceptSpec(name=name, pos_label="p", neg_label="n", pos_system="a", neg_system="b"),
                          run_dir=str(tmp_path / name), logger=JsonlLogger(str(tmp_path / name / "log.jsonl")))
-    probe.concept_vectors = np.array([[1.0, 0.0], [1.0, 0.0]], dtype=np.float32)
-    probe.best_layer = 0
+    probe.directions = np.array([[1.0, 0.0], [1.0, 0.0]], dtype=np.float32)
+    probe.steer_directions = probe.directions
+    probe.layer = 0
     return probe
 
 
@@ -165,7 +166,7 @@ def test_a_steering_probe_outside_the_list_is_checked_against_the_model(tmp_path
                                                            "model": {"dtype": "bfloat16"}})
     other = _scoring_probe(tmp_path, monkeypatch, "other", config={"output": {"console": False},
                                                                    "model": {"dtype": "float32"}})
-    other.sigma_best_layer = 1.0
+    other.steer_sigma = 1.0
     with pytest.raises(ValueError, match="dtype"):
         multi_probe_score_prompts([a], ["hi"], alphas=[1.0], steer_probe=other, output_root=str(tmp_path / "m"))
 

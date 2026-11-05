@@ -96,7 +96,7 @@ def _steer_layer_list(
     if steer_window_radius is None:
         steer_window_radius = probe.config["steering"]["steer_window_radius"]
     return _resolve_steer_layers(
-        steer_layers, int(probe.best_layer), steer_window_radius, probe.model_bundle.num_layers
+        steer_layers, int(probe.layer), steer_window_radius, probe.num_layers
     )
 
 
@@ -248,7 +248,7 @@ def multi_probe_score_prompts(
             scoring_vectors_by_probe.append(vectors)
         else:
             random_scoring_seed_map[probe_name] = None
-            scoring_vectors_by_probe.append(probe.concept_vectors)
+            scoring_vectors_by_probe.append(probe.directions)
     steering_seed: Optional[int] = None
     steering_vectors: Optional[np.ndarray] = None
 
@@ -270,7 +270,7 @@ def multi_probe_score_prompts(
                 f"(same-norm per layer, seed={steering_seed}, steer_probe={steer_probe_obj.concept.name})."
             )
         else:
-            steering_vectors = steer_probe_obj.concept_vectors
+            steering_vectors = steer_probe_obj.steer_directions
     if random_scoring_vector:
         warn(
             f"multi_probe_score_prompts using random scoring vector control "
@@ -377,6 +377,13 @@ def multi_probe_score_prompts(
     warn_fn = warn
 
     eos_ids = _eos_token_ids(model, tokenizer)
+    z_missing_by_probe: Dict[str, Optional[str]] = {}
+    for probe in probes:
+        reason = None
+        if not random_scoring_vector and probe.calibration_for(GENERATED_CONTEXT) is None:
+            reason = probe._missing_z_reason(GENERATED_CONTEXT)
+            warn(f"multi_probe_score_prompts: {probe.concept.name}: score_mean_z is None: {reason}")
+        z_missing_by_probe[str(probe.concept.name)] = reason
     run_idx = 0
     progress_every = 1
     for i, prompt in enumerate(prompts):
@@ -579,6 +586,7 @@ def multi_probe_score_prompts(
                 "segments_path": segments_path,
                 "score_mean_by_probe": score_mean_by_probe,
                 "score_mean_z_by_probe": score_mean_z_by_probe,
+                "z_missing_by_probe": z_missing_by_probe,
                 "generation_logits_saved": bool(generation_logits_payload),
                 "generation_logits_top_k": (
                     int(generation_logits_payload["generation_logits_topk_k"][0])

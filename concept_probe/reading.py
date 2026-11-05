@@ -538,7 +538,8 @@ class Reps:
     ``positions`` the token position of each row (``tokens`` readouts only). Items that could not
     be read (an empty span, a missing substring) have no rows and are listed in ``skipped`` with
     the reason. ``norms`` (items, layers) and ``projections`` (per item, tokens x layers) are
-    there when asked for, for the items that were read."""
+    there when asked for, for the items that were read. ``identity`` is the model they were read
+    with (see :func:`concept_probe.modeling.identity_of`): a probe trained on them takes it."""
 
     data: np.ndarray
     layers: List[Union[int, str]]
@@ -550,6 +551,7 @@ class Reps:
     skipped: Dict[int, str] = field(default_factory=dict)
     batch_size: int = 1
     cache_dir: Optional[str] = None
+    identity: Optional[Dict[str, Any]] = None
     from_cache: int = 0
     choices: List[Choice] = field(default_factory=list)
 
@@ -680,6 +682,7 @@ def _read(
             norms=np.stack([found[k][i]["norms"] for i in kept]) if (norms and kept) else None,
             projections=[extra[i]["projections"] for i in kept] if vectors is not None else None,
             skipped=dict(errors[k]), batch_size=step, cache_dir=None if store is None else store.dir,
+            identity=dict(identity) if identity else identity_of(model, tokenizer),
             from_cache=0 if store is None else store.hits // max(1, len(readouts)), choices=choices,
         ))
     return out

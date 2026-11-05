@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from concept_probe import multi_probe as multi_mod
-from concept_probe import preview_input
+from concept_probe import Calibration, ReadContext, preview_input
 from concept_probe import probe as probe_mod
 from concept_probe.config import ConceptSpec, resolve_config
 from concept_probe.logger import JsonlLogger
@@ -66,21 +66,16 @@ def _probe(tmp_path, monkeypatch, name="c", vectors=None, config=None):
         run_dir=str(tmp_path / name),
         logger=JsonlLogger(str(tmp_path / name / "log.jsonl")),
     )
-    probe.concept_vectors = np.array([[1.0, 0.0], [1.0, 0.0]] if vectors is None else vectors, dtype=np.float32)
-    probe.best_layer = 0
+    probe.directions = np.array([[1.0, 0.0], [1.0, 0.0]] if vectors is None else vectors, dtype=np.float32)
+    probe.steer_directions = probe.directions
+    probe.layer = 0
     # per-item references (an item's mean) and per-token references (single tokens), measured on
-    # generated completions, and the same numbers as the transfer check's references for raw texts
-    probe.score_center = np.array([0.0, 0.0])
-    probe.score_scale = np.array([0.5, 1.0])
-    probe.token_center = np.array([0.5, 0.0])
-    probe.token_scale = np.array([0.25, 1.0])
-    probe.reference_context = {"kind": "generated", "mode": "assistant_all_mean"}
-    probe.transfer_references = {
-        "context": probe_mod._text_context("raw", None, None, "assistant_all_mean"),
-        "score_center": probe.score_center, "score_scale": probe.score_scale,
-        "token_center": probe.token_center, "token_scale": probe.token_scale,
-    }
-    probe.sigma_best_layer = 0.5
+    # generated completions, and the same numbers for raw texts (the transfer check's)
+    refs = dict(center=np.array([0.0, 0.0]), scale=np.array([0.5, 1.0]),
+                token_center=np.array([0.5, 0.0]), token_scale=np.array([0.25, 1.0]))
+    probe.calibrations = [Calibration(ReadContext.generated(), source="evaluation", **refs),
+                          Calibration(ReadContext(role="raw"), source="transfer check", **refs)]
+    probe.steer_sigma = 0.5
     probe.resid_norm = np.array([2.0, 4.0])
     return probe
 

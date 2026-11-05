@@ -43,9 +43,10 @@ def _probe(tmp_path, name, vectors, bundle):
         run_dir=str(tmp_path / name),
         logger=JsonlLogger(str(tmp_path / name / "log.jsonl")),
     )
-    probe.concept_vectors = np.asarray(vectors, dtype=np.float32)
-    probe.best_layer = 0
-    probe.sigma_best_layer = 1.0
+    probe.directions = np.asarray(vectors, dtype=np.float32)
+    probe.steer_directions = probe.directions
+    probe.layer = 0
+    probe.steer_sigma = 1.0
     return probe
 
 

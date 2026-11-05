@@ -188,7 +188,7 @@ def test_a_trained_probe_records_its_model_identity_and_refuses_another(tmp_path
     metrics = json.loads(open(f"{probe.run_dir}/metrics.json").read())
     assert metrics["model_identity"]["model_id"] == "tiny-test" and metrics["model_identity"]["dtype"] == "float64"
     assert metrics["read_batch_size"] == 16
-    assert ws.get_probe(project_directory=probe.run_dir).model_identity["model_id"] == "tiny-test"
+    assert ws.get_probe(project_directory=probe.run_dir).identity["model_id"] == "tiny-test"
     other = _ws(tmp_path, model=TinyCausalLM().float(), tokenizer=CharChatTok(), model_id="tiny-test")
     with pytest.raises(ValueError, match="dtype: 'float64' vs 'float32'"):
         other.get_probe(project_directory=probe.run_dir)

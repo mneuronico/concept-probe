@@ -248,7 +248,7 @@ def test_extract_reps_and_token_scores(probes):
         "text_reps_user": extract_text_reps(model, tok, EVAL_NEG[:2], role="user", system="x y z"),
         "text_reps_assistant": extract_text_reps(model, tok, EVAL_NEG[:2], role="assistant", prompt="say"),
         "completion_reps": extract_completion_reps(model, tok, [("tell me", "pp x"), ("why z", "nn y")], system="z"),
-        "token_scores": score_text_tokens(model, tok, probes["texts"].concept_vectors, "pp nx", layer_indices=[1, 3]),
+        "token_scores": score_text_tokens(model, tok, probes["texts"].directions, "pp nx", layer_indices=[1, 3]),
     }
     out["token_scores"].pop("offset_mapping")  # character offsets of the fake tokenizer, not the library's
     _check("extract_reps_and_token_scores", out)
