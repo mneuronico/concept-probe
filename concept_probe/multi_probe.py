@@ -6,10 +6,9 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 
 from .logger import JsonlLogger
-from .modeling import apply_chat, attention_mask_from_ids
+from .modeling import apply_chat, attention_mask_from_ids, identity_mismatches
 from .probe import (
     GENERATED_CONTEXT,
-    _MODEL_IDENTITY_KEYS,
     ConceptProbe,
     PromptLike,
     _pack_generation_logits_arrays,
@@ -23,6 +22,7 @@ from .probe import (
     _prompt_slug_any,
     _resolve_random_control_seed,
     forward_hidden_states_all_layers,
+    model_identity_of,
     token_scores_from_hs_layers,
 )
 from .steering import MultiLayerSteererLayerwise
@@ -176,14 +176,11 @@ def multi_probe_score_prompts(
     model_bundle = probes[0].model_bundle
 
     def check_same_model(probe: ConceptProbe) -> None:
-        mismatched = [
-            k for k in _MODEL_IDENTITY_KEYS
-            if probe.config.get("model", {}).get(k) != probes[0].config.get("model", {}).get(k)
-        ]
+        mismatched = identity_mismatches(model_identity_of(probe), model_identity_of(probes[0]))
         if probe.model_bundle.model_id != model_bundle.model_id or mismatched:
             raise ValueError(
                 f"Probe {probe.concept.name!r} was trained with other model settings than "
-                f"{probes[0].concept.name!r} ({', '.join(mismatched) or 'model_id'}); multi-probe scoring "
+                f"{probes[0].concept.name!r} ({'; '.join(mismatched) or 'model_id'}); multi-probe scoring "
                 "runs one model for all probes."
             )
 

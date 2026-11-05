@@ -1,14 +1,14 @@
 """Model-free test for extract_completion_reps.
 
-A fake tokenizer provides a 2-token prompt and a 3-token completion;
-forward_hidden_states_all_layers is monkeypatched to return controlled hidden
-states. The rep must be the mean over the completion tokens only (prompt excluded).
+A fake tokenizer provides a 2-token prompt and a 3-token completion; a model
+built from a function returns controlled hidden states. The rep must be the mean over the completion tokens only (prompt excluded).
 """
 import numpy as np
 import torch
 
 import concept_probe
 from concept_probe import probe as probe_mod
+from fakes import FunctionModel
 
 
 class _FakeTok:
@@ -24,9 +24,9 @@ def _fake_forward(model, input_ids, **kwargs):
     return [torch.tensor([[0.0, 0, 0, 0], [0, 0, 0, 0], [1, 1, 1, 1], [2, 2, 2, 2], [3, 3, 3, 3]])]
 
 
-def test_pools_over_completion_tokens_only(monkeypatch):
-    monkeypatch.setattr(probe_mod, "forward_hidden_states_all_layers", _fake_forward)
-    reps = concept_probe.extract_completion_reps(object(), _FakeTok(), [("hi", "abc")])
+def test_pools_over_completion_tokens_only():
+    reps = concept_probe.extract_completion_reps(FunctionModel(_fake_forward), _FakeTok(), [("hi", "abc")],
+                                                 cache=False)
     assert reps.shape == (1, 1, 4)
     # assistant_all_mean over completion rows [1..],[2..],[3..] -> [2,2,2,2] (prompt rows excluded)
     np.testing.assert_allclose(reps[0, 0], [2, 2, 2, 2], atol=1e-6)

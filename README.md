@@ -57,7 +57,8 @@ Notes:
 - `matplotlib` is used for plots.
 - `statsmodels` and `scikit-learn` are used by reporting utilities.
 - `groq` is only needed for coherence rating helpers.
-- `bitsandbytes` is only needed for 4-bit loading.
+- `bitsandbytes` is only needed for the `nf4` and `int8` quantization levels, and `hqq` for the
+  `hqq*` levels.
 
 ## Quickstart
 
@@ -95,6 +96,40 @@ probe.score_prompts(
 
 Outputs are written under `outputs/<concept_name>/<timestamp>/`. A `run_name` that already
 holds a run raises instead of mixing two runs; pass `overwrite=True` to replace it.
+
+## Loading the model
+
+`ProbeWorkspace` loads the model of the config's `model` section:
+
+- `model.dtype` is `"auto"` by default: bfloat16 on GPUs that compute in it (compute capability
+  8.0 and up), float16 on older GPUs (the T4 and the RTX 20xx only emulate bfloat16, slowly),
+  except float32 for Gemma 3, whose activations overflow in float16; float32 without a CUDA GPU.
+  An explicit `"bfloat16"`, `"float16"` or `"float32"` is used as given.
+- `model.quantization` is null (default), a level (`"nf4"`, `"int8"`, `"hqq4"`, `"hqq3"`,
+  `"hqq2"`), a transformers quantization config, or a dict with its `quant_method` (for
+  bitsandbytes with double quantization, for instance). NF4 computes in `model.dtype`. A level
+  that cannot load fails instead of loading the full-precision model. `model.use_4bit = true` is
+  the old name of `"nf4"` and still works, with a deprecation warning.
+- With `HF_HUB_OFFLINE` set, a repo id loads from its snapshot in the local cache.
+
+A model that is already loaded can be passed in instead, for instance one quantized another
+way, or one model shared by several workspaces: `ProbeWorkspace(model=model, tokenizer=tokenizer)`,
+or `model=` a `ModelBundle`. Its own name, dtype and quantization replace the config's.
+
+What makes the activations what they are (the model and its revision, the dtype actually used,
+the quantization, the chat template and its date) is the model's **identity**. A trained probe
+records it in `metrics.json` (`model_identity`), and loading a probe with a model of another
+identity raises (see [Loading a trained probe](#loading-a-trained-probe)).
+
+**Every choice the library makes on its own is announced.** The dtype chosen for `"auto"`, the
+cached snapshot loaded offline, where read representations are cached: each is printed with
+its reason (when `output.console` is on), written to the run's log, and listed under `choices`
+in `metrics.json`. Each has a setting to choose otherwise.
+
+**Results are saved by default.** Runs write their folder, and reading stores the
+representations it computes (see [Reading representations](#reading-representations)), so the
+same text does not go through the same model twice. `concept_probe.configure(save=False)`
+turns off every write the caller did not ask for, for the rest of the session.
 
 ## What the model sees
 
@@ -142,9 +177,11 @@ preview_input(tokenizer, "The river was calm.", role="user", system="...")   # c
 preview_input(tokenizer, "Write about the sea.", generation=True)            # as score_prompts
 ```
 
-It returns the decoded input with every special and template token, the token ids, and the
-span of the text's own tokens. `score_texts` records the same `input_text` and `text_span`, and
-`score_prompts` records `prompt_text`.
+It returns the decoded input with every special and template token, the token ids, the span of
+the text's own tokens, and `message_spans`: the role, token span and text of every message of
+the chat (system prompt, user turns, the reply being read). `message_spans(tokenizer, messages)`
+gives the spans for any conversation. `score_texts` records the same `input_text` and
+`text_span`, and `score_prompts` records `prompt_text`.
 
 ## Training from labelled texts
 
@@ -204,6 +241,49 @@ from one forward pass:
 ```python
 reps = extract_text_reps(model, tokenizer, new_texts, pool=["assistant_all_mean", "assistant_last"])
 ```
+
+## Reading representations
+
+`read_texts` reads texts with a model and returns their representations as arrays, with no run
+folder and no probe:
+
+```python
+from concept_probe import Readout, read_texts
+
+reps = read_texts(model, tokenizer, texts)                          # mean over each text's tokens
+reps.data                                                           # (texts, layers, hidden_dim)
+read_texts(model, tokenizer, texts, "assistant_max")                # per-coordinate max over the tokens
+read_texts(model, tokenizer, texts, Readout(position=0))            # the text's first token
+read_texts(model, tokenizer, texts, Readout(substring="river"))     # the tokens of a word
+read_texts(model, tokenizer, texts, Readout(substring=words))       # one word per text
+read_texts(model, tokenizer, texts, "assistant_tokens")             # every token is a row
+read_texts(model, tokenizer, texts, layers=["embeddings", 0, -1])   # the embedding output too
+```
+
+Texts are encoded as everywhere else (`role`, `system`, `prompt`). A `Readout` takes the text's
+own tokens (`span="text"`) or the input up to the end of the text (`span="sequence"`), narrows
+them to the last `last_k`, one `position` or a `substring`, and reduces them with `agg`
+(`"mean"`, `"max"`, `"first"`, `"last"`, or `"tokens"`, which keeps every token as a row, with
+`reps.items` and `reps.positions` saying where each row comes from). The readout names of the
+config (`assistant_all_mean`, `assistant_max`, `assistant_tokens`, ...) are shorthands for these.
+A text without the position or substring raises `EmptySpanError` naming it, or, with
+`skip_empty=True`, is listed in `reps.skipped`. Training takes the pooled readouts; training on
+every token as a sample is not supported yet. `read_encoded` reads inputs already tokenized, such
+as generated completions, without tokenizing them again.
+
+Inputs go through the model `batch_size` at a time (default 16; `readout.batch_size` in the
+config, which training uses). Batching is several times faster, and in half precision it changes
+the last digits: with Qwen 2.5 0.5B in float16, reading 64 texts in batches of 16 instead of one
+by one took 0.5 s instead of 3.8 s and moved a d of 3.4043 to 3.4041. `batch_size=1` reproduces
+reading one input at a time exactly.
+
+Reading stores what it reads in a cache and reuses it: an entry is used again only for the same
+model identity, the same token ids, the same span and the same readout. The cache is one SQLite
+file per model under `<output_root>/rep_cache` (`concept_probe.configure(output_root=...)`;
+`<output.root_dir>/rep_cache` for a workspace, or `output.rep_cache_dir`). `cache=False`, or
+`output.rep_cache = false` in a workspace, turns it off. Entries hold float32, so a cached read
+equals a fresh one; `cache_dtype="float16"` (`output.rep_cache_dtype`) halves the size and rounds,
+and keeps float32 for an entry with values float16 cannot hold.
 
 The probe learns whatever separates the two sets of texts, so if the poles also differ in
 length, negation, punctuation, topic or phrasing, the direction mixes the concept with that, and
@@ -451,15 +531,17 @@ probe = workspace.get_probe()
 ```
 
 This loads the run's own model settings. `get_probe` on a workspace created otherwise raises if
-the model (`model_id`, `dtype`, `use_4bit`, chat template or its date) differs from the run's,
-since the directions only apply to the activations they were trained on;
-`allow_model_mismatch=True` loads it anyway.
+the model identity (the model, the dtype actually used, the quantization, the chat template or
+its date) differs from the run's, since the directions only apply to the activations they were
+trained on; `allow_model_mismatch=True` loads it anyway. Runs saved before identities were
+recorded are compared on their config, whose dtype may be `"auto"`: that one is not compared.
 
 ## Configuration
 
 `concept_probe/defaults.json` holds every setting. Overrides with a key the defaults do not have
-(a misspelling, for instance) raise instead of being ignored. `model.use_4bit` (default false) loads NF4 4-bit weights; it needs bitsandbytes and
-fails rather than loading the full-precision model in its place.
+(a misspelling, for instance) raise instead of being ignored. The model settings are described in
+[Loading the model](#loading-the-model); `readout.batch_size` and `output.rep_cache`,
+`output.rep_cache_dir` and `output.rep_cache_dtype` in [Reading representations](#reading-representations).
 
 ## JSON-driven workflow
 
@@ -500,6 +582,12 @@ from concept_probe import (
     extract_completion_reps,
     extract_text_reps,
     preview_input,
+    read_texts,
+    read_encoded,
+    Readout,
+    message_spans,
+    ModelBundle,
+    configure,
     multi_probe_score_prompts,
     train_concept_from_json,
     generate_multi_probe_report,
@@ -528,6 +616,28 @@ GitHub Actions CI runs the same lightweight checks and also builds source and wh
 
 ### Unreleased
 
+- **Loading.** `model.dtype` defaults to `"auto"`: bfloat16 on GPUs that compute in it, float16
+  on older ones (float32 for Gemma 3), float32 on the CPU. It used to be bfloat16 everywhere,
+  which older GPUs only emulate, slowly. `model.quantization` takes `"nf4"`, `"int8"`, `"hqq4"`,
+  `"hqq3"`, `"hqq2"`, a dict or a transformers config (`use_4bit` still works, as `"nf4"`, with
+  a deprecation warning); HQQ layers compute in the model's dtype (transformers 4.57 forced
+  float32). `ProbeWorkspace(model=..., tokenizer=...)` takes a model that is already loaded.
+- **Model identity.** Probes record the identity of the model they were trained with (model,
+  revision, dtype actually used, quantization, chat template and date) in `metrics.json`, and
+  `get_probe` and `multi_probe_score_prompts` compare identities instead of config keys.
+- **Automatic choices are announced** (printed, logged, and listed under `choices` in
+  `metrics.json`), and **results are saved by default**; `concept_probe.configure(save=False)`
+  turns off every write the caller did not ask for.
+- **Batched reading.** Training, eval texts, `extract_text_reps` and `extract_completion_reps`
+  read 16 inputs per forward pass (`readout.batch_size`), several times faster than one by one;
+  in half precision the last digits change. Metrics record `read_batch_size`.
+- **Representations cache.** Reading stores what it computes (one SQLite file per model under
+  `<root_dir>/rep_cache`) and reuses it for the same model identity, token ids, span and readout.
+- **Readouts.** `read_texts` / `read_encoded` return arrays with any `Readout`: max, first token,
+  a position, a word (one per text if needed), every token as a row, and the embedding output;
+  `assistant_max`, `assistant_first`, `sequence_max` and `assistant_tokens` are new readout names.
+- **Message spans.** `preview_input` returns the token span of every message, and
+  `message_spans(tokenizer, messages)` does for any conversation.
 - **NaN or inf hidden states stop the run** with `NonFiniteActivationsError`, which names the
   layers and the model's dtype; loading a Gemma 3 model in float16 warns that it overflows.
   Previously the non-finite layers gave NaN directions and scores, and the layer sweep skipped

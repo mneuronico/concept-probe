@@ -249,15 +249,25 @@ mantienen sus firmas y sus defaults. `eval_system.py` y `coherence.py` pasan a l
 en memoria: los archivos se siguen escribiendo por defecto (D4), pero ya nada los necesita para
 analizar.
 
-### Organización del código (provisional)
+### Organización del código
+
+Desde la etapa 1, cada capa es un módulo en la raíz del paquete, en vez de una subcarpeta `core/`:
+así se movió menos código, y `concept_probe.probe` reexporta lo que se mudó. Lo que ya existe:
 
 ```
 concept_probe/
-  core/                 # capas 0-6: las cuentas; guardar y registrar se llaman al final
-    models.py           # 0  cargar e identidad
-    inputs.py           # 1  codificar y tramos
-    read.py             # 1  pasar por el modelo y resumir
-    cache.py            # 1  caché de representaciones
+  modeling.py           # 0  cargar: dtype automático, cuantización, identidad, modelo ya cargado
+  inputs.py             # 1  codificar: roles, tramos de cada mensaje y del texto, caracteres de cada token
+  reading.py            # 1  pasar por el modelo en lotes, readouts, caché (SQLite por identidad)
+  settings.py           #    ajustes de sesión: guardar, carpeta, consola
+  record.py             #    registro de elecciones automáticas (consola, log, lo guardado)
+```
+
+Lo que falta, con los nombres provisionales de la propuesta:
+
+```
+concept_probe/
+  core/                 # (etapas 2 a 6)
     directions.py       # 2  estimadores
     probe.py            # 3  Probe y calibraciones
     interventions.py    # 4
@@ -355,6 +365,15 @@ elecciones automáticas y el guardado por defecto. `extract_text_reps` y el entr
 usar el lector nuevo.
 - Al terminar: el entrenamiento da lo mismo (con la tolerancia de D8) y leer cientos de textos es
   varias veces más rápido.
+- *Hecha el 2026-11-05; los tests de referencia siguen iguales. Probada con modelos reales: dtype
+  automático (fp16 para Qwen, fp32 para Gemma 3 en la RTX 2060), NF4, int8 y HQQ4; leer 64
+  textos en lotes de 16 tardó 0.5 s contra 3.8 s de a uno, y un d pasó de 3.4043 a 3.4041;
+  leer una palabra y los tramos de cada mensaje andan con los tokenizers de Qwen, Llama y Gemma.
+  Cambios respecto de la propuesta: la caché es un archivo SQLite por identidad del modelo y no
+  un archivo por texto (en Windows, abrir cada archivo tardaba 25 ms, más que leer el texto con un
+  modelo chico); su clave son los ids de los tokens, que ya contienen el contexto de lectura, y no
+  el texto más el contexto; el contexto de lectura como objeto pasa a la etapa 2, donde lo
+  necesitan las calibraciones; `configure(save=False)` apaga también la caché de un workspace.*
 
 **Etapa 2 — Direcciones y probe en memoria (capas 2 y 3).** Entradas 20, 15, 14, 19 (set neutro) y
 26 (umbral); estimadores logística, LDA y sin dimensiones extremas; un polo contra una línea de base.

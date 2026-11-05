@@ -40,7 +40,7 @@ def _train(tmp_path, monkeypatch, overrides=None, concept=None, generate=_genera
     }, overrides or {}))
     concept = concept or ConceptSpec(name="c", pos_label="p", neg_label="n", pos_system="POS", neg_system="NEG",
                                      eval_pos_texts=["ppp", "ppx", "px"], eval_neg_texts=["nnn", "nnx", "nx"])
-    bundle = SimpleNamespace(model_id="fake", tokenizer=CharChatTok(), model=object(), num_layers=2)
+    bundle = SimpleNamespace(model_id="fake", tokenizer=CharChatTok(), model=CharModel(), num_layers=2)
     probe = ConceptProbe(model_bundle=bundle, config=cfg, concept=concept, run_dir=str(tmp_path),
                          logger=JsonlLogger(str(tmp_path / "log.jsonl"))).train()
     return probe, json.loads((tmp_path / "metrics.json").read_text()), np.load(tmp_path / "tensors.npz")
@@ -160,7 +160,9 @@ def test_a_reused_batch_directory_raises_unless_overwriting(tmp_path, monkeypatc
 
 
 def test_a_steering_probe_outside_the_list_is_checked_against_the_model(tmp_path, monkeypatch):
-    a = _scoring_probe(tmp_path, monkeypatch, "a")
+    # explicit dtypes: with the default "auto", the config alone does not say which dtype was used
+    a = _scoring_probe(tmp_path, monkeypatch, "a", config={"output": {"console": False},
+                                                           "model": {"dtype": "bfloat16"}})
     other = _scoring_probe(tmp_path, monkeypatch, "other", config={"output": {"console": False},
                                                                    "model": {"dtype": "float32"}})
     other.sigma_best_layer = 1.0

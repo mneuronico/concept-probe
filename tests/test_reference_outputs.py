@@ -20,9 +20,7 @@ import numpy as np
 import pytest
 
 from concept_probe import extract_completion_reps, extract_text_reps, multi_probe_score_prompts, score_text_tokens
-from concept_probe.config import ConceptSpec, resolve_config
-from concept_probe.console import ConsoleLogger
-from concept_probe.modeling import ModelBundle
+from concept_probe.config import ConceptSpec
 from concept_probe.probe import ProbeWorkspace
 from concept_probe.utils import deep_merge
 from fakes import CharChatTok
@@ -103,22 +101,15 @@ def _files(root):
 
 
 def _workspace(root, overrides=None):
-    # The model is passed in instead of loaded from the config (entry 4 of LIBRARY_ISSUES will make
-    # this a constructor).
-    ws = ProbeWorkspace.__new__(ProbeWorkspace)
-    ws.project_directory = None
-    ws.config = resolve_config(deep_merge({
+    # The model is passed in already loaded (entry 4 of LIBRARY_ISSUES).
+    return ProbeWorkspace(config_overrides=deep_merge({
         "output": {"root_dir": str(root), "console": False},
         "plots": {"enabled": False},
         "prompts": {"train_questions": QUESTIONS, "eval_questions": EVAL_QUESTIONS},
         "training": {"train_max_new_tokens": 10, "gen_batch_size": 4},
         "evaluation": {"eval_max_new_tokens": 10, "n_permutations": 200, "n_bootstrap": 200},
         "steering": {"steer_max_new_tokens": 10},
-    }, overrides or {}))
-    ws.root_dir = ws.config["output"]["root_dir"]
-    ws.console = ConsoleLogger(False)
-    ws.model_bundle = ModelBundle(model_id=ws.config["model"]["model_id"], tokenizer=CharChatTok(), model=TinyCausalLM())
-    return ws
+    }, overrides or {}), model=TinyCausalLM(), tokenizer=CharChatTok(), model_id="tiny-test")
 
 
 def _concept(name, **kwargs):

@@ -11,7 +11,56 @@ import torch
 
 from .config import ConceptSpec, check_config_keys, load_defaults, resolve_config
 from .logger import JsonlLogger
-from .modeling import ModelBundle, _chat_template_kwargs, _resolve_attr_path, apply_chat, attention_mask_from_ids
+from .modeling import (
+    ModelBundle,
+    _chat_template_kwargs,
+    _resolve_attr_path,
+    apply_chat,
+    attention_mask_from_ids,
+    identity_from_config,
+    identity_mismatches,
+    identity_of,
+)
+from .record import Choice, announce
+from .settings import settings
+from .reading import (  # re-exported: they lived here before
+    EmptySpanError,
+    NonFiniteActivationsError,
+    READ_MODES,
+    Readout,
+    Reps,
+    _FINAL_NORM_PATHS,
+    _get_final_norm_module,
+    _model_dtype,
+    _read,
+    _slice_generation_step_logits,
+    _span_bounds,
+    check_finite_hidden_states,
+    extract_completion_reps,
+    extract_text_reps,
+    forward_hidden_states_all_layers,
+    read_encoded,
+    read_texts,
+    reps_from_hs_layers,
+)
+from .inputs import (  # re-exported: they lived here before
+    Encoded,
+    PromptLike,
+    PromptMessage,
+    TEXT_ROLES,
+    _TEXT_SENTINEL,
+    _completion_input_ids,
+    _decode_tokens,
+    _encode_for_read,
+    _encode_text_for_read,
+    _has_chat_template,
+    _no_bos_sink_start,
+    _normalize_messages,
+    _prompt_to_text,
+    _token_count,
+    _user_text_span,
+    preview_input,
+)
 from .steering import MultiLayerSteererLayerwise
 from .utils import (
     deep_merge,
@@ -230,15 +279,6 @@ def _bootstrap_d_ci(
             ds.append(cohen_d_np(rng.choice(pos, pos.size), rng.choice(neg, neg.size)))
     lo, hi = np.nanpercentile(ds, [2.5, 97.5])
     return [float(lo), float(hi)]
-
-
-def _span_bounds(total: int, start: Optional[int], end: Optional[int]) -> Tuple[int, int]:
-    """``[lo, hi)`` of an item's own tokens; position 0 (the BOS) is left out when the span is unknown."""
-    lo = 1 if start is None else int(start)
-    hi = total if end is None else min(int(end), total)
-    if lo >= hi:
-        lo, hi = 0, total
-    return lo, hi
 
 
 def _mean_token_norms(hs_layers: List[torch.Tensor], start: Optional[int], end: Optional[int]) -> np.ndarray:
@@ -466,250 +506,6 @@ def _prepare_batch_dir(out_dir: str, overwrite: bool) -> None:
     ensure_dir(out_dir)
 
 
-def _decode_tokens(tokenizer, token_ids: Iterable[int]) -> List[str]:
-    return [tokenizer.decode([int(t)], skip_special_tokens=False) for t in token_ids]
-
-
-def _has_chat_template(tokenizer) -> bool:
-    return bool(getattr(tokenizer, "chat_template", None))
-
-
-_CHAT_TEMPLATE_FALLBACK_WARNED: set = set()
-
-
-def _encode_for_read(
-    tokenizer,
-    prompt: "PromptLike",
-    default_system: Optional[str],
-    *,
-    warn: Optional[Callable[[str], None]] = None,
-    warn_prefix: str = "read",
-) -> torch.Tensor:
-    """Encode a chat-formatted 'read' input (no generation): ``prompt`` as a user turn, after
-    ``default_system`` if one is set (see :func:`_normalize_messages`). Without a chat template
-    it falls back to plain tokenization, and any system text is dropped.
-    """
-    if _has_chat_template(tokenizer):
-        messages, _ = _normalize_messages(
-            prompt, default_system, warn=warn, warn_prefix=warn_prefix
-        )
-        return apply_chat(tokenizer, messages, add_generation_prompt=False)
-
-    text = prompt if isinstance(prompt, str) else _prompt_to_text(prompt)
-    fallback_key = id(tokenizer)
-    if warn is not None and fallback_key not in _CHAT_TEMPLATE_FALLBACK_WARNED:
-        warn(
-            f"{warn_prefix}: tokenizer has no chat_template; falling back to plain tokenization"
-            + (" (the system prompt is dropped)." if default_system else ".")
-        )
-        _CHAT_TEMPLATE_FALLBACK_WARNED.add(fallback_key)
-    enc = tokenizer(text, return_tensors="pt", add_special_tokens=True)
-    return enc["input_ids"]
-
-
-def _completion_input_ids(tokenizer, messages: "List[PromptMessage]", completion: str) -> Tuple[torch.Tensor, int]:
-    """Chat-format ``messages`` with an assistant generation prompt and append ``completion``.
-
-    Returns ``(input_ids, prompt_len)``: the completion occupies ``input_ids[0, prompt_len:]``,
-    with no end-of-turn token after it.
-    """
-    prompt_ids = apply_chat(tokenizer, messages, add_generation_prompt=True)
-    plen = int(prompt_ids.shape[-1])
-    comp_ids = tokenizer(str(completion), add_special_tokens=False, return_tensors="pt")["input_ids"]
-    if comp_ids.dim() == 1:
-        comp_ids = comp_ids.unsqueeze(0)
-    return torch.cat([prompt_ids, comp_ids.to(prompt_ids.dtype)], dim=1), plen
-
-
-TEXT_ROLES = ("user", "assistant", "raw")
-
-_TEXT_SENTINEL = "CONCEPT_PROBE_TEXT_SENTINEL"
-
-
-def _token_count(tokenizer, text: str) -> int:
-    ids = tokenizer(text, add_special_tokens=False)["input_ids"]
-    return int(torch.as_tensor(ids).reshape(-1).shape[0])
-
-
-def _user_text_span(
-    tokenizer, text: "PromptLike", system: Optional[str], input_ids: torch.Tensor
-) -> Optional[Tuple[int, int, bool]]:
-    """Token span of a user-role text inside its encoding from :func:`_encode_for_read`.
-
-    Returns ``(start, end, trimmed)``: ``[start, end)`` are the text's own tokens, leaving out
-    the BOS, system block and role headers before the text and the end-of-turn tokens after it
-    (for a message-list text, the last message's content). ``trimmed`` is True when the chat
-    template stripped whitespace from the text. Returns None if the span cannot be located.
-    """
-    total = int(input_ids.shape[-1])
-    if not _has_chat_template(tokenizer):
-        # Position 0 is the attention sink: the BOS, or else the first text token (left out).
-        flat = text if isinstance(text, str) else _prompt_to_text(text)
-        bos = getattr(tokenizer, "bos_token_id", None)
-        has_bos = bos is not None and total > 0 and int(input_ids[0, 0]) == int(bos)
-        n_text = _token_count(tokenizer, flat)
-        return 1, min(total, (1 if has_bos else 0) + n_text), False
-
-    messages, _ = _normalize_messages(text, system)
-    content = messages[-1]["content"]
-    try:
-        kwargs = _chat_template_kwargs(tokenizer)
-        rendered = tokenizer.apply_chat_template(messages, add_generation_prompt=False, tokenize=False, **kwargs)
-        # The template's output before the content does not depend on the content, so a sentinel
-        # in its place gives where the text starts.
-        probe_messages = messages[:-1] + [dict(messages[-1], content=_TEXT_SENTINEL)]
-        probe_rendered = tokenizer.apply_chat_template(
-            probe_messages, add_generation_prompt=False, tokenize=False, **kwargs
-        )
-        enc = tokenizer(rendered, add_special_tokens=False, return_offsets_mapping=True)
-    except Exception:
-        return None
-    if not isinstance(rendered, str) or not isinstance(probe_rendered, str):
-        return None
-    if list(enc["input_ids"]) != input_ids[0].tolist():
-        return None
-    char_start = probe_rendered.rfind(_TEXT_SENTINEL)
-    if char_start < 0:
-        return None
-    needle = next((n for n in (content, content.strip()) if n and rendered.startswith(n, char_start)), None)
-    if needle is None:  # the template rewrote the text
-        return None
-    char_end = char_start + len(needle)
-    covered = [
-        i for i, (a, b) in enumerate(enc["offset_mapping"]) if b > a and a < char_end and b > char_start
-    ]
-    if not covered:
-        return None
-    return covered[0], covered[-1] + 1, needle != content
-
-
-_TEMPLATE_TRIM_WARNED: set = set()
-_NO_BOS_WARNED: set = set()
-
-
-def _no_bos_sink_start(tokenizer, warn: Optional[Callable[[str], None]], warn_prefix: str) -> int:
-    """Where a raw text's own span starts when the tokenizer has no BOS token: after its first token.
-
-    The first position of an input is the attention sink, with activations far larger than other
-    tokens'; with a BOS it is the BOS, otherwise it is the text's first token, which is then left
-    out of pooling.
-    """
-    if warn is not None and id(tokenizer) not in _NO_BOS_WARNED:
-        warn(
-            f"{warn_prefix}: the tokenizer has no BOS token, so the first token of each text is the attention "
-            "sink (activations far larger than the rest); it is left out of pooling."
-        )
-        _NO_BOS_WARNED.add(id(tokenizer))
-    return 1
-
-
-def _encode_text_for_read(
-    tokenizer,
-    text: "PromptLike",
-    system: Optional[str] = None,
-    *,
-    role: str = "raw",
-    prompt: Optional[str] = None,
-    warn: Optional[Callable[[str], None]] = None,
-    warn_prefix: str = "read",
-) -> Tuple[torch.Tensor, Optional[int], Optional[int]]:
-    """Encode a text to read (no generation), as texts-mode training, eval texts,
-    ``score_texts`` and ``extract_text_reps`` do.
-
-    Returns ``(input_ids, text_start, text_end)``: ``input_ids[0, text_start:text_end]`` are the
-    text's own tokens, the span the ``assistant_*`` readout modes pool over.
-
-    - ``role="raw"`` (default): the text alone, with no chat template and no system prompt: the
-      BOS token (if the tokenizer has one) and the text. ``system`` and ``prompt`` are ignored.
-      Without a BOS, the text's first token is the attention sink and is left out of the span.
-    - ``role="user"``: the text as a user turn of the chat template, after ``system`` if one is
-      set. A message list is read as given. The span leaves out the template tokens around the
-      text; it is None when it cannot be located (``sequence_*`` modes still work then).
-    - ``role="assistant"``: the text as the model's own reply: ``system`` if set, an optional user
-      turn ``prompt``, the assistant header, then the text, with no end-of-turn token after it.
-    """
-    if role not in TEXT_ROLES:
-        raise ValueError(f"training.train_text_role must be one of {TEXT_ROLES}; got {role!r}")
-    if role == "user":
-        ids = _encode_for_read(tokenizer, text, system, warn=warn, warn_prefix=warn_prefix)
-        span = _user_text_span(tokenizer, text, system, ids)
-        if span is None:
-            if warn is not None:
-                warn(f"{warn_prefix}: could not locate the text's own tokens in the chat-formatted input.")
-            return ids, None, None
-        if span[2] and warn is not None and id(tokenizer) not in _TEMPLATE_TRIM_WARNED:
-            warn(f"{warn_prefix}: the chat template strips leading/trailing whitespace from texts.")
-            _TEMPLATE_TRIM_WARNED.add(id(tokenizer))
-        return ids, span[0], span[1]
-    if not isinstance(text, str):
-        raise TypeError(
-            f"{warn_prefix}: role={role!r} needs plain-string texts; read a message list with role='user'."
-        )
-    if role == "raw":
-        if (prompt is not None or system) and warn is not None:
-            warn(f"{warn_prefix}: role='raw' reads the text alone; system and prompt are ignored.")
-        ids = tokenizer(text, add_special_tokens=False, return_tensors="pt")["input_ids"]
-        if ids.dim() == 1:
-            ids = ids.unsqueeze(0)
-        bos = getattr(tokenizer, "bos_token_id", None)
-        if bos is None:
-            return ids, _no_bos_sink_start(tokenizer, warn, warn_prefix), int(ids.shape[-1])
-        ids = torch.cat([torch.tensor([[bos]], dtype=ids.dtype), ids], dim=1)
-        return ids, 1, int(ids.shape[-1])
-    if not _has_chat_template(tokenizer):
-        raise ValueError("role='assistant' needs a tokenizer with a chat template.")
-    messages: "List[PromptMessage]" = []
-    if system:
-        messages.append({"role": "system", "content": str(system)})
-    if prompt is not None:
-        messages.append({"role": "user", "content": str(prompt)})
-    if not messages:
-        raise ValueError(
-            f"{warn_prefix}: reading a text as the assistant's reply needs a turn before it, since chat "
-            "templates cannot format a conversation that starts with the reply: pass prompt= (a user turn) "
-            "or system= (in training: training.train_text_prompt, or training.train_text_system / "
-            "prompts.neutral_system)."
-        )
-    ids, plen = _completion_input_ids(tokenizer, messages, text)
-    return ids, plen, int(ids.shape[-1])
-
-
-def preview_input(
-    tokenizer,
-    text: "PromptLike",
-    *,
-    role: str = "raw",
-    system: Optional[str] = None,
-    prompt: Optional[str] = None,
-    generation: bool = False,
-) -> Dict[str, Any]:
-    """Exactly what the library feeds the model for ``text``, before running anything.
-
-    ``generation=False`` encodes ``text`` as a text to read, as texts-mode training, eval texts,
-    ``score_texts`` and ``extract_text_reps`` do with the same ``role``/``system``/``prompt``.
-    ``generation=True`` encodes it as a prompt to generate from, as ``score_prompts`` does: a user
-    turn (after ``system`` if set) and the assistant header; ``role`` and ``prompt`` are ignored.
-
-    Returns ``input_text`` (decoded with every special and template token), ``input_ids``,
-    ``tokens``, and ``text_span`` / ``span_text``: the tokens the ``assistant_*`` readouts pool
-    over (None for generation prompts).
-    """
-    if generation:
-        messages, _ = _normalize_messages(text, system)
-        ids = apply_chat(tokenizer, messages, add_generation_prompt=True)
-        start = end = None
-    else:
-        ids, start, end = _encode_text_for_read(tokenizer, text, system, role=role, prompt=prompt)
-    token_ids = [int(t) for t in ids[0].tolist()]
-    return {
-        "input_text": tokenizer.decode(token_ids, skip_special_tokens=False),
-        "input_ids": token_ids,
-        "tokens": _decode_tokens(tokenizer, token_ids),
-        "text_span": None if start is None else (int(start), int(end)),
-        "span_text": None if start is None else tokenizer.decode(token_ids[start:end], skip_special_tokens=False),
-    }
-
-
 def _prompt_slug(text: str, max_words: int = 8, max_len: int = 48) -> str:
     words = text.strip().split()
     snippet = " ".join(words[:max_words])
@@ -717,78 +513,8 @@ def _prompt_slug(text: str, max_words: int = 8, max_len: int = 48) -> str:
     return slug or "prompt"
 
 
-PromptMessage = Dict[str, str]
-PromptLike = Union[str, List[PromptMessage]]
-
-
-def _prompt_to_text(prompt: PromptLike) -> str:
-    if isinstance(prompt, str):
-        return prompt
-    if not isinstance(prompt, list):
-        return str(prompt)
-    parts: List[str] = []
-    for m in prompt:
-        if not isinstance(m, dict):
-            parts.append(str(m))
-            continue
-        role = str(m.get("role", ""))
-        content = str(m.get("content", ""))
-        if role:
-            parts.append(f"{role}: {content}")
-        else:
-            parts.append(content)
-    return "\n".join(parts)
-
-
 def _prompt_slug_any(prompt: PromptLike, max_words: int = 8, max_len: int = 48) -> str:
     return _prompt_slug(_prompt_to_text(prompt), max_words=max_words, max_len=max_len)
-
-
-def _normalize_messages(
-    prompt: PromptLike,
-    default_system: Optional[str],
-    *,
-    warn: Optional[Callable[[str], None]] = None,
-    warn_prefix: str = "prompt",
-) -> Tuple[List[PromptMessage], bool]:
-    """Return (messages, used_prompt_system).
-
-    A system message is added only when ``default_system`` is set; None or "" add none.
-
-    - A string prompt becomes a user turn, after the system message if any.
-    - A message list is used as given. ``default_system`` is prepended only if the list has no
-      system message; if it has one, that one wins (with a warning when ``default_system`` is set).
-    """
-    system_messages = [{"role": "system", "content": str(default_system)}] if default_system else []
-    if isinstance(prompt, str):
-        return system_messages + [{"role": "user", "content": prompt}], False
-
-    if not isinstance(prompt, list):
-        raise TypeError(f"{warn_prefix} must be str or list of messages; got {type(prompt)}")
-
-    messages: List[PromptMessage] = []
-    system_count = 0
-    for i, m in enumerate(prompt):
-        if not isinstance(m, dict):
-            raise TypeError(f"{warn_prefix}[{i}] must be a dict with role/content; got {type(m)}")
-        if "role" not in m or "content" not in m:
-            raise ValueError(f"{warn_prefix}[{i}] must have 'role' and 'content' keys")
-        role = str(m["role"])
-        content = str(m["content"])
-        if role == "system":
-            system_count += 1
-        messages.append({"role": role, "content": content})
-
-    if system_count > 0:
-        if default_system and warn is not None:
-            warn(
-                f"{warn_prefix} includes a system message; the provided default system prompt is ignored."
-            )
-        if system_count > 1 and warn is not None:
-            warn(f"{warn_prefix} includes multiple system messages; using them as provided.")
-        return (messages, True)
-
-    return system_messages + messages, False
 
 
 def _alpha_label(alpha: float, unit: str) -> str:
@@ -844,298 +570,6 @@ def _pack_generation_logits_arrays(
         out["generation_logits_topk_k"] = np.array([0], dtype=np.int32)
 
     return out
-
-
-def _slice_generation_step_logits(
-    full_logits: torch.Tensor,
-    *,
-    prompt_len: int,
-    total_tokens: int,
-) -> torch.Tensor:
-    if full_logits.ndim != 2:
-        raise ValueError(f"Expected full logits shape (seq_len, vocab_size); got {tuple(full_logits.shape)}")
-
-    generated_steps = max(0, int(total_tokens) - int(prompt_len))
-    if generated_steps <= 0:
-        return full_logits.new_empty((0, int(full_logits.shape[-1])))
-
-    start = 0 if int(prompt_len) <= 0 else int(prompt_len) - 1
-    end = start + generated_steps
-    if end > int(full_logits.shape[0]):
-        raise ValueError(
-            f"Cannot slice generation logits: prompt_len={prompt_len}, total_tokens={total_tokens}, logits_seq_len={int(full_logits.shape[0])}"
-        )
-    return full_logits[start:end]
-
-
-# Mirrors the wrapper layouts handled by modeling.get_transformer_layers, so any model
-# whose blocks we can find also has a findable final norm.
-_FINAL_NORM_PATHS = (
-    "model.norm",
-    "model.final_layernorm",
-    "model.ln_f",
-    "model.language_model.norm",
-    "language_model.norm",
-    "model.model.norm",
-    "model.model.language_model.norm",
-    "base_model.model.norm",
-    "base_model.model.language_model.norm",
-    "transformer.ln_f",
-    "norm",
-    "final_layernorm",
-    "ln_f",
-)
-
-
-def _get_final_norm_module(model):
-    for path in _FINAL_NORM_PATHS:
-        mod = _resolve_attr_path(model, path)
-        if mod is not None and isinstance(mod, torch.nn.Module):
-            return mod
-    tried = ", ".join(_FINAL_NORM_PATHS)
-    raise AttributeError(
-        f"Could not locate the final norm module on {type(model).__name__}; tried: {tried}"
-    )
-
-
-class NonFiniteActivationsError(FloatingPointError):
-    """The model produced NaN or inf hidden states, typically an overflow of half precision."""
-
-
-def _model_dtype(model) -> Optional[torch.dtype]:
-    dtype = getattr(model, "dtype", None)
-    if isinstance(dtype, torch.dtype):
-        return dtype
-    try:
-        return next(model.parameters()).dtype
-    except Exception:
-        return None
-
-
-def check_finite_hidden_states(hs_layers: Sequence[torch.Tensor], model) -> None:
-    """Raise :class:`NonFiniteActivationsError` if any layer holds NaN or inf.
-
-    Nothing downstream can tell such a layer from a real one: its directions, scores and d come
-    out NaN and the layer sweep would skip it in silence. The message names the model's dtype,
-    since the usual cause is half precision overflowing (Gemma 3 in float16, for one).
-    """
-    bad = [l for l, h in enumerate(hs_layers) if not bool(torch.isfinite(h).all())]
-    if not bad:
-        return
-    where = f"layers {bad}" if len(bad) <= 8 else f"{len(bad)} layers ({bad[0]} to {bad[-1]})"
-    quantized = getattr(getattr(model, "config", None), "quantization_config", None) is not None
-    raise NonFiniteActivationsError(
-        f"The model's hidden states are not finite (NaN or inf) at {where} of {len(hs_layers)}; the model "
-        f"runs in {_model_dtype(model)}{' (quantized)' if quantized else ''}. This is usually half precision "
-        "overflowing (Gemma 3 does in float16): load the model in bfloat16 if the GPU supports it, or in "
-        "float32" + (", and use that as the quantization's compute dtype." if quantized else ".")
-    )
-
-
-@torch.no_grad()
-def forward_hidden_states_all_layers(
-    model,
-    input_ids: torch.Tensor,
-    *,
-    return_generation_logits: bool = False,
-    generation_prompt_len: Optional[int] = None,
-) -> Union[List[torch.Tensor], Tuple[List[torch.Tensor], torch.Tensor]]:
-    """Per-layer hidden states ``(seq_len, hidden_dim)`` (CPU float32) of one input: entry ``l`` is
-    the output of block ``l``. Raises :class:`NonFiniteActivationsError` on NaN or inf."""
-    attn = attention_mask_from_ids(input_ids).to(model.device)
-
-    final_norm = _get_final_norm_module(model)
-    captured: Dict[str, torch.Tensor] = {}
-
-    def _capture_pre_norm(module, args):
-        x = args[0] if isinstance(args, tuple) else args
-        captured["pre_norm"] = x.detach()
-
-    handle = final_norm.register_forward_pre_hook(_capture_pre_norm)
-    try:
-        out = model(
-            input_ids=input_ids.to(model.device),
-            attention_mask=attn,
-            output_hidden_states=True,
-            use_cache=False,
-            return_dict=True,
-        )
-    finally:
-        handle.remove()
-
-    if "pre_norm" not in captured:
-        raise RuntimeError(
-            "Forward pre-hook on final norm did not fire; model layout is unexpected."
-        )
-
-    hs = list(out.hidden_states)
-    # HF returns the post-final-norm tensor as hidden_states[-1] for decoder-only LMs,
-    # collapsing the last layer to a much smaller scale than the rest of the residual
-    # stream. Replace it with the pre-norm input so all layers are on the same scale.
-    hs[-1] = captured["pre_norm"]
-
-    num_layers = len(hs) - 1
-    hs_layers = [hs[l + 1][0].detach().float().cpu() for l in range(num_layers)]
-    check_finite_hidden_states(hs_layers, model)
-    if not return_generation_logits:
-        return hs_layers
-
-    logits = getattr(out, "logits", None)
-    if logits is None:
-        raise ValueError("Model output does not include logits; cannot save generation logits.")
-    logits_2d = logits[0]
-    seq_len = int(input_ids.shape[-1])
-    prompt_len = seq_len if generation_prompt_len is None else int(generation_prompt_len)
-    step_logits = _slice_generation_step_logits(
-        logits_2d,
-        prompt_len=prompt_len,
-        total_tokens=seq_len,
-    )
-    return hs_layers, step_logits.detach().to(dtype=torch.float32, device="cpu")
-
-
-READ_MODES = (
-    "sequence_last",
-    "sequence_last_k_mean",
-    "sequence_all_mean",
-    "assistant_last",
-    "assistant_last_k_mean",
-    "assistant_all_mean",
-)
-
-
-class EmptySpanError(ValueError):
-    """An item has no tokens of its own to pool: an empty completion or an empty text."""
-
-
-def reps_from_hs_layers(
-    hs_layers: List[torch.Tensor],
-    prompt_len: Optional[int],
-    mode: str,
-    last_k: int,
-    span_end: Optional[int] = None,
-) -> np.ndarray:
-    """Pool each layer's hidden states ``(seq_len, dim)`` into one rep per layer.
-
-    ``assistant_*`` modes read the span ``[prompt_len, span_end)`` (``span_end`` defaults to the
-    end of the sequence): a generated completion, or the own tokens of a read text.
-    ``sequence_*`` modes read from the start of the input to ``span_end``: the prompt and
-    template tokens before the item are included, the tokens after it (an end-of-sequence or
-    end-of-turn token) are not, like in every other readout. An empty span raises
-    :class:`EmptySpanError` rather than pooling something else (the prompt and system prompt
-    would stand in for the missing text).
-    """
-    if mode not in READ_MODES:
-        raise ValueError(f"Unknown mode: {mode}")
-    num_layers = len(hs_layers)
-    dim = int(hs_layers[0].shape[1])
-    total = int(hs_layers[0].shape[0])
-    reps = np.zeros((num_layers, dim), dtype=np.float32)
-
-    start, end = 0, total
-    if mode.startswith("assistant_"):
-        if prompt_len is None:
-            raise ValueError(
-                f"mode={mode} pools over a text or completion span, but its start is unknown; "
-                "use a sequence_* mode to read the whole sequence."
-            )
-        start = int(prompt_len)
-        end = total if span_end is None else min(int(span_end), total)
-        if start >= end:
-            raise EmptySpanError(f"mode={mode}: no tokens to pool (span [{start}, {end}) of a {total}-token input)")
-
-    seq_end = total if span_end is None else min(int(span_end), total)
-    for l in range(num_layers):
-        hs = hs_layers[l][:seq_end] if mode.startswith("sequence_") else hs_layers[l]
-        if mode == "sequence_last":
-            reps[l] = hs[-1].numpy()
-        elif mode == "sequence_last_k_mean":
-            reps[l] = hs[-min(last_k, hs.shape[0]):].mean(dim=0).numpy()
-        elif mode == "sequence_all_mean":
-            reps[l] = hs.mean(dim=0).numpy()
-        else:
-            span = hs[start:end]
-            if mode == "assistant_last":
-                reps[l] = span[-1].numpy()
-            elif mode == "assistant_last_k_mean":
-                reps[l] = span[-min(last_k, span.shape[0]):].mean(dim=0).numpy()
-            else:
-                reps[l] = span.mean(dim=0).numpy()
-
-    return reps
-
-
-@torch.no_grad()
-def extract_completion_reps(
-    model,
-    tokenizer,
-    pairs: List[Tuple[PromptLike, str]],
-    *,
-    pool: str = "assistant_all_mean",
-    last_k: int = 12,
-    system: Optional[str] = None,
-) -> np.ndarray:
-    """Per-layer reps pooled over the completion tokens, for ``(prompt, completion)`` pairs.
-
-    Reconstructs the readout used during training: each prompt is chat-formatted with an
-    assistant generation prompt, the completion tokens are appended, one forward pass
-    captures all layers, and the hidden states are pooled over the completion span per
-    layer (``pool='assistant_all_mean'`` by default). Returns an array of shape
-    ``(len(pairs), num_layers, hidden_dim)``.
-
-    Use it to score externally-provided text -- e.g. another model's generations -- against
-    trained concept vectors, or to compare how different models represent the same text.
-    Prompts follow the rules of every other path: a string is a user turn, a message list is used
-    as given, and ``system`` (default None: no system message) is added unless the list has its own.
-    The completion is tokenized from its text, so its tokens can differ slightly from the ids a
-    generation produced.
-    """
-    out_reps: List[np.ndarray] = []
-    for prompt, completion in pairs:
-        messages, _ = _normalize_messages(prompt, system)
-        full_ids, plen = _completion_input_ids(tokenizer, messages, completion)
-        hs_layers = forward_hidden_states_all_layers(model, full_ids)
-        try:
-            out_reps.append(reps_from_hs_layers(hs_layers, prompt_len=plen, mode=pool, last_k=last_k))
-        except EmptySpanError as exc:
-            raise EmptySpanError(f"pairs[{len(out_reps)}]: {exc}") from None
-    return np.stack(out_reps, axis=0).astype(np.float32)
-
-
-@torch.no_grad()
-def extract_text_reps(
-    model,
-    tokenizer,
-    texts: List[str],
-    *,
-    role: str = "raw",
-    prompt: Optional[str] = None,
-    system: Optional[str] = None,
-    pool: Union[str, Sequence[str]] = "assistant_all_mean",
-    last_k: int = 12,
-) -> Union[np.ndarray, Dict[str, np.ndarray]]:
-    """Per-layer reps of texts, encoded exactly as texts-mode training encodes them.
-
-    ``role``, ``prompt`` and ``system`` mean what ``training.train_text_role``,
-    ``training.train_text_prompt`` and the training system prompt mean, and the defaults are the
-    training defaults: the raw text with no template or system prompt, pooled over its own
-    tokens. ``pool`` is one readout mode, returning ``(len(texts), num_layers, hidden_dim)``, or
-    several, returning a dict of such arrays from a single forward pass per text. Use
-    :func:`preview_input` to see the exact input.
-    """
-    pools = [pool] if isinstance(pool, str) else list(pool)
-    out: Dict[str, List[np.ndarray]] = {p: [] for p in pools}
-    for i, text in enumerate(texts):
-        ids, start, end = _encode_text_for_read(tokenizer, text, system, role=role, prompt=prompt,
-                                                warn_prefix=f"texts[{i}]")
-        hs_layers = forward_hidden_states_all_layers(model, ids)
-        for p in pools:
-            try:
-                out[p].append(reps_from_hs_layers(hs_layers, prompt_len=start, mode=p, last_k=last_k, span_end=end))
-            except EmptySpanError as exc:
-                raise EmptySpanError(f"texts[{i}]: {exc}") from None
-    arrays = {p: np.stack(v, axis=0).astype(np.float32) for p, v in out.items()}
-    return arrays[pool] if isinstance(pool, str) else arrays
 
 
 def token_scores_from_hs_layers(
@@ -1423,6 +857,9 @@ class ConceptProbe:
     resid_norm: Optional[np.ndarray] = None
     sweep_d: Optional[np.ndarray] = None
     sweep_p: Optional[np.ndarray] = None
+    # What makes the activations what they are (model, dtype used, quantization, chat template):
+    # a probe only applies to activations with the same identity.
+    model_identity: Optional[Dict[str, Any]] = None
 
     def train(self) -> "ConceptProbe":
         readout = self.config["readout"]
@@ -1489,6 +926,11 @@ class ConceptProbe:
         for key, mode in (("read_mode", readout["read_mode"]), ("train_mode", readout["train_mode"])):
             if mode not in READ_MODES:
                 raise ValueError(f"readout.{key} must be one of {READ_MODES}; got {mode!r}")
+        if str(train_readout_mode).endswith("_tokens"):
+            raise ValueError(
+                f"readout {train_readout_mode} makes every token a sample, and training on token samples is not "
+                "supported yet; read them with read_texts(..., readout='assistant_tokens'), or pick a pooled readout."
+            )
         text_role = train_cfg.get("train_text_role") or "raw"
         if text_role not in TEXT_ROLES:
             raise ValueError(f"training.train_text_role must be one of {TEXT_ROLES}; got {text_role!r}")
@@ -1551,6 +993,12 @@ class ConceptProbe:
         json_dump(os.path.join(self.run_dir, "config.json"), self.config)
         json_dump(os.path.join(self.run_dir, "concept.json"), self.concept.to_dict())
         self.logger.log("config", {"config": self.config, "concept": self.concept.to_dict()})
+        self.model_identity = model_identity_of(self.model_bundle, self.config)
+        self.logger.log("model_identity", self.model_identity)
+        # Every choice made on the caller's behalf goes to the run log and to metrics.json; the ones
+        # made when the model was loaded were printed then.
+        run_choices: List[Choice] = list(getattr(self.model_bundle, "choices", []) or [])
+        announce(run_choices, console=False, logger=self.logger)
 
         tokenizer = self.model_bundle.tokenizer
         model = self.model_bundle.model
@@ -1560,33 +1008,40 @@ class ConceptProbe:
 
         dropped_items: Dict[str, List[int]] = {}
 
+        read_batch_size = int(readout.get("batch_size", 16))
+        rep_cache = self._rep_cache_dir()
+        rep_cache_dtype = str(out_cfg.get("rep_cache_dtype", "float32"))
+
+        def note(choices: Sequence[Choice]) -> None:
+            """Announce and log reading's choices once per run (they repeat for every set read)."""
+            fresh = [c for c in choices if all(c != seen for seen in run_choices)]
+            run_choices.extend(fresh)
+            announce(fresh, console=self.console is not None and self.console.enabled, logger=self.logger)
+
         def pooled_reps(ids_list, starts, ends, mode, last_k, label, vectors=None):
             """Pooled reps ``(n, layers, dim)`` and mean token norms ``(n, layers)`` over each span, and,
-            given ``vectors``, each item's per-token projections ``(n_tokens, layers)``.
+            given ``vectors``, each item's per-token projections ``(n_tokens, layers)``. The items go
+            through the model ``readout.batch_size`` at a time, and through the representations cache
+            when it is on.
 
             An item with no tokens of its own (an empty completion or text) is left out and listed
             under ``dropped_items[label]``; a side left with no items raises.
             """
-            reps, norms, tokens = [], [], []
-            for i, (ids, start, end) in enumerate(zip(ids_list, starts, ends)):
-                hs_layers = forward_hidden_states_all_layers(model, ids.reshape(1, -1))
-                try:
-                    reps.append(reps_from_hs_layers(hs_layers, prompt_len=start, mode=mode, last_k=last_k, span_end=end))
-                except EmptySpanError:
-                    dropped_items.setdefault(label, []).append(i)
-                    continue
-                norms.append(_mean_token_norms(hs_layers, start, end))
-                if vectors is not None:
-                    tokens.append(_span_token_projections(hs_layers, vectors, start, end))
-            if label in dropped_items:
+            encodings = [Encoded(ids.reshape(-1), start, end) for ids, start, end in zip(ids_list, starts, ends)]
+            result = _read(model, tokenizer, encodings, [Readout.parse(mode, last_k)], batch_size=read_batch_size,
+                           norms=True, project_on=vectors, cache=rep_cache if rep_cache else False,
+                           cache_dtype=rep_cache_dtype, identity=self.model_identity, skip_empty=True,
+                           label=label)[0]
+            note(result.choices)
+            if result.skipped:
+                dropped_items[label] = sorted(result.skipped)
                 self._warn(
                     f"{label}: items {dropped_items[label]} have no tokens to pool (an empty completion or text) "
                     "and are left out."
                 )
-            if not reps:
+            if result.data.shape[0] == 0:
                 raise ValueError(f"{label}: no item has tokens to pool (every completion or text is empty).")
-            kept = [i for i in range(len(ids_list)) if i not in dropped_items.get(label, [])]
-            return np.stack(reps, axis=0).astype(np.float32), np.stack(norms, axis=0), tokens, kept
+            return result.data, result.norms, result.projections or [], result.read_items
 
         self._status(f"Training concept '{self.concept.name}' with model {self.model_bundle.model_id}")
         phase1_action = "Reading training texts" if train_prompt_mode == "texts" else "Generating training completions"
@@ -2252,6 +1707,10 @@ class ConceptProbe:
             "eval_readout": eval_readout,
             "transfer_eval": transfer_eval,
             "dropped_items": dropped_items or None,
+            "model_identity": self.model_identity,
+            "read_batch_size": read_batch_size,
+            "rep_cache": rep_cache,
+            "choices": [c.to_dict() for c in run_choices],
         }
         json_dump(os.path.join(self.run_dir, "metrics.json"), metrics)
         self.logger.log("artifacts_saved", {"npz_path": npz_path})
@@ -2260,6 +1719,15 @@ class ConceptProbe:
             jsonl_to_pretty(os.path.join(self.run_dir, "log.jsonl"), pretty_path)
         self._status(f"Saved artifacts to {self.run_dir}")
         return self
+
+    def _rep_cache_dir(self) -> Optional[str]:
+        """Where this run caches representations: ``output.rep_cache_dir``, or else
+        ``<output.root_dir>/rep_cache``; None when ``output.rep_cache`` is false or the session does
+        not save (``concept_probe.configure(save=False)`` turns off every implicit write)."""
+        out_cfg = self.config.get("output", {})
+        if not out_cfg.get("rep_cache", True) or not settings().save:
+            return None
+        return out_cfg.get("rep_cache_dir") or os.path.join(out_cfg.get("root_dir", "outputs"), "rep_cache")
 
     def _require_trained(self) -> None:
         if self.concept_vectors is None or self.best_layer is None:
@@ -2941,6 +2409,12 @@ class ConceptProbe:
             transfer = {k: (np.asarray(v, dtype=np.float64) if k != "context" else v) for k, v in transfer.items()}
         obj.transfer_references = transfer
         obj.resid_norm = tensors["resid_norm"]
+        metrics_path = os.path.join(run_dir, "metrics.json")
+        if os.path.exists(metrics_path):
+            with open(metrics_path, "r", encoding="utf-8") as f:
+                obj.model_identity = json.loads(f.read()).get("model_identity")
+        if not obj.model_identity:
+            obj.model_identity = identity_from_config(cfg.get("model", {}))
         sigma = float(obj.score_scale[obj.best_layer])
         obj.sigma_best_layer = sigma if np.isfinite(sigma) else None
         return obj
@@ -2958,8 +2432,14 @@ def _dotted_differences(a: Dict[str, Any], b: Dict[str, Any], prefix: str = "") 
     return out
 
 
-# Model settings that change the activations: a probe must be used with the ones it was trained with.
-_MODEL_IDENTITY_KEYS = ("model_id", "dtype", "use_4bit", "chat_template", "chat_template_date")
+def model_identity_of(obj: Any, config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """The model identity of a bundle or probe: the one recorded when it was loaded or trained, or
+    else the one its config describes (runs saved before identities were recorded)."""
+    identity = getattr(obj, "identity", None) or getattr(obj, "model_identity", None)
+    if identity:
+        return identity
+    cfg = config if config is not None else getattr(obj, "config", None) or {}
+    return identity_from_config(cfg.get("model", {}))
 
 
 class ProbeWorkspace:
@@ -2970,7 +2450,16 @@ class ProbeWorkspace:
         defaults_path: Optional[str] = None,
         model_id: Optional[str] = None,
         project_directory: Optional[str] = None,
+        model: Any = None,
+        tokenizer: Any = None,
     ) -> None:
+        """A model and a config to train and load probes with.
+
+        The model is loaded from the config's ``model`` section, or passed in already loaded:
+        ``model`` is a :class:`ModelBundle`, or a Hugging Face model together with its
+        ``tokenizer``. A passed model's own settings (name, dtype, quantization) replace the
+        config's, and that replacement is printed and logged like every automatic choice.
+        """
         self.project_directory = project_directory
 
         if project_directory:
@@ -2988,27 +2477,53 @@ class ProbeWorkspace:
             # root_dir isn't used for loading, but keep it consistent for callers.
             if root_dir:
                 cfg["output"]["root_dir"] = root_dir
-
             self.config = cfg
             self.root_dir = cfg["output"].get("root_dir", "outputs")
             self.console = ConsoleLogger(cfg["output"].get("console", False))
-            self.console.info(f"Loading model {cfg['model']['model_id']}...")
-            self.model_bundle = ModelBundle.load(cfg["model"])
-            self.console.info(f"Model loaded ({self.model_bundle.num_layers} layers).")
-            return
+        else:
+            cfg = resolve_config(config_overrides, defaults_path=defaults_path)
+            if model_id:
+                cfg["model"]["model_id"] = model_id
+            if root_dir:
+                cfg["output"]["root_dir"] = root_dir
+            self.config = cfg
+            self.root_dir = cfg["output"]["root_dir"]
+            ensure_dir(self.root_dir)
+            self.console = ConsoleLogger(cfg["output"].get("console", False))
+        self.model_bundle = self._model_bundle(model, tokenizer, model_id)
+        announce(self.model_bundle.choices, console=self.console.enabled)
+        self.console.info(f"Model ready ({self.model_bundle.num_layers} layers).")
 
-        cfg = resolve_config(config_overrides, defaults_path=defaults_path)
-        if model_id:
-            cfg["model"]["model_id"] = model_id
-        if root_dir:
-            cfg["output"]["root_dir"] = root_dir
-        self.config = cfg
-        self.root_dir = cfg["output"]["root_dir"]
-        ensure_dir(self.root_dir)
-        self.console = ConsoleLogger(cfg["output"].get("console", False))
-        self.console.info(f"Loading model {cfg['model']['model_id']}...")
-        self.model_bundle = ModelBundle.load(cfg["model"])
-        self.console.info(f"Model loaded ({self.model_bundle.num_layers} layers).")
+    def _model_bundle(self, model: Any, tokenizer: Any, model_id: Optional[str]) -> ModelBundle:
+        cfg = self.config
+        if model is None:
+            if tokenizer is not None:
+                raise ValueError("tokenizer was passed without a model.")
+            self.console.info(f"Loading model {cfg['model']['model_id']}...")
+            return ModelBundle.load(cfg["model"])
+        if isinstance(model, ModelBundle):
+            if tokenizer is not None:
+                raise ValueError("Pass either a ModelBundle or a model and its tokenizer, not both.")
+            bundle = model
+            if not bundle.identity:
+                bundle.identity = identity_of(bundle.model, bundle.tokenizer, bundle.model_id)
+        else:
+            if tokenizer is None:
+                raise ValueError("A model passed to ProbeWorkspace needs its tokenizer (tokenizer=...).")
+            bundle = ModelBundle.from_loaded(model, tokenizer, model_id=model_id, model_cfg=cfg["model"])
+        identity = bundle.identity
+        described = identity_from_config(cfg["model"])
+        replaced = {k: identity.get(k) for k in ("model_id", "dtype", "quantization")
+                    if described.get(k) != identity.get(k)}
+        if replaced:
+            bundle.choices = list(bundle.choices) + [Choice(
+                "model", {k: described.get(k) for k in replaced}, replaced,
+                "a loaded model was passed in; its own settings replace the config's model section",
+            )]
+        cfg["model"].update(model_id=identity.get("model_id") or cfg["model"]["model_id"],
+                            dtype=identity.get("dtype") or cfg["model"].get("dtype"),
+                            quantization=identity.get("quantization"), use_4bit=False)
+        return bundle
 
     def get_probe(
         self,
@@ -3019,9 +2534,9 @@ class ProbeWorkspace:
         """Load a previously trained probe without retraining.
 
         If this workspace was created with project_directory=..., that directory is used by default.
-        The workspace's model settings (model_id, dtype, use_4bit, chat template and its date)
-        must match the run's, since the probe's directions only apply to the activations they
-        were trained on; ``allow_model_mismatch=True`` loads it anyway. Scoring then uses the
+        The workspace's model identity (model, dtype actually used, quantization, chat template and
+        its date) must match the run's, since the probe's directions only apply to the activations
+        they were trained on; ``allow_model_mismatch=True`` loads it anyway. Scoring then uses the
         workspace config, and a warning lists the settings that differ from the run's.
         """
         if not (project_directory or self.project_directory):
@@ -3029,13 +2544,10 @@ class ProbeWorkspace:
         run_dir = os.path.abspath(project_directory or self.project_directory)
 
         probe = ConceptProbe.load(run_dir, model_bundle=self.model_bundle)
-        saved_model = probe.config.get("model", {})
-        mine = self.config.get("model", {})
-        mismatched = [f"{k}: run={saved_model.get(k)!r} workspace={mine.get(k)!r}" for k in _MODEL_IDENTITY_KEYS
-                      if saved_model.get(k) != mine.get(k)]
+        mismatched = identity_mismatches(model_identity_of(probe), model_identity_of(self.model_bundle, self.config))
         if mismatched and not allow_model_mismatch:
             raise ValueError(
-                "The workspace model differs from the one this probe was trained on ("
+                "The workspace model differs from the one this probe was trained on (run vs workspace: "
                 + "; ".join(mismatched)
                 + "). Load it with ProbeWorkspace(project_directory=run_dir) to use the run's own model "
                 "settings, or pass allow_model_mismatch=True."

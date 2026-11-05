@@ -57,18 +57,51 @@ def fake_forward(model, input_ids, **kwargs):
 
 
 class _Block(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, scale=1.0):
         super().__init__()
         self.p = torch.nn.Parameter(torch.zeros(1))  # a parameter, as real blocks have
+        self.scale = scale
 
+    def forward(self, x, *args, **kwargs):
+        return x * self.scale
+
+
+class FunctionModel(torch.nn.Module):
+    """A model whose hidden states come from ``fn(model, input_ids)``, a function of the kind tests
+    used to put in place of ``forward_hidden_states_all_layers``: given one input ``(1, seq_len)``,
+    it returns one ``(seq_len, dim)`` tensor per layer. Batches are computed row by row; ``calls``
+    counts forward passes."""
+
+    device = torch.device("cpu")
+
+    def __init__(self, fn, num_layers=None):
+        super().__init__()
+        self.fn = fn
+        probe = fn(None, torch.zeros(1, 1, dtype=torch.long))
+        self.model = torch.nn.Module()
+        self.model.layers = torch.nn.ModuleList([_Block() for _ in range(num_layers or len(probe))])
+        self.model.norm = torch.nn.Identity()
+        self.calls = 0
+
+    def forward(self, input_ids, attention_mask=None, output_hidden_states=False, **kwargs):
+        self.calls += 1
+        rows = [self.fn(None, row.unsqueeze(0)) for row in input_ids]
+        layers = [torch.stack([r[l] for r in rows]).float() for l in range(len(rows[0]))]
+        states = [torch.zeros_like(layers[0])] + layers[:-1] + [self.model.norm(layers[-1])]
+        return SimpleNamespace(hidden_states=tuple(states), logits=None)
+
+
+class _Norm(torch.nn.Module):
     def forward(self, x):
-        return x
+        return x / (x.abs().amax(dim=-1, keepdim=True) + 1.0)
 
 
 class CharModel(torch.nn.Module):
     """generate appends ``completion`` and the end-of-sequence token '$', as HF generate does.
 
-    It has two (identity) blocks, so steering hooks can be registered on it.
+    Its forward pass gives the hidden states of :func:`fake_forward` (block 0 passes the
+    embeddings ``[value, 1]`` through, block 1 doubles them), through two real blocks that steering
+    hooks can be registered on, and a final norm, as the library's readers expect.
     """
 
     device = torch.device("cpu")
@@ -77,9 +110,24 @@ class CharModel(torch.nn.Module):
     def __init__(self, completion="pp"):
         super().__init__()
         self.model = torch.nn.Module()
-        self.model.layers = torch.nn.ModuleList([_Block(), _Block()])
+        self.model.layers = torch.nn.ModuleList([_Block(1.0), _Block(2.0)])
+        self.model.norm = _Norm()
         self.completion = completion
         self.calls = []
+        self.forward_calls = []
+
+    def forward(self, input_ids, attention_mask=None, output_hidden_states=False, **kwargs):
+        self.forward_calls.append(input_ids.shape)
+        v = torch.tensor([[{"p": 1.0, "n": -1.0}.get(chr(int(t)), 0.0) for t in row] for row in input_ids])
+        x = torch.stack([v, torch.ones_like(v)], dim=-1)
+        states = [x]
+        h = x
+        for block in self.model.layers:
+            h = block(h)
+            states.append(h)
+        states[-1] = self.model.norm(h)
+        logits = torch.zeros(input_ids.shape + (128,))
+        return SimpleNamespace(hidden_states=tuple(states) if output_hidden_states else None, logits=logits)
 
     def generate(self, input_ids, max_new_tokens=8, **kwargs):
         self.calls.append(input_ids)

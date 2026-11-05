@@ -16,7 +16,7 @@ from concept_probe.config import ConceptSpec, resolve_config
 from concept_probe.logger import JsonlLogger
 from concept_probe.probe import ConceptProbe, _encode_text_for_read, reps_from_hs_layers
 from concept_probe.utils import deep_merge
-from fakes import CharChatTok, fake_forward
+from fakes import CharChatTok, CharModel, fake_forward
 
 
 _CharChatTok = CharChatTok
@@ -120,7 +120,7 @@ def _train(tmp_path, monkeypatch, mode, overrides=None, concept=None):
         "plots": {"enabled": False},
         "output": {"console": False, "pretty_json_log": False},
     }, overrides or {}))
-    bundle = SimpleNamespace(model_id="fake", tokenizer=tok, model=object(), num_layers=2)
+    bundle = SimpleNamespace(model_id="fake", tokenizer=tok, model=CharModel(), num_layers=2)
     ConceptProbe(model_bundle=bundle, config=cfg, concept=concept or _concept(), run_dir=str(tmp_path),
                  logger=JsonlLogger(str(tmp_path / "log.jsonl"))).train()
     metrics = json.loads((tmp_path / "metrics.json").read_text())
@@ -234,7 +234,7 @@ def test_settings_that_would_be_ignored_or_misread_raise_before_anything_runs(tm
 
     monkeypatch.setattr(probe_mod, "generate_batch", must_not_generate)
     cfg = resolve_config(deep_merge({"output": {"console": False}}, overrides))
-    bundle = SimpleNamespace(model_id="fake", tokenizer=_CharChatTok(), model=object(), num_layers=2)
+    bundle = SimpleNamespace(model_id="fake", tokenizer=_CharChatTok(), model=CharModel(), num_layers=2)
     probe = ConceptProbe(model_bundle=bundle, config=cfg, concept=_concept(), run_dir=str(tmp_path),
                          logger=JsonlLogger(str(tmp_path / "log.jsonl")))
     with pytest.raises(ValueError):
@@ -357,7 +357,7 @@ def test_an_empty_completion_is_left_out_instead_of_pooling_the_prompt(tmp_path,
         "evaluation": {"n_permutations": 10, "n_bootstrap": 10},
         "plots": {"enabled": False}, "output": {"console": False, "pretty_json_log": False},
     })
-    bundle = SimpleNamespace(model_id="fake", tokenizer=_CharChatTok(), model=object(), num_layers=2)
+    bundle = SimpleNamespace(model_id="fake", tokenizer=_CharChatTok(), model=CharModel(), num_layers=2)
     ConceptProbe(model_bundle=bundle, config=cfg, concept=_concept(), run_dir=str(tmp_path),
                  logger=JsonlLogger(str(tmp_path / "log.jsonl"))).train()
     metrics = json.loads((tmp_path / "metrics.json").read_text())
@@ -372,10 +372,9 @@ def test_a_side_with_no_tokens_at_all_raises(tmp_path, monkeypatch):
         _train(tmp_path, monkeypatch, "texts", concept=_concept(train_pos_texts=["", ""]))
 
 
-def test_extract_text_reps_names_an_empty_text(monkeypatch):
-    monkeypatch.setattr(probe_mod, "forward_hidden_states_all_layers", _fake_forward)
+def test_extract_text_reps_names_an_empty_text():
     with pytest.raises(probe_mod.EmptySpanError, match=r"texts\[1\]"):
-        probe_mod.extract_text_reps(object(), _CharChatTok(), ["pp", ""])
+        probe_mod.extract_text_reps(CharModel(), _CharChatTok(), ["pp", ""])
 
 
 def test_texts_mode_evaluated_on_completions_pools_them_like_its_training_texts(tmp_path, monkeypatch):
@@ -395,10 +394,9 @@ def test_the_saved_config_has_the_concept_that_was_trained(tmp_path, monkeypatch
     assert config["concept"]["name"] == "c" and config["concept"]["pos_system"] == "POS"
 
 
-def test_extract_completion_reps_formats_prompts_like_every_other_path(monkeypatch):
-    monkeypatch.setattr(probe_mod, "forward_hidden_states_all_layers", _fake_forward)
+def test_extract_completion_reps_formats_prompts_like_every_other_path():
     tok = _CharChatTok()
     own = [{"role": "system", "content": "mine"}, {"role": "user", "content": "q"}]
-    probe_mod.extract_completion_reps(object(), tok, [("q", "pp"), (own, "pp")], system="S")
+    probe_mod.extract_completion_reps(CharModel(), tok, [("q", "pp"), (own, "pp")], system="S")
     rendered = [r for r in tok.rendered if r.endswith("<a>")]
     assert rendered == ["^<s>S|<u>q|<a>", "^<s>mine|<u>q|<a>"]  # a list's own system message is kept

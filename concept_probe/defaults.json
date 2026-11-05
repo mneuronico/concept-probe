@@ -1,8 +1,9 @@
 {
   "model": {
     "model_id": "meta-llama/Llama-3.2-3B-Instruct",
+    "dtype": "auto",
+    "quantization": null,
     "use_4bit": false,
-    "dtype": "bfloat16",
     "device_map": "auto",
     "hf_token_env": "HF_TOKEN",
     "chat_template": null,
@@ -72,7 +73,8 @@
     "train_mode": "assistant_all_mean",
     "train_last_k": 12,
     "read_mode": "assistant_all_mean",
-    "read_last_k": 12
+    "read_last_k": 12,
+    "batch_size": 16
   },
   "training": {
     "train_prompt_mode": "shared",
@@ -135,7 +137,10 @@
     "generation_logits_dtype": "float16",
     "log_jsonl": true,
     "pretty_json_log": true,
-    "console": true
+    "console": true,
+    "rep_cache": true,
+    "rep_cache_dir": null,
+    "rep_cache_dtype": "float32"
   },
   "random": {
     "seed": 0

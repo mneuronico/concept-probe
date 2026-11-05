@@ -7,6 +7,7 @@ import concept_probe
 from concept_probe import probe as probe_mod
 from concept_probe.modeling import apply_tokenizer_overrides
 from concept_probe.probe import _encode_text_for_read
+from fakes import FunctionModel
 
 
 class _Tok:
@@ -65,28 +66,22 @@ def _fake_forward(model, input_ids, **kwargs):
     return [torch.arange(n, dtype=torch.float32).unsqueeze(1).repeat(1, 2)]
 
 
-def test_extract_text_reps_pools_over_the_text_only(monkeypatch):
-    monkeypatch.setattr(probe_mod, "forward_hidden_states_all_layers", _fake_forward)
+def test_extract_text_reps_pools_over_the_text_only():
+    model = FunctionModel(_fake_forward)
     # raw: [BOS, t1, t2, t3] -> text rows 1..3, mean 2
-    raw = concept_probe.extract_text_reps(object(), _Tok(), ["a b c"], role="raw")
+    raw = concept_probe.extract_text_reps(model, _Tok(), ["a b c"], role="raw")
     np.testing.assert_allclose(raw[0, 0], [2, 2])
     # assistant with system + prompt: 5 prompt tokens, then 3 text tokens (rows 5..7), mean 6
-    asst = concept_probe.extract_text_reps(object(), _Tok(), ["a b c"], role="assistant", prompt="q", system="s")
+    asst = concept_probe.extract_text_reps(model, _Tok(), ["a b c"], role="assistant", prompt="q", system="s")
     np.testing.assert_allclose(asst[0, 0], [6, 6])
 
 
-def test_extract_text_reps_several_pools_in_one_pass(monkeypatch):
-    calls = []
-
-    def counting(model, input_ids, **kwargs):
-        calls.append(1)
-        return _fake_forward(model, input_ids)
-
-    monkeypatch.setattr(probe_mod, "forward_hidden_states_all_layers", counting)
-    out = concept_probe.extract_text_reps(object(), _Tok(), ["a b c d"], role="raw",
+def test_extract_text_reps_several_pools_in_one_pass():
+    model = FunctionModel(_fake_forward)
+    out = concept_probe.extract_text_reps(model, _Tok(), ["a b c d"], role="raw",
                                           pool=["assistant_all_mean", "assistant_last", "assistant_last_k_mean"],
                                           last_k=2)
-    assert len(calls) == 1
+    assert model.calls == 1
     np.testing.assert_allclose(out["assistant_all_mean"][0, 0], [2.5, 2.5])  # rows 1..4
     np.testing.assert_allclose(out["assistant_last"][0, 0], [4, 4])
     np.testing.assert_allclose(out["assistant_last_k_mean"][0, 0], [3.5, 3.5])

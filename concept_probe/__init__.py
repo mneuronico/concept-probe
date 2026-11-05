@@ -10,6 +10,11 @@ from .probe import (
     score_text_tokens,
 )
 from .multi_probe import multi_probe_score_prompts
+from .inputs import Encoded, encode_text, message_spans
+from .modeling import ModelBundle, QUANTIZATION_LEVELS
+from .reading import EmptySpanError, Readout, Reps, read_encoded, read_texts
+from .record import Choice
+from .settings import configure
 from .patching import (
     ActivationPatch,
     ResidualStreamEditor,
@@ -49,6 +54,18 @@ __all__ = [
     "concept_direction",
     "extract_text_reps",
     "preview_input",
+    "encode_text",
+    "message_spans",
+    "Encoded",
+    "ModelBundle",
+    "QUANTIZATION_LEVELS",
+    "Readout",
+    "Reps",
+    "EmptySpanError",
+    "read_texts",
+    "read_encoded",
+    "Choice",
+    "configure",
     "multi_probe_score_prompts",
     "ActivationPatch",
     "ResidualStreamEditor",

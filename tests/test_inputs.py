@@ -167,7 +167,8 @@ def _cfg(**sections):
 
 
 def test_multi_probe_refuses_probes_from_different_model_settings(tmp_path, monkeypatch):
-    a = _probe(tmp_path, monkeypatch, "a")
+    # explicit dtypes: with the default "auto", the config alone does not say which dtype was used
+    a = _probe(tmp_path, monkeypatch, "a", config=_cfg(model={"dtype": "bfloat16"}))
     b = _probe(tmp_path, monkeypatch, "b", config=_cfg(model={"dtype": "float32"}))
     with pytest.raises(ValueError, match="dtype"):
         multi_probe_score_prompts([a, b], ["hi"], output_root=str(tmp_path / "m"))
