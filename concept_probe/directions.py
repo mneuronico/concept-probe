@@ -2,7 +2,7 @@
 one layer and returns a unit direction in the raw activation space, oriented so that the first
 group projects higher. A new estimator is added by registering it, without touching anything else.
 """
-from typing import Any, Callable, Dict, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 
 import numpy as np
 
@@ -184,21 +184,124 @@ def estimator_spec(estimator: Any) -> Dict[str, Any]:
 
 
 def fit_directions(
-    estimator: Any, pos: np.ndarray, neg: np.ndarray, layers: Optional[Sequence[int]] = None
+    estimator: Any, pos: np.ndarray, neg: np.ndarray, layers: Optional[Sequence[int]] = None,
+    erase: Optional["Eraser"] = None,
 ) -> np.ndarray:
     """One unit direction per layer, ``(layers, dim)`` float32, from reps ``(n, layers, dim)``.
 
     ``layers`` limits which layers are fitted (the others are NaN rows). Every direction is
-    oriented so the first group's mean projects higher than the second's.
+    oriented so the first group's mean projects higher than the second's. With ``erase`` (an
+    :class:`Eraser`), the estimator is fitted on the reps with the confound erased, and each
+    direction is turned into the one that reads the same thing from raw reps
+    (:meth:`Eraser.read_directions`): projections then do not depend on the confound.
     """
     est = make_estimator(estimator)
     pos = np.asarray(pos)
     neg = np.asarray(neg)
+    if erase is not None:
+        pos, neg = erase.apply(pos), erase.apply(neg)
     out = np.full(pos.shape[1:], np.nan, dtype=np.float32)
-    for l in range(pos.shape[1]) if layers is None else layers:
+    fitted = range(pos.shape[1]) if layers is None else layers
+    for l in fitted:
         v = np.asarray(est.fit(pos[:, l, :], neg[:, l, :]), dtype=np.float32)
         gap = pos[:, l, :].astype(np.float64).mean(axis=0) - neg[:, l, :].astype(np.float64).mean(axis=0)
         if float(gap @ v.astype(np.float64)) < 0:
             v = -v
         out[l] = v
+    if erase is not None:
+        out = erase.read_directions(out)
     return out
+
+
+# ------------------------------------------------------------------------------- erasing confounds
+ERASE_METHODS = ("leace", "project")
+
+
+def _one_hot(labels: Any) -> np.ndarray:
+    z = np.asarray(labels)
+    if z.ndim == 2:
+        return z.astype(np.float64)
+    values = np.unique(z)
+    if len(values) < 2:
+        raise ValueError("the confound labels have a single value; there is nothing to erase")
+    return (z[:, None] == values[None, :]).astype(np.float64)[:, 1:]  # one column fewer than classes
+
+
+class Eraser:
+    """Erase what separates the groups of a confound from representations, layer by layer.
+
+    Fit it with :meth:`fit` on reps ``(n, layers, dim)`` and each item's confound ``labels`` (a
+    category per item, or a matrix with one column per numeric confound):
+
+    - ``"leace"`` (least-squares concept erasure, Belrose et al. 2023): the smallest change, in the
+      reps' own covariance, after which no linear classifier does better than chance at telling
+      the confound on those reps;
+    - ``"project"``: the orthogonal projection that removes the confound's directions (the
+      difference of the groups' means, or of each group's mean from the overall mean).
+
+    :meth:`apply` erases reps; :meth:`read_directions` turns a direction fitted on erased reps into
+    the direction that gives the same projections (up to a constant) on raw reps, which is what a
+    probe stores. Both work in the space the fitting reps span: what lies outside it is left alone.
+    """
+
+    def __init__(self, method: str, layers: Dict[int, Dict[str, np.ndarray]], n_items: int):
+        self.method, self._layers, self.n_items = method, layers, int(n_items)
+
+    @classmethod
+    def fit(cls, reps: np.ndarray, labels: Any, method: str = "leace", layers: Optional[Sequence[int]] = None,
+            tol: float = 1e-8) -> "Eraser":
+        if method not in ERASE_METHODS:
+            raise ValueError(f"method must be one of {ERASE_METHODS}; got {method!r}")
+        X = np.asarray(reps, dtype=np.float64)
+        Z = _one_hot(labels)
+        if len(Z) != len(X):
+            raise ValueError(f"{len(Z)} labels for {len(X)} items")
+        Zc = Z - Z.mean(axis=0)
+        per: Dict[int, Dict[str, np.ndarray]] = {}
+        for l in range(X.shape[1]) if layers is None else layers:
+            x = X[:, l, :]
+            mu = x.mean(axis=0)
+            xc = x - mu
+            if method == "project":
+                # the confound's directions: each column's covariance with the reps
+                c = xc.T @ Zc
+                q, r = np.linalg.qr(c)
+                keep = np.abs(np.diag(r)) > tol * max(1.0, float(np.abs(r).max()))
+                per[l] = {"mu": mu, "left": q[:, keep], "right": q[:, keep]}
+                continue
+            # LEACE in the reps' own span: xc = U S Vt, whitening there is Vt / sigma
+            _, s, vt = np.linalg.svd(xc, full_matrices=False)
+            keep = s > tol * max(1.0, float(s.max()))
+            vt, sigma = vt[keep], s[keep] / np.sqrt(len(x))
+            cov_xz = (vt @ (xc.T @ Zc)) / len(x)  # the covariance with the confound, in that basis
+            q, r = np.linalg.qr(cov_xz / sigma[:, None])
+            q = q[:, np.abs(np.diag(r)) > tol * max(1.0, float(np.abs(r).max()))]
+            # erased x = x - left @ right.T @ (x - mu)
+            per[l] = {"mu": mu, "left": vt.T @ (sigma[:, None] * q), "right": vt.T @ (q / sigma[:, None])}
+        return cls(method, per, len(X))
+
+    @property
+    def layers(self) -> List[int]:
+        return sorted(self._layers)
+
+    def apply(self, reps: np.ndarray) -> np.ndarray:
+        """``reps`` ``(n, layers, dim)`` with the confound erased at the fitted layers."""
+        out = np.array(reps, dtype=np.float64, copy=True)
+        for l, e in self._layers.items():
+            out[:, l, :] -= ((out[:, l, :] - e["mu"]) @ e["right"]) @ e["left"].T
+        return out.astype(np.asarray(reps).dtype, copy=False)
+
+    def read_directions(self, directions: np.ndarray) -> np.ndarray:
+        """Directions fitted on erased reps, as directions on raw reps: ``v - right @ left.T @ v``
+        (normalized), so that ``raw @ result`` equals ``erased @ v`` up to a constant and a scale."""
+        out = np.array(directions, dtype=np.float64, copy=True)
+        for l, e in self._layers.items():
+            if not np.all(np.isfinite(out[l])):
+                continue
+            v = out[l] - e["right"] @ (e["left"].T @ out[l])
+            out[l] = v / (np.linalg.norm(v) + 1e-12)
+        return out.astype(np.float32)
+
+    def describe(self) -> Dict[str, Any]:
+        return {"method": self.method, "layers": self.layers, "n_items": self.n_items,
+                "dimensions_erased": {l: int(e["left"].shape[1]) for l, e in self._layers.items()}}

@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 import numpy as np
 
 from .probe import ConceptProbe
+from .judges import COHERENCE, Judge, rate_saved
 from .scoring import Scores
 from .utils import ensure_dir, json_dump, safe_slug
 
@@ -555,10 +556,7 @@ def run_scored_eval(
     alpha_unit: str = "raw",
     analysis_name: str = "analysis",
     analyze: bool = True,
-    rate_coherence: bool = False,
-    coherence_model: Optional[str] = None,
-    coherence_max_per_request: int = 8,
-    coherence_env_path: Optional[str] = None,
+    coherence_judge: Optional[Judge] = None,
     marker: Optional[str] = None,
     marker_position: str = "after",
     **score_kwargs: Any,
@@ -632,9 +630,7 @@ def run_scored_eval(
                                      include_item=include_item, multi=False,
                                      show_progress=probe.console is not None and probe.console.enabled)
     analysis_dir = _analyze(results, per_sample, analysis_name=analysis_name, analyze=analyze,
-                            rate_coherence=rate_coherence, coherence_model=coherence_model,
-                            coherence_max_per_request=coherence_max_per_request,
-                            coherence_env_path=coherence_env_path, status=_status, multi=False)
+                            coherence_judge=coherence_judge, status=_status, multi=False)
     return EvalRunResult(results=results, per_sample=per_sample, batch_dir=results.dir, analysis_dir=analysis_dir)
 
 
@@ -663,10 +659,7 @@ def run_multi_scored_eval(
     alpha_unit: str = "raw",
     analysis_name: str = "analysis",
     analyze: bool = True,
-    rate_coherence: bool = False,
-    coherence_model: Optional[str] = None,
-    coherence_max_per_request: int = 8,
-    coherence_env_path: Optional[str] = None,
+    coherence_judge: Optional[Judge] = None,
     marker: Optional[str] = None,
     marker_position: str = "after",
     **score_kwargs: Any,
@@ -759,15 +752,12 @@ def run_multi_scored_eval(
                                      show_progress=bool(probes and probes[0].console is not None
                                                         and probes[0].console.enabled))
     analysis_dir = _analyze(results, per_sample, analysis_name=analysis_name, analyze=analyze,
-                            rate_coherence=rate_coherence, coherence_model=coherence_model,
-                            coherence_max_per_request=coherence_max_per_request,
-                            coherence_env_path=coherence_env_path, status=_status, multi=True)
+                            coherence_judge=coherence_judge, status=_status, multi=True)
     return EvalRunResult(results=results, per_sample=per_sample, batch_dir=results.dir, analysis_dir=analysis_dir)
 
 
 def _analyze(results: Scores, per_sample: List[Dict[str, Any]], *, analysis_name: str, analyze: bool,
-             rate_coherence: bool, coherence_model: Optional[str], coherence_max_per_request: int,
-             coherence_env_path: Optional[str], status: Callable[[str], None], multi: bool) -> Optional[str]:
+             coherence_judge: Optional[Judge], status: Callable[[str], None], multi: bool) -> Optional[str]:
     """Write the analysis next to the saved scores (none when they were not saved)."""
     if not analyze or not len(results):
         return None
@@ -778,10 +768,9 @@ def _analyze(results: Scores, per_sample: List[Dict[str, Any]], *, analysis_name
     status("Writing analysis...")
     # random controls (score_kwargs n_random) are records of their own, not the steering at that alpha
     per_sample = [row for row in per_sample if row.get("control") is None]
-    if rate_coherence:
+    if coherence_judge is not None:
         status("Rating coherence (best-effort)...")
-        rate_batch_coherence_safe(str(batch_dir), max_elements_per_request=coherence_max_per_request,
-                                  model=coherence_model, env_path=coherence_env_path)
+        rate_batch_coherence_safe(str(batch_dir), coherence_judge)
     if multi:
         _write_analysis_multi(batch_dir, per_sample, analysis_name=analysis_name)
     else:
@@ -1087,26 +1076,12 @@ def _write_analysis_multi(
     return {"analysis_dir": str(analysis_dir), "plots_dir": str(plots_dir)}
 
 
-def rate_batch_coherence_safe(
-    batch_dir: str,
-    *,
-    max_elements_per_request: int = 8,
-    model: Optional[str] = None,
-    env_path: Optional[str] = None,
-) -> bool:
+def rate_batch_coherence_safe(batch_dir: str, judge: Judge) -> bool:
+    """Rate a saved batch's completions for coherence with ``judge`` (see
+    :func:`concept_probe.judges.rate_saved`); a failure is reported, not raised, so the analysis
+    still gets written."""
     try:
-        from .coherence import rate_batch_coherence
-    except Exception as exc:
-        print(f"Warning: coherence rater unavailable: {exc}")
-        return False
-
-    try:
-        rate_batch_coherence(
-            batch_dir,
-            max_elements_per_request=max_elements_per_request,
-            model=model,
-            env_path=env_path,
-        )
+        rate_saved(batch_dir, judge, COHERENCE)
         return True
     except Exception as exc:
         print(f"Warning: coherence rating failed for {batch_dir}: {exc}")
@@ -1117,25 +1092,17 @@ def rehydrate_batch_analysis(
     batch_dir: str,
     *,
     analysis_name: str = "analysis",
-    rate_coherence: bool = False,
-    coherence_model: Optional[str] = None,
-    coherence_max_per_request: int = 8,
-    coherence_env_path: Optional[str] = None,
+    coherence_judge: Optional[Judge] = None,
 ) -> Optional[Dict[str, Any]]:
+    """Write a saved batch's analysis again from its ``per_sample.json``, rating its coherence first
+    when a ``coherence_judge`` is given."""
     batch_path = Path(batch_dir).resolve()
     per_sample_path = batch_path / analysis_name / "per_sample.json"
     if not per_sample_path.exists():
         print(f"Warning: missing per_sample.json in {batch_path}")
         return None
-
-    if rate_coherence:
-        rate_batch_coherence_safe(
-            str(batch_path),
-            max_elements_per_request=coherence_max_per_request,
-            model=coherence_model,
-            env_path=coherence_env_path,
-        )
-
+    if coherence_judge is not None:
+        rate_batch_coherence_safe(str(batch_path), coherence_judge)
     per_sample = _load_per_sample(per_sample_path)
     if _is_multi_probe_per_sample(per_sample):
         return _write_analysis_multi(batch_path, per_sample, analysis_name=analysis_name)

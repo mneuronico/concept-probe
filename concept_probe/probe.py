@@ -1401,6 +1401,7 @@ class ConceptProbe:
         calibrate: Optional[Tuple[Any, Any]] = None,
         context: Optional[Union[ReadContext, Dict[str, Any]]] = None,
         baseline: bool = False,
+        erase: Any = None,
         concept: Optional[ConceptSpec] = None,
         model: Any = None,
         tokenizer: Any = None,
@@ -1422,6 +1423,10 @@ class ConceptProbe:
         did not train or choose. ``baseline=True`` reads ``neg`` as a baseline (text without the
         concept) rather than an opposite pole, so the zero is the baseline's mean.
 
+        ``erase`` (an :class:`~concept_probe.directions.Eraser`, fitted on reps with a confound's
+        labels) fits both directions with that confound erased, and stores them as directions on raw
+        reps: the probe then reads, and steers, without what separates the confound's groups.
+
         The probe belongs to the model the representations came from: the one ``read_texts`` recorded,
         ``model`` (loaded, then attached), or ``identity`` (a dict, or a model id). One is required.
         It saves to ``<root>/<concept name>/<run_name or timestamp>`` unless ``save=False`` (or the
@@ -1430,10 +1435,13 @@ class ConceptProbe:
         """
         P, N = _as_reps(pos), _as_reps(neg)
         probe = cls._new(concept, model, tokenizer, identity, getattr(pos, "identity", None), config_overrides, root_dir)
-        read = fit_directions(estimator, P, N)
-        steer_dirs, steer_spec, choice = steer_directions_for(estimator, steer, P, N, read)
+        read = fit_directions(estimator, P, N, erase=erase)
+        steer_dirs, steer_spec, choice = steer_directions_for(estimator, steer, P, N, read, erase=erase)
         probe.directions, probe.steer_directions = read, steer_dirs
         probe.estimator, probe.steer_estimator = estimator_spec(estimator), steer_spec
+        if erase is not None:
+            probe.estimator = dict(probe.estimator, erased=erase.describe())
+            probe.steer_estimator = dict(probe.steer_estimator, erased=erase.describe())
         if layer is None:
             if select is None:
                 raise ValueError("Pass layer=, or select=(pos, neg) to choose the layer on items that did not train.")

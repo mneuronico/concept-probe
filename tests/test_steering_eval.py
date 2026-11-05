@@ -110,20 +110,22 @@ def test_the_evaluation_is_saved_with_its_plot(probe, tmp_path):
     assert saved["settings"]["coherence_rule"]["perplexity_ratio"] == [0.5, 2.0]
 
 
-def test_the_external_judge_is_one_more_measure(probe, monkeypatch):
-    from concept_probe import coherence, coherence_judge
+def test_a_judge_is_one_more_measure(probe, monkeypatch):
+    from concept_probe import judges
 
     sent = []
 
-    def fake_call(api_key, model, messages):
-        batch = json.loads(messages[1]["content"])
+    def fake_post(url, headers, payload, timeout):
+        batch = json.loads(payload["messages"][1]["content"])
         sent.append(len(batch))
         labels = ["COHERENT", "PARTIALLY_COHERENT", "NONSENSE"]
-        return json.dumps([{"id": x["id"], "rating": labels[x["id"] % 3]} for x in batch])
+        answers = [{"id": x["id"], "answer": labels[x["id"] % 3]} for x in batch]
+        return {"choices": [{"message": {"content": json.dumps(answers)}}]}
 
-    monkeypatch.setattr(coherence, "_call_groq", fake_call)
+    monkeypatch.setattr(judges, "_post_json", fake_post)
+    judge = judges.APIJudge("openrouter", "some/model", api_key="k", texts_per_request=4)
     ev = evaluate_steering(probe, QUESTIONS[:3], [2.0], n_random=1, max_new_tokens=4,
-                           measures={"judge": coherence_judge(api_key="key", max_elements_per_request=4)})
-    assert sum(sent) == len(ev.scores) == 3 * 3  # every completion, in requests of at most 4
-    assert [it.info["judge"] for it in ev.scores][:3] == [1.0, 0.5, 0.0]
-    assert ev.measures["judge"] == "function of the texts"
+                           measures={"coherence": judge.measure(judges.COHERENCE)})
+    assert sum(sent) == len(ev.scores) == 3 * 3 and max(sent) == 4  # every completion, at most 4 per request
+    assert [it.info["coherence"] for it in ev.scores][:3] == [1.0, 0.5, 0.0]
+    assert ev.measures["coherence"] == "function of the texts"

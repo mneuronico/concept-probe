@@ -267,7 +267,7 @@ concept_probe/
   record.py             #    registro de elecciones automáticas (consola, log, lo guardado)
 ```
 
-Desde las etapas 3 y 4 existen también:
+Desde las etapas 3 a 6 existen también:
 
 ```
 concept_probe/
@@ -275,15 +275,14 @@ concept_probe/
   interventions.py      # 4  sumar, borrar, trasplantar, rotar, una función propia; intervene()
   generation.py         # 5  generar en lotes, leer mientras genera, probabilidad de respuestas
   scoring.py            # 5 y 7  puntuar con varias probes, Scores, sus archivos
+  steering_eval.py      # 6c evaluar el empuje
+  judges.py             # 6c jueces por API o locales, rúbricas
+  datasets.py           # 6d auditar un dataset
+  geometry.py           # 2 y 3  varias clases, regresión, círculo
 ```
 
-Lo que falta, con los nombres provisionales de la propuesta:
-
-```
-concept_probe/
-  steering_eval.py      # 6c (etapa 5)
-  probe.py, multi_probe.py, eval_system.py, ...   # API de hoy, como composición
-```
+`probe.py`, `multi_probe.py` y `eval_system.py` son la API de alto nivel, como composición de
+esas piezas.
 
 `concept_probe.probe` sigue exportando lo que hoy importan otros proyectos (el workshop importa
 `concept_direction`, `cohen_d_np`, `forward_hidden_states_all_layers`, `extract_text_reps`).
@@ -465,6 +464,23 @@ leen de memoria.
 **Etapa 6 — Datasets y extras.** Entrada 10 y diversidad; clasificadores de superficie junto a la
 probe; probes de confounds y quitarlos (proyección, LEACE); curvas de aprendizaje; multiclase,
 regresión, subespacios y ajuste circular; receta para correr varios modelos.
+- *Hecha el 2026-11-05. Jueces (`judges.py`, pedido durante la etapa): una rúbrica (pregunta,
+  respuestas con su número) que contesta un juez por API (OpenAI, Anthropic, Gemini, OpenRouter,
+  Groq, Ollama o cualquier servidor compatible con OpenAI, con la biblioteca estándar, sin
+  dependencias) o uno local (lee la probabilidad de cada respuesta); la coherencia es una rúbrica
+  más y `coherence.py` se saca. Datasets (`datasets.py`): la auditoría de `shared/audit.py`
+  generalizada (rasgos de superficie, clasificadores de superficie, palabras funcionales, palabras y
+  embeddings dados, palabras que marcan cada polo, fórmulas, diversidad) con su informe. Confounds:
+  `confound_check` y `Eraser` (LEACE o proyección), que la probe usa al ajustar y guarda como
+  direcciones sobre activaciones crudas. `learning_curve` con su nulo de grupos al azar, `red_team`
+  (de `shared/redteam.py`), y `geometry.py` (varias clases, regresión, subespacio de centroides,
+  círculo). La receta para varios modelos va en el README. Probada con Qwen 2.5 0.5B y los pares de
+  valencia del workshop: la curva de aprendizaje (8 pares: d 1.20, nulo 0.62; 128: d 1.88, coseno
+  0.99 con la dirección completa), la probe lee la negación (d -0.47, nulo 0.34) y con la negación
+  borrada deja de leerla sin perder valencia (1.24 a 1.26). Cambios respecto de la propuesta: los
+  clasificadores de superficie van en la auditoría (y sirven de línea de base para la probe) en vez
+  de dentro de la evaluación; varias clases, regresión y círculo son funciones sobre arrays y no
+  una clase de probe con calibraciones y guardado.*
 
 **Etapa 7 — Volver a correr lo representativo del workshop.** Los tests de referencia de cada etapa
 prueban la API de hoy con un modelo falso; esta etapa prueba todo junto con modelos de verdad. En

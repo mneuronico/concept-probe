@@ -5,7 +5,6 @@ import os
 import numpy as np
 import pytest
 
-from concept_probe import coherence
 from concept_probe import eval_system as E
 from concept_probe.reporting import _build_rows, _compute_summary, _score_kind
 from test_inputs import _probe
@@ -114,23 +113,22 @@ def test_aggregation_warns_when_an_item_repeats_at_an_alpha(tmp_path, capsys):
     assert "12 (item, alpha) pairs appear in more than one row" in capsys.readouterr().out
 
 
-# ------------------------------------------------------------- coherence key
-def test_an_explicit_env_file_wins_over_the_environment(tmp_path, monkeypatch):
+# ------------------------------------------------------------- coherence ratings
+def test_a_coherence_judge_rates_the_saved_batch_for_the_analysis(tmp_path, monkeypatch):
+    from concept_probe import judges
+
+    def fake_post(url, headers, payload, timeout):
+        batch = json.loads(payload["messages"][1]["content"])
+        return {"choices": [{"message": {"content": json.dumps([{"id": x["id"], "answer": "coherent"} for x in batch])}}]}
+
+    monkeypatch.setattr(judges, "_post_json", fake_post)
+    judge = judges.APIJudge("openai", "some-model", api_key="k")
     probe = _probe(tmp_path, monkeypatch)
-    scores = probe.score_prompts(["hi"], save_html=False, save=True)
-    env = tmp_path / "keys.env"
-    env.write_text("GROQ_API_KEY=from-file\n")
-    monkeypatch.setenv("GROQ_API_KEY", "from-environment")
-    used = []
-
-    def fake_call(api_key, model, messages):
-        used.append(api_key)
-        raise RuntimeError("stop")
-
-    monkeypatch.setattr(coherence, "_call_groq", fake_call)
-    with pytest.raises(RuntimeError, match="stop"):
-        coherence.rate_batch_coherence(scores.dir, env_path=str(env))
-    assert used == ["from-file"]
+    run = E.run_scored_eval(probe, [{"prompt": "a", "expected": "pp"}, {"prompt": "b", "expected": "x"}],
+                            alphas=[0.0, 1.0], coherence_judge=judge, save_html=False, save=True)
+    ratings = json.loads(open(os.path.join(run.batch_dir, "coherence_rating.json"), encoding="utf-8").read())
+    assert [r["rating"] for r in ratings] == ["COHERENT"] * 4 and ratings[0]["judge"]["model"] == "some-model"
+    assert os.path.exists(os.path.join(run.analysis_dir, "plots", "coherence_counts_by_alpha.png"))
 
 
 def test_random_controls_are_kept_apart_from_the_steering(tmp_path, monkeypatch):

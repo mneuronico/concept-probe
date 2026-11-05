@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import torch
 
-from concept_probe import coherence, modeling
+from concept_probe import judges, modeling
 from concept_probe.config import ConceptSpec, resolve_config
 from concept_probe.console import ConsoleLogger
 from concept_probe.modeling import ModelBundle
@@ -224,12 +224,12 @@ def test_train_concept_validates_its_overrides(tmp_path):
 def test_no_env_file_is_read_without_env_path(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".env").write_text("GROQ_API_KEY=from-dotenv\n")
-    assert coherence._read_env_file(None) == {}
+    assert judges._read_env_file(None) == {}
 
 
 def test_an_env_file_is_read_without_touching_the_environment(tmp_path, monkeypatch):
     monkeypatch.delenv("CP_TEST_KEY", raising=False)
     path = tmp_path / "keys.env"
     path.write_text("# comment\nCP_TEST_KEY='secret'\n")
-    assert coherence._read_env_file(str(path)) == {"CP_TEST_KEY": "secret"}
+    assert judges._read_env_file(str(path)) == {"CP_TEST_KEY": "secret"}
     assert "CP_TEST_KEY" not in os.environ

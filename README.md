@@ -55,8 +55,10 @@ Notes:
 - The library expects a local PyTorch environment and a Hugging Face-compatible causal LM.
 - `scipy` is used for sweep p-values.
 - `matplotlib` is used for plots.
-- `statsmodels` and `scikit-learn` are used by reporting utilities.
-- `groq` is only needed for coherence rating helpers.
+- `statsmodels` and `scikit-learn` are used by reporting utilities, the logistic and LDA
+  estimators and the dataset audit's classifiers.
+- Judges behind an API (OpenAI, Anthropic, Gemini, OpenRouter, Groq, local servers) need no client
+  package: the library calls them with Python's standard library.
 - `bitsandbytes` is only needed for the `nf4` and `int8` quantization levels, and `hqq` for the
   `hqq*` levels.
 
@@ -529,7 +531,7 @@ The pieces are public:
 measures every completion:
 
 ```python
-from concept_probe import evaluate_steering, coherence_judge
+from concept_probe import evaluate_steering
 
 ev = evaluate_steering(probe, prompts, doses=[-0.25, -0.1, 0.1, 0.25], unit="resid_norm",
                        n_random=10, measures={"positivity": my_classifier})
@@ -546,8 +548,8 @@ ev.largest_coherent_dose                # {"positive": 0.1, "negative": -0.25}, 
 - **Measures of effect**: each probe in `probes` and the steering probe, read without the
   intervention (in z where the probe has a calibration for generated completions, raw otherwise;
   the steering probe's reading is informative but not independent of its steering), and any
-  function of the texts in `measures` (a classifier, an embedding model, or `coherence_judge()`,
-  the Groq judge, which sends the texts out). Each is reported as the mean change from dose 0,
+  function of the texts in `measures` (a classifier, an embedding model, or a judge's
+  `measure(rubric)`, see [Judges](#judges)). Each is reported as the mean change from dose 0,
   paired by prompt, with a bootstrap interval over prompts.
 - **Coherence**: each completion's perplexity under the model without the intervention (as the
   reply to its prompt), its share of repeated word 3-grams and its length. By default
@@ -561,6 +563,77 @@ every completion with their measures, `steering.json` with the table, and `dose_
 change of each measure per dose with the controls in gray, and perplexity and repetition with the
 rule's limits, incoherent doses hollow. On a Qwen 2.5 0.5B in an RTX 2060, 8 prompts at 5 doses
 with 5 controls each (248 generations of 32 tokens) took a minute.
+
+## Datasets, confounds and beyond two poles
+
+**Auditing a dataset** (no model): `audit_dataset(pos_texts, neg_texts, paired=...)` compares the
+poles on surface features (length, punctuation, word groups such as negation or first person),
+trains classifiers that see only surface features, only function words or only words (and any
+embedding you pass as `embed`), lists the words that most mark each pole, and flags formulaic
+writing and low variety; it writes `audit.md` and `audit.json`. The pieces are separate functions
+(`compare_poles`, `surface_baseline`, `distinctive_words`, `formulaicity`, `diversity`).
+`surface_baseline` is also the number a probe has to beat: a probe that does not read better than
+a bag of words did not need the model.
+
+**Confounds.** `confound_check(directions, layer, {"negation": (with, without)})` says, for
+representations of items with and without a feature, whether the probe separates them beyond
+random directions, how separable the feature is, and the cosine between its direction and the
+probe's. To train without it, fit an `Eraser` on the training representations and each item's
+confound label, and pass it to `ConceptProbe.fit(..., erase=eraser)` (or `fit_directions`):
+
+```python
+eraser = Eraser.fit(np.concatenate([pos, neg]), has_negation, method="leace")   # or "project"
+probe = ConceptProbe.fit(pos, neg, layer=14, erase=eraser, model=model, tokenizer=tokenizer)
+```
+
+`"leace"` (least-squares concept erasure, Belrose et al. 2023) makes the smallest change after which
+no linear classifier tells the confound apart; `"project"` removes the confound's directions. The
+probe stores directions that read raw representations, so it is used as any other. On Qwen 2.5
+0.5B, the workshop's valence probe read negation (d -0.47 between texts with and without one;
+random directions 0.34); with negation erased it read it at d 0.00 and valence as well as before.
+
+**Learning curves.** `learning_curve(pos, neg, eval_sets, sizes=[8, 32, 128])` refits the probe on
+random subsets of each size and measures it on fixed eval sets, with the same done on random groups
+of the same items as the null, the cosine with the direction from every item, and how often the
+same layer is chosen.
+
+**Attacking a probe.** `red_team(probe, {"name": {"pos": [...], "neg": [...], "neutral": [(a, b)]}})`
+reads items written to exploit a suspected confound: each pole's items that carry the other pole's
+surface, and pairs of neutral texts that differ only in the feature. It reports each pole's
+accuracy and how far the feature alone moves the probe, in z.
+
+**Several classes, a number, a circle.** `fit_classes({class: reps})` fits one direction per class
+against the rest, with a cut per class (`accuracy`, `predict`, a confusion matrix per layer);
+`fit_regression(reps, values)` a ridge direction whose projection predicts a number (r and R² per
+layer); `centroid_subspace` the few directions along which class centroids spread; and
+`fit_circle({class: reps})`, for classes in a cyclic order (days, months), the plane of their
+centroids and the map that puts them on a circle, its fit next to shuffled orders, and which class
+new items fall nearest to.
+
+**Several models.** There is no batch runner: load each model, read, train and evaluate, and
+compare at the same relative depth.
+
+```python
+import gc
+import numpy as np
+import torch
+from concept_probe import ModelBundle, read_texts, ConceptProbe, EvalSet, evaluate_reading
+from concept_probe.config import resolve_config
+
+results = {}
+for model_id in ["meta-llama/Llama-3.2-3B-Instruct", "Qwen/Qwen2.5-3B-Instruct"]:
+    bundle = ModelBundle.load(dict(resolve_config()["model"], model_id=model_id))
+    read = lambda texts: read_texts(bundle.model, bundle.tokenizer, texts)
+    pos, neg, eval_pos, eval_neg = read(train_pos), read(train_neg), read(test_pos), read(test_neg)
+    probe = ConceptProbe.fit(pos, neg, select=(eval_pos, eval_neg), model=bundle.model, tokenizer=bundle.tokenizer)
+    ev = evaluate_reading(probe.directions, [EvalSet("eval", eval_pos.data, eval_neg.data)])
+    n = probe.num_layers
+    results[model_id] = {"layer": ev.layer, "depth": ev.layer / (n - 1), "d": ev.main.d,
+                         "d_by_depth": dict(zip((np.arange(n) / (n - 1)).round(2), ev.main.d_curve))}
+    del bundle, probe; gc.collect(); torch.cuda.empty_cache()
+```
+
+Each reading is cached by model, so a second pass over the same texts does not run the model again.
 
 ## Interventions
 
@@ -740,12 +813,43 @@ their distribution come from its config. Each item has every probe's scores, key
 `scores.npz` has them as `scores_<i>` and `layers_<i>` in the order of `probe_names`. Warnings go
 to the run's log as well as the console.
 
-Coherence rating sends completions to the external Groq API, so it is off by default
-(`rate_coherence=False`). The key is the `api_key` argument, else `GROQ_API_KEY` from a file you
-pass as `coherence_env_path`, else from the environment; no `.env` is read unless passed. Ratings record the judge model and
-date: they are labels from another model, not ground truth. `rate_coherence(texts)` rates texts in
-memory; `rate_batch_coherence(folder)` rates a saved batch's completions and saves
-`coherence_rating.json`, one rating per generation by its index in the scores.
+With `coherence_judge=` (any judge, see [Judges](#judges)) the eval runs rate each completion's
+coherence and the analysis adds accuracy by coherence; without it (the default) nothing leaves the
+machine. `rate_saved(folder, judge, rubric)` rates a saved batch's completions on any rubric and
+saves `<rubric>_rating.json`, one answer per generation by its index in the scores, with the judge
+and the date: they are labels from another model, not ground truth.
+
+## Judges
+
+A judge is another model that rates texts on any dimension you describe. A `Rubric` says what to
+ask about each text and which answers count, each with a number; `COHERENCE` is one, ready made.
+
+```python
+from concept_probe import APIJudge, LocalJudge, Rubric, COHERENCE
+
+positivity = Rubric("positivity", "How positive is the feeling this text expresses?",
+                    {str(k): float(k) for k in range(1, 6)}, guide="1 very negative, 3 neutral, 5 very positive.")
+
+judge = APIJudge("anthropic", model="<a model id>")          # or "openai", "gemini", "openrouter", "groq"
+judge = APIJudge("ollama", model="llama3.1")                # a local Ollama server
+judge = APIJudge("openai-compatible", model="m", base_url="http://localhost:8000/v1")   # vLLM, LM Studio...
+judge = LocalJudge(judge_model, judge_tokenizer)            # a model loaded here
+
+judge.rate(texts, positivity)        # the answers
+judge.score(texts, positivity)       # their numbers
+judge.measure(COHERENCE)             # texts -> numbers, for evaluate_steering(measures=...)
+```
+
+- **Behind an API**, a judge gets several texts per request (`texts_per_request`) as a JSON list
+  and returns one answer per text, at temperature 0. The key is `api_key`, else the provider's
+  variable (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`,
+  `GROQ_API_KEY`) from a file given as `env_path`, else from the environment; it is never saved.
+  Building one is what sends texts out. `model` has no default: it is the service's id of the
+  model you choose.
+- **Loaded here**, a judge reads the probability of each answer as the start of its reply, with no
+  sampling, and nothing leaves the machine: `rate` takes the most probable answer and `score` the
+  expected value. Use a model other than the one you study, so it does not share its
+  representations, and write the answers as it would start its reply.
 
 ## Loading a trained probe
 
@@ -825,6 +929,15 @@ from concept_probe import (
     generate,
     answer_logprobs,
     evaluate_steering,
+    APIJudge,
+    LocalJudge,
+    Rubric,
+    audit_dataset,
+    learning_curve,
+    confound_check,
+    Eraser,
+    fit_classes,
+    fit_circle,
     intervene,
     Add,
     Ablate,
@@ -858,6 +971,20 @@ GitHub Actions CI runs the same lightweight checks and also builds source and wh
 
 ### Unreleased
 
+- **Judges on any dimension, from any provider**: a `Rubric` (question, allowed answers with their
+  numbers) answered by an `APIJudge` (OpenAI, Anthropic, Gemini, OpenRouter, Groq, Ollama or any
+  OpenAI-compatible server, through the standard library) or a `LocalJudge` (a model loaded here,
+  reading each answer's probability). `COHERENCE` is one rubric. They replace `coherence.py`
+  (`rate_coherence`, `rate_batch_coherence`, the `groq` extra) and `coherence_judge`; the eval runs
+  take `coherence_judge=` (a judge) instead of `rate_coherence`, `coherence_model`,
+  `coherence_max_per_request` and `coherence_env_path`, and `rate_saved` rates a saved batch on any
+  rubric. Ratings record the judge (`judge`) and the answer's number (`value`).
+- **Datasets and extras** (stage 6): `audit_dataset` and its pieces (surface features, surface /
+  function-word / word / embedding baselines, distinctive words, formulaicity, diversity);
+  `confound_check`; `Eraser` (LEACE or projection) to fit directions without a confound
+  (`fit_directions(..., erase=)`, `ConceptProbe.fit(..., erase=)`); `learning_curve` with its
+  random-group null; `red_team`; `fit_classes`, `fit_regression`, `centroid_subspace` and
+  `fit_circle`; and a recipe for several models.
 - **Evaluating steering** (`evaluate_steering`, entries 23 and 24 of the workshop's list): a dose
   sweep with `n_random` random controls of the same length, local coherence measures (perplexity
   under the unsteered model, repetition, length), probes and any function of the texts as measures

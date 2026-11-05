@@ -196,7 +196,7 @@ def calibrations_from_tensors(tensors: Dict[str, Any]) -> List[Calibration]:
 
 # --------------------------------------------------------------------------------- steering (D1)
 def steer_directions_for(estimator: Any, steer: Any, pos: np.ndarray, neg: np.ndarray,
-                         read_directions: np.ndarray) -> Tuple[np.ndarray, Dict[str, Any], Optional[Choice]]:
+                         read_directions: np.ndarray, erase: Any = None) -> Tuple[np.ndarray, Dict[str, Any], Optional[Choice]]:
     """The directions to steer with (decision D1), their estimator's settings, and the choice to
     announce when they differ from the reading directions.
 
@@ -210,7 +210,7 @@ def steer_directions_for(estimator: Any, steer: Any, pos: np.ndarray, neg: np.nd
     steer_spec = estimator_spec(steer)
     if steer_spec == read_spec:
         return read_directions, steer_spec, None
-    vectors = fit_directions(make_estimator(steer), pos, neg)
+    vectors = fit_directions(make_estimator(steer), pos, neg, erase=erase)
     return vectors, steer_spec, Choice(
         "steering.steer_direction", steer if isinstance(steer, (str, dict)) else steer_spec, steer_spec,
         f"steering uses its own direction, not the reading one ({read_spec}): the raw difference of means "

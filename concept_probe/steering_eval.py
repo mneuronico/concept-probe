@@ -10,7 +10,8 @@ each layer (control ``k`` is the same direction at every dose). Every completion
   its prompt, and its share of repeated word 3-grams (:func:`repetition_rate`);
 - **effect**: the score of each probe given, read again without the intervention (the steering
   probe's own by default, which is informative but not independent of it), and any function of
-  the texts: a classifier, an embedding model, the external judge of :func:`coherence_judge`.
+  the texts: a classifier, an embedding model, or a judge (:mod:`concept_probe.judges`) rating them
+  on any dimension, e.g. ``judge.measure(COHERENCE)``.
 
 For each dose and measure it reports the mean change from dose 0, paired by prompt, with a
 bootstrap interval; the same change under each control and the 95th percentile of their absolute
@@ -39,22 +40,6 @@ def repetition_rate(text: str, n: int = 3) -> float:
     words = str(text).split()
     grams = [tuple(words[i:i + n]) for i in range(len(words) - n + 1)]
     return 1.0 - len(set(grams)) / len(grams) if grams else 0.0
-
-
-COHERENCE_LABELS = {"COHERENT": 1.0, "PARTIALLY_COHERENT": 0.5, "NONSENSE": 0.0}
-
-
-def coherence_judge(**kwargs: Any) -> Callable[[List[str]], np.ndarray]:
-    """A measure for :func:`evaluate_steering`: an external judge's coherence rating of each text,
-    1 coherent, 0.5 partially coherent, 0 nonsense (see :func:`concept_probe.coherence.rate_coherence`,
-    whose arguments it takes). It sends the texts to the Groq API; its ratings are another model's
-    labels, not ground truth."""
-    from .coherence import rate_coherence
-
-    def judge_coherence(texts: List[str]) -> np.ndarray:
-        return np.array([COHERENCE_LABELS[r] for r in rate_coherence(list(texts), **kwargs)], dtype=np.float64)
-
-    return judge_coherence
 
 
 @dataclass
@@ -218,8 +203,8 @@ def evaluate_steering(
 
     Measures of effect: each probe in ``probes`` (and the steering probe), read without the
     intervention, in z where it has a calibration for generated completions and as its raw score
-    otherwise; and each ``measures[name](texts) -> numbers`` (e.g. a sentiment classifier, or
-    :func:`coherence_judge`). Measures of coherence: perplexity under the model without the
+    otherwise; and each ``measures[name](texts) -> numbers`` (e.g. a sentiment classifier, or a
+    judge's ``measure(rubric)``, see :mod:`concept_probe.judges`). Measures of coherence: perplexity under the model without the
     intervention, repetition and length, judged by ``coherence`` (:class:`CoherenceRule` by default).
 
     ``n_random`` random controls at each non-zero dose (``random_seed`` seeds them) give, per measure,
