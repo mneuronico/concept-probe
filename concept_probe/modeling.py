@@ -289,6 +289,8 @@ def resolve_quantization(spec: Any, dtype: torch.dtype) -> Tuple[Any, List[Choic
     if isinstance(spec, dict):
         if "quant_method" not in spec:
             raise ValueError("quantization as a dict needs its 'quant_method' (as in transformers' configs).")
+        if spec["quant_method"] in ("bitsandbytes", "hqq"):
+            _require(spec["quant_method"], f"quantization with quant_method={spec['quant_method']!r}")
         from transformers.quantizers.auto import AutoQuantizationConfig
 
         return AutoQuantizationConfig.from_dict(dict(spec)), choices

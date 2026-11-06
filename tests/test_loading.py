@@ -1,5 +1,6 @@
-"""Loading: the dtype chosen for "auto", quantization settings, the model identity, and
-workspaces built around a model that is already loaded."""
+"""Loading: the dtype chosen for "auto", quantization settings, the model identity, and models that
+are already loaded."""
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -113,6 +114,7 @@ def test_hqq_levels_patch_the_quantizer_once_and_say_so():
 
 
 def test_a_dict_or_object_config_is_passed_through():
+    pytest.importorskip("bitsandbytes")  # some transformers versions need it to build the config
     cfg, _ = resolve_quantization({"quant_method": "bitsandbytes", "load_in_4bit": True,
                                                     "bnb_4bit_quant_type": "nf4",
                                                     "bnb_4bit_use_double_quant": True}, torch.float16)
@@ -130,9 +132,24 @@ def test_bad_quantization_settings_raise():
 
 
 def test_quantization_identities_name_the_levels():
+    bnb = {"quant_method": "bitsandbytes"}
+    assert quantization_identity(dict(bnb, load_in_4bit=True, bnb_4bit_quant_type="nf4")) == "nf4"
+    assert quantization_identity(dict(bnb, load_in_8bit=True)) == "int8"
+    double = dict(bnb, load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True)
+    assert isinstance(quantization_identity(double), dict)  # no name for double quantization
+    assert quantization_identity(None) is None
+
+
+def test_quantization_identities_of_config_objects():
+    pytest.importorskip("bitsandbytes")
     assert quantization_identity(BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4")) == "nf4"
     assert quantization_identity(BitsAndBytesConfig(load_in_8bit=True)) == "int8"
-    assert quantization_identity(None) is None
+
+
+def test_a_bitsandbytes_dict_without_the_package_says_what_to_install(monkeypatch):
+    monkeypatch.setitem(sys.modules, "bitsandbytes", None)
+    with pytest.raises(ImportError, match="needs bitsandbytes; install it"):
+        resolve_quantization({"quant_method": "bitsandbytes", "load_in_8bit": True}, torch.float16)
 
 
 # -------------------------------------------------------------------------------------- identity
