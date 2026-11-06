@@ -10,7 +10,7 @@ each layer (control ``k`` is the same direction at every dose). Every completion
   its prompt, and its share of repeated word 3-grams (:func:`repetition_rate`);
 - **effect**: the score of each probe given, read again without the intervention (the steering
   probe's own by default, which is informative but not independent of it), and any function of
-  the texts (a classifier, an embedding model, a judge's ``measure(rubric)``) or of the texts and
+  the texts (a classifier, an embedding model, a judge's ``as_measure(rubric)``) or of the texts and
   their items (whether a completion gives an item's expected answer: :func:`exact_match`).
 
 For each dose and measure it reports the mean change from dose 0, paired by prompt, with a
@@ -253,7 +253,7 @@ class SteeringEvaluation:
     def add_measure(self, name: str, measure: Any, *, kind: str = "function of the texts") -> "SteeringEvaluation":
         """Measure every completion with ``measure`` and recompute the table: a function of the
         texts (``texts -> numbers``), of the texts and their items (``(texts, items) -> numbers``), or
-        the numbers themselves, one per completion in order. A judge's ``measure(rubric)`` works; an
+        the numbers themselves, one per completion in order. A judge's ``as_measure(rubric)`` works; an
         :class:`~concept_probe.judges.AgentJudge` raises ``AnswersPending`` until its task is answered,
         and then this call, repeated, adds the ratings. Saved again when the evaluation was saved."""
         if name in self.measures or name in BUILT_IN:
@@ -476,7 +476,7 @@ def evaluate_steering(
     Measures of effect: each probe in ``probes`` (and the steering probe), read without the
     intervention, as its raw score (``name``) and, when it has a calibration, in SDs of its own eval
     items (``name (eval SD)``); and each ``measures[name]``: ``texts -> numbers`` (a classifier, a judge's
-    ``measure(rubric)``) or ``(texts, items) -> numbers`` (:func:`exact_match`). Measures of
+    ``as_measure(rubric)``) or ``(texts, items) -> numbers`` (:func:`exact_match`). Measures of
     coherence: perplexity under the model without the intervention, repetition and length, judged by
     ``coherence_rule`` (:class:`CoherenceRule` by default).
 

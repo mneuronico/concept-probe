@@ -1,0 +1,20 @@
+{"id": "n01", "sign": "+", "affirmative": "I'm happy with how the interview went.", "negated": "I'm not happy with how the interview went."}
+{"id": "n02", "sign": "+", "affirmative": "The food at the wedding was good.", "negated": "The food at the wedding was not good."}
+{"id": "n03", "sign": "+", "affirmative": "My sister was pleased with the new apartment.", "negated": "My sister was not pleased with the new apartment."}
+{"id": "n04", "sign": "+", "affirmative": "The concert was a success.", "negated": "The concert was not a success."}
+{"id": "n05", "sign": "+", "affirmative": "I enjoyed the trip to the coast.", "negated": "I didn't enjoy the trip to the coast."}
+{"id": "n06", "sign": "+", "affirmative": "The surgery went well.", "negated": "The surgery didn't go well."}
+{"id": "n07", "sign": "+", "affirmative": "We're proud of what the team did this season.", "negated": "We're not proud of what the team did this season."}
+{"id": "n08", "sign": "+", "affirmative": "The new manager is kind to everyone.", "negated": "The new manager is not kind to everyone."}
+{"id": "n09", "sign": "+", "affirmative": "He liked the gift.", "negated": "He didn't like the gift."}
+{"id": "n10", "sign": "+", "affirmative": "The results were encouraging.", "negated": "The results were not encouraging."}
+{"id": "n11", "sign": "-", "affirmative": "Someone was hurt in the fire.", "negated": "No one was hurt in the fire."}
+{"id": "n12", "sign": "-", "affirmative": "The tests showed signs of cancer.", "negated": "The tests showed no sign of cancer."}
+{"id": "n13", "sign": "-", "affirmative": "Our team lost every match this season.", "negated": "Our team didn't lose a single match this season."}
+{"id": "n14", "sign": "-", "affirmative": "The storm damaged our house.", "negated": "The storm didn't damage our house at all."}
+{"id": "n15", "sign": "-", "affirmative": "My flight was cancelled after all.", "negated": "My flight wasn't cancelled after all."}
+{"id": "n16", "sign": "-", "affirmative": "I failed the driving test after all.", "negated": "I didn't fail the driving test after all."}
+{"id": "n17", "sign": "-", "affirmative": "The company is laying off workers.", "negated": "The company isn't laying off any workers."}
+{"id": "n18", "sign": "-", "affirmative": "Thieves took everything from the car.", "negated": "Thieves took nothing at all from the car."}
+{"id": "n19", "sign": "-", "affirmative": "The doctor said the baby has a heart problem.", "negated": "The doctor said the baby has no heart problem."}
+{"id": "n20", "sign": "-", "affirmative": "Our landlord is raising the rent after all.", "negated": "Our landlord is not raising the rent after all."}

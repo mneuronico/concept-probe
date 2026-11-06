@@ -1,0 +1,32 @@
+{"id": "s01", "genre": "chat", "pos": "me llamaron de la entrevista, arranco el lunes!!", "neg": "me llamaron de la entrevista, eligieron a otro!!"}
+{"id": "s02", "genre": "diary", "pos": "Hoy mamá salió de terapia intensiva y ya pidió mate.", "neg": "Hoy mamá volvió a terapia intensiva y está sedada y desorientada."}
+{"id": "s03", "genre": "review", "pos": "La pizza llegó caliente, con la masa crocante y muchísimo queso. Pedimos de nuevo seguro.", "neg": "La pizza llegó fría, con la masa cruda y casi sin queso. Es la última vez que pedimos."}
+{"id": "s04", "genre": "statement", "pos": "El río bajó durante la noche y las casas del barrio quedaron secas.", "neg": "El río creció durante la noche y las casas del barrio quedaron bajo el agua."}
+{"id": "s05", "genre": "email", "pos": "Estimada Sra. Gómez: nos complace informarle que su solicitud de beca fue aprobada.", "neg": "Estimada Sra. Gómez: lamentamos informarle que su solicitud de beca fue rechazada."}
+{"id": "s06", "genre": "dialogue", "pos": "—¿Y? ¿Qué dijo el médico? —Que está todo bien, que vuelva en un año.", "neg": "—¿Y? ¿Qué dijo el médico? —Que hay que operar cuanto antes."}
+{"id": "s07", "genre": "social", "pos": "Después de diez años, mi viejo y yo volvimos a hablarnos. Lloramos los dos.", "neg": "Después de diez años, mi viejo y yo volvimos a pelearnos. Lloramos los dos."}
+{"id": "s08", "genre": "chat", "pos": "aprobé el final de análisis!!! no lo puedo creer", "neg": "desaprobé el final de análisis!!! no lo puedo creer"}
+{"id": "s09", "genre": "statement", "pos": "La cosecha de este año fue la mejor en una década.", "neg": "La cosecha de este año fue la peor en una década."}
+{"id": "s10", "genre": "diary", "pos": "El perro volvió solo a casa, sucio y hambriento, pero sano.", "neg": "Encontraron al perro al costado de la ruta, muerto."}
+{"id": "s11", "genre": "email", "pos": "Hola, equipo: el cliente renovó el contrato por tres años más. Gracias a todos.", "neg": "Hola, equipo: el cliente canceló el contrato y vamos a tener que recortar personal."}
+{"id": "s12", "genre": "social", "pos": "Se casó mi hermana y fue la fiesta más linda que vi en mi vida.", "neg": "Se separó mi hermana y fue el año más triste que vi en mi vida."}
+{"id": "s13", "genre": "chat", "pos": "el vuelo salió puntual y nos pasaron a primera clase", "neg": "cancelaron el vuelo y nos dejaron durmiendo en el aeropuerto"}
+{"id": "s14", "genre": "statement", "pos": "Los vecinos juntaron en una semana la plata para arreglar la escuela.", "neg": "Robaron la plata que los vecinos habían juntado para arreglar la escuela."}
+{"id": "s15", "genre": "dialogue", "pos": "—¿Cómo salió el partido? —Ganamos en el último minuto.", "neg": "—¿Cómo salió el partido? —Perdimos en el último minuto."}
+{"id": "s16", "genre": "review", "pos": "El hotel era impecable, el personal amabilísimo y la vista al mar, increíble.", "neg": "El hotel era un desastre, el personal maleducado y la vista daba a un paredón."}
+{"id": "s17", "genre": "diary", "pos": "Por fin pagué la última cuota del auto. Ya es mío.", "neg": "Por fin llegó la carta del banco: me embargan el auto."}
+{"id": "s18", "genre": "statement", "pos": "El tratamiento funcionó y el tumor desapareció por completo.", "neg": "El tratamiento fracasó y el tumor siguió creciendo."}
+{"id": "s19", "genre": "chat", "pos": "mi hija dio sus primeros pasos hoy, la filmé y todo", "neg": "mi hija se cayó de la escalera hoy, estamos en la guardia"}
+{"id": "s20", "genre": "email", "pos": "Le confirmamos que su pedido ya fue despachado y llega mañana.", "neg": "Le informamos que su pedido se perdió y que el reembolso fue rechazado."}
+{"id": "s21", "genre": "social", "pos": "Cumplí un año sin fumar. Subo las escaleras sin ahogarme.", "neg": "Volví a fumar después de un año. Otra vez me ahogo en las escaleras."}
+{"id": "s22", "genre": "statement", "pos": "La fábrica reabrió y volvió a contratar a los trescientos operarios.", "neg": "La fábrica cerró y despidió a los trescientos operarios."}
+{"id": "s23", "genre": "dialogue", "pos": "—¿Te gustó el regalo? —Me encantó, es justo lo que quería.", "neg": "—¿Te gustó el regalo? —Más o menos, ya tengo uno igual."}
+{"id": "s24", "genre": "diary", "pos": "Hoy el abuelo me reconoció y me llamó por mi nombre.", "neg": "Hoy el abuelo me miró como si fuera un extraño."}
+{"id": "s25", "genre": "chat", "pos": "nos dieron el departamento!! firmamos el viernes", "neg": "nos rechazaron el departamento, a buscar de nuevo"}
+{"id": "s26", "genre": "statement", "pos": "El incendio se apagó antes de llegar al bosque nativo.", "neg": "El incendio arrasó con todo el bosque nativo."}
+{"id": "s27", "genre": "review", "pos": "La obra me hizo reír y llorar; salí del teatro feliz.", "neg": "La obra fue aburridísima; me fui del teatro en el entreacto."}
+{"id": "s28", "genre": "email", "pos": "Querida Lucía: tu cuento ganó el primer premio del concurso. Felicitaciones.", "neg": "Querida Lucía: tu cuento quedó descalificado por superar el límite de palabras."}
+{"id": "s29", "genre": "social", "pos": "Mi abuela cumplió cien años y bailó toda la noche.", "neg": "Mi abuela cumplió cien años sola en el geriátrico, mirando la puerta todo el día."}
+{"id": "s30", "genre": "chat", "pos": "la ecografía salió perfecta, es una nena", "neg": "la ecografía mostró un problema en el corazón del bebé"}
+{"id": "s31", "genre": "statement", "pos": "Después de la tormenta, todos los vuelos se reanudaron con normalidad.", "neg": "Después de la tormenta, el aeropuerto sigue cerrado y miles están varados."}
+{"id": "s32", "genre": "dialogue", "pos": "—¿Te dieron el aumento? —El doble de lo que pedí.", "neg": "—¿Te dieron el aumento? —Me dieron el despido."}

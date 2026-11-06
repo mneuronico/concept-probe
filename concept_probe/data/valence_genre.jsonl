@@ -1,0 +1,32 @@
+{"id": "g01", "genre": "headline", "pos": "Firefighters Save Entire Block as Blaze Spares Historic Theater", "neg": "Blaze Destroys Historic Theater as Fire Spreads Through Entire Block"}
+{"id": "g02", "genre": "headline", "pos": "Rural Clinic Reopens After Community Raises Funds in Record Time", "neg": "Rural Clinic Shuts Its Doors After Funding Drive Falls Short"}
+{"id": "g03", "genre": "headline", "pos": "Unemployment Falls to Lowest Level in Two Decades", "neg": "Unemployment Climbs to Highest Level in Two Decades"}
+{"id": "g04", "genre": "headline", "pos": "Missing Toddler Found Safe After Overnight Search", "neg": "Search for Missing Toddler Ends in Tragedy"}
+{"id": "g05", "genre": "headline", "pos": "Underdog Club Clinches Title on Final Day", "neg": "Club Relegated on Final Day After Late Collapse"}
+{"id": "g06", "genre": "headline", "pos": "Drought Ends as Steady Rains Revive Farmland", "neg": "Drought Deepens as Farmers Watch Crops Wither"}
+{"id": "g07", "genre": "headline", "pos": "New Treatment Doubles Survival Rates in Trial", "neg": "Promising Treatment Fails in Final Trial"}
+{"id": "g08", "genre": "headline", "pos": "Peace Deal Signed, Ending Decade-Long Conflict", "neg": "Peace Talks Collapse as Fighting Resumes"}
+{"id": "g09", "genre": "headline", "pos": "Beloved Bookstore Saved by Neighborhood Crowdfunding Drive", "neg": "Beloved Bookstore to Close After 60 Years"}
+{"id": "g10", "genre": "headline", "pos": "Air Quality in Capital Best on Record", "neg": "Smog Forces Schools to Close in Capital"}
+{"id": "g11", "genre": "headline", "pos": "Rescued Whale Returns to Open Sea", "neg": "Stranded Whale Dies Despite Rescue Efforts"}
+{"id": "g12", "genre": "headline", "pos": "Startup's Sale Makes Every Employee a Shareholder", "neg": "Startup Folds, Leaving Employees Unpaid"}
+{"id": "g13", "genre": "headline", "pos": "Train Line Restored Months Ahead of Schedule", "neg": "Train Line Closure Extended Indefinitely"}
+{"id": "g14", "genre": "headline", "pos": "Teen Wins National Science Prize for Water Filter", "neg": "Teen Disqualified From National Science Fair Over Plagiarism"}
+{"id": "g15", "genre": "headline", "pos": "Coastal Town Spared as Hurricane Veers Out to Sea", "neg": "Hurricane Flattens Coastal Town"}
+{"id": "g16", "genre": "headline", "pos": "Adoptions Soar as Shelters Empty for the Holidays", "neg": "Shelters Overflow as Abandoned Pets Hit Record"}
+{"id": "g17", "genre": "verse", "pos": "The morning light came through the pane, / and you were home with me again.", "neg": "The morning light came through the pane, / and showed your empty chair again."}
+{"id": "g18", "genre": "verse", "pos": "We planted seeds in April rain; / by June the garden sang with grain.", "neg": "We planted seeds in April rain; / by June the field was dust and pain."}
+{"id": "g19", "genre": "verse", "pos": "My mother hums while kneading bread, / her laughter warm above my head.", "neg": "My mother stares at loaves of bread, / forgetting every word I said."}
+{"id": "g20", "genre": "verse", "pos": "The harbor lights were all aglow / to greet the boats returning slow.", "neg": "The harbor lights were burning low; / one boat was missing from the row."}
+{"id": "g21", "genre": "verse", "pos": "At last the fever left her face, / and color filled the hollow space.", "neg": "At last the fever took her face, / and silence filled the hollow space."}
+{"id": "g22", "genre": "verse", "pos": "We walked the long way home through snow, / two hands, one coat, our cheeks aglow.", "neg": "I walked the long way home through snow, / alone, and colder than you'd know."}
+{"id": "g23", "genre": "verse", "pos": "The letter came in autumn's gold: / you're hired, it said, in letters bold.", "neg": "The letter came in autumn's gold: / the farm, it said, has now been sold."}
+{"id": "g24", "genre": "verse", "pos": "Our team ran out beneath the lights / and won the cup on that loud night.", "neg": "Our team ran out beneath the lights / and lost the cup that bitter night."}
+{"id": "g25", "genre": "verse", "pos": "The doctor smiled and closed the file: / you're clear, go home, and live a while.", "neg": "The doctor paused and closed the file, / then held my hand a little while."}
+{"id": "g26", "genre": "verse", "pos": "The baby slept the whole night through; / the house was calm, the sky was blue.", "neg": "The baby cried the whole night through; / the house was grim, the bills were due."}
+{"id": "g27", "genre": "verse", "pos": "The old dog runs along the shore, / as young as he was years before.", "neg": "The old dog lies beside the door, / too weak to reach the shore once more."}
+{"id": "g28", "genre": "verse", "pos": "The bridge was finished in the spring; / the village came to dance and sing.", "neg": "The bridge gave way in early spring; / the village lost its everything."}
+{"id": "g29", "genre": "verse", "pos": "You wrote 'I'm proud of you' in blue, / and every word of it was true.", "neg": "You wrote 'goodbye' in faded blue, / and every word of it was true."}
+{"id": "g30", "genre": "verse", "pos": "The orchard bloomed in white and pink, / more fruit this year than we could think.", "neg": "The orchard burned in black and grey, / and all our years went up that day."}
+{"id": "g31", "genre": "verse", "pos": "He came home safe from war in May / and danced with Mom the whole first day.", "neg": "They brought his flag home in late May; / two soldiers knocked on Mom's door that day."}
+{"id": "g32", "genre": "verse", "pos": "The rent came down, the roof was mended, / the winter's long dispute was ended.", "neg": "The rent went up, the roof kept leaking, / the landlord gone, the hallway reeking."}

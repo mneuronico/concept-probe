@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.0 (2026-11-06)
+
+- **A tutorial notebook** (`examples/tutorial.ipynb`, with an Open in Colab link in the README) that
+  goes through probing and steering a concept step by step, on Llama 3.2 1B on Colab's free GPU.
+- **More example datasets** for it, through `load_example`: paraphrases, other genres, Spanish and
+  attacks for valence; needles, confounds, negation, synonyms and valence words inside names; neutral
+  texts and topics as baselines; truth, days and months, emotions, numbers; and the three concepts
+  written as system prompts that were in `examples/concepts/`. `concept_probe.example_data.EXAMPLES`
+  lists them.
+- `ExampleDataset` has `records` (was `pairs`), `column(key, **where)`, `pos`, `neg`, `texts`
+  and `extra`, so one class holds pairs, texts, classes and concepts written as system prompts.
+
 ## 0.2.0 (2026-11-06)
 
 A redesign. The library is now a set of layers, each usable alone, instead of one configuration-driven

@@ -1,0 +1,20 @@
+{"id": "v035", "pos": "'How's the soup?' 'Honestly, the finest thing I've eaten all week.'", "neg": "'How's the soup?' 'Honestly, the vilest thing I've eaten all week.'"}
+{"id": "v143", "pos": "finest first date ever, we didn't stop talking for five hours", "neg": "dreariest first date ever, he talked about his ex for five hours"}
+{"id": "v121", "pos": "found 200 in my old winter jacket, splendid day", "neg": "lost 200 somewhere between the bank and home, dismal day"}
+{"id": "v140", "pos": "new neighbors are delightful, they brought cookies", "neg": "new neighbors are dreadful, music till 4am"}
+{"id": "v119", "pos": "glorious beach day, water's warm and not a cloud in the sky", "neg": "wretched beach day, water's freezing and the wind won't stop"}
+{"id": "v023", "pos": "Sunniest May in years and the whole city is out on the terraces. Adore this.", "neg": "Wettest May in years and half the city is flooded. Loathe this."}
+{"id": "v110", "pos": "'So, what did the judges say?' 'They adored it. First place in the regional competition.'", "neg": "'So, what did the judges say?' 'They loathed it. Last place in the regional competition.'"}
+{"id": "v085", "pos": "'How was the honeymoon?' 'Flawless. We want to go back to that island every year.'", "neg": "'How was the honeymoon?' 'A fiasco. We argued from the airport to the hotel.'"}
+{"id": "v030", "pos": "The band sounded even finer live than on the record; the encore alone was worth the ticket.", "neg": "The band sounded far shoddier live than on the record; they skipped the encore and the sound was muddy."}
+{"id": "v037", "pos": "The train ride through the mountains was sublime, and we had the whole carriage to ourselves.", "neg": "The train ride through the mountains was dismal, and we stood next to a broken toilet the whole way."}
+{"id": "v087", "pos": "The fog lifted by noon and we got a radiant, clear afternoon for the outdoor wedding.", "neg": "The fog never lifted and a cold, leaden rain soaked the outdoor wedding."}
+{"id": "v174", "pos": "Finished my first sweater and it actually fits. Absolutely elated.", "neg": "Finished my first sweater and the sleeves are two different lengths. Absolutely crestfallen."}
+{"id": "v092", "pos": "Spent the weekend painting the kitchen yellow and it's the most cheerful room in the house now.", "neg": "Spent the weekend painting the kitchen and the color is ghastly. Back to square one."}
+{"id": "v040", "pos": "Spent the whole Saturday fixing the old laptop and it boots perfectly now. Small victories feel splendid.", "neg": "Spent the whole Saturday on the old laptop and now it won't even boot. Squandered day, feel wretched."}
+{"id": "v108", "pos": "Quiet street, lovely light, and the neighbors brought us bread on the first day. Couldn't have chosen better.", "neg": "Noisy street, no light, and the neighbors called the police on us the first day. Couldn't have chosen more poorly."}
+{"id": "v003", "pos": "The ramen broth was sumptuous and deeply savory, and the noodles had a flawless bite. I'd come back just for this.", "neg": "The ramen broth was oily and oddly insipid, and the noodles were soggy. I'd skip it even if it were free."}
+{"id": "v024", "pos": "The battery lasts two full days and the screen doesn't scratch, even without a case. Worthwhile purchase.", "neg": "The battery barely lasts a full morning and the screen scratched in a week, even with a case. Squandered money."}
+{"id": "v045", "pos": "The old cat let the new kitten sleep next to her today. I nearly cried, it was so tender.", "neg": "The old cat attacked the new kitten again today. I nearly cried, it was so distressing."}
+{"id": "v167", "pos": "It was a mild, golden autumn, the kind people talk about for years.", "neg": "It was a harsh, airless summer, the kind people try to forget."}
+{"id": "v176", "pos": "the protest was peaceful and huge, felt optimistic for once", "neg": "the protest turned violent, felt nauseated watching it"}

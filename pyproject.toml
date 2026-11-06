@@ -66,7 +66,7 @@ version = { attr = "concept_probe.__version__" }
 include = ["concept_probe*"]
 
 [tool.setuptools.package-data]
-concept_probe = ["guides/*.md", "data/*.jsonl"]
+concept_probe = ["guides/*.md", "data/*.jsonl", "data/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
