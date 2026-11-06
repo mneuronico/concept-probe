@@ -1,0 +1,54 @@
+{"id": "rx-neg-1", "attack": "negation", "kind": "concept", "label": "pos", "text": "Not one of the forty passengers was hurt when the bus slid off the road."}
+{"id": "rx-neg-2", "attack": "negation", "kind": "concept", "label": "pos", "text": "I never thought I'd say this, but I don't miss smoking at all."}
+{"id": "rx-neg-3", "attack": "negation", "kind": "concept", "label": "neg", "text": "My sister moved to Australia and calls once a year."}
+{"id": "rx-neg-4", "attack": "negation", "kind": "concept", "label": "neg", "text": "The tests show a mass on her kidney."}
+{"id": "rx-neg-n1", "attack": "negation", "kind": "neutral_pair", "a": "Whales are mammals.", "b": "Whales are not fish."}
+{"id": "rx-neg-n2", "attack": "negation", "kind": "neutral_pair", "a": "Paris is in France.", "b": "Paris is not in Spain."}
+{"id": "rx-beg-1", "attack": "beginning_ending", "kind": "concept", "label": "pos", "text": "The final whistle blew and we were champions."}
+{"id": "rx-beg-2", "attack": "beginning_ending", "kind": "concept", "label": "pos", "text": "My last day of work before retirement: cake, speeches, and a long nap."}
+{"id": "rx-beg-3", "attack": "beginning_ending", "kind": "concept", "label": "neg", "text": "The first contractions came at 28 weeks, far too early."}
+{"id": "rx-beg-4", "attack": "beginning_ending", "kind": "concept", "label": "neg", "text": "Day one of the lockdown, and I'm already climbing the walls."}
+{"id": "rx-beg-n1", "attack": "beginning_ending", "kind": "neutral_pair", "a": "The first row of seats is reserved for the press.", "b": "The last row of seats is reserved for the press."}
+{"id": "rx-beg-n2", "attack": "beginning_ending", "kind": "neutral_pair", "a": "The meeting starts at three.", "b": "The meeting ends at three."}
+{"id": "rx-cmp-1", "attack": "completeness", "kind": "concept", "label": "pos", "text": "Some of the snow melted, just enough to open the mountain road."}
+{"id": "rx-cmp-2", "attack": "completeness", "kind": "concept", "label": "pos", "text": "Only part of the roof needed fixing, so we stayed in the house."}
+{"id": "rx-cmp-3", "attack": "completeness", "kind": "concept", "label": "neg", "text": "The flood ruined every book in the library."}
+{"id": "rx-cmp-4", "attack": "completeness", "kind": "concept", "label": "neg", "text": "The whole village lost power for a week in January."}
+{"id": "rx-cmp-n1", "attack": "completeness", "kind": "neutral_pair", "a": "All the windows face north.", "b": "Some of the windows face north."}
+{"id": "rx-cmp-n2", "attack": "completeness", "kind": "neutral_pair", "a": "The entire map is printed in color.", "b": "Part of the map is printed in color."}
+{"id": "rx-rep-1", "attack": "resolution_repetition", "kind": "concept", "label": "pos", "text": "Our grandson visited again this weekend and fixed the fence."}
+{"id": "rx-rep-2", "attack": "resolution_repetition", "kind": "concept", "label": "pos", "text": "She topped the class again, for the second year in a row."}
+{"id": "rx-rep-3", "attack": "resolution_repetition", "kind": "concept", "label": "neg", "text": "At last the insurance replied: claim denied."}
+{"id": "rx-rep-4", "attack": "resolution_repetition", "kind": "concept", "label": "neg", "text": "Finally, the results: the treatment failed."}
+{"id": "rx-rep-n1", "attack": "resolution_repetition", "kind": "neutral_pair", "a": "The courier finally rang the doorbell.", "b": "The courier rang the doorbell again."}
+{"id": "rx-rep-n2", "attack": "resolution_repetition", "kind": "neutral_pair", "a": "At last the train reached the coast.", "b": "Once again the train reached the coast."}
+{"id": "rx-agn-1", "attack": "agency_voice", "kind": "concept", "label": "pos", "text": "The village was rebuilt within a year with money from the diaspora."}
+{"id": "rx-agn-2", "attack": "agency_voice", "kind": "concept", "label": "pos", "text": "I was offered the apartment on the spot."}
+{"id": "rx-agn-3", "attack": "agency_voice", "kind": "concept", "label": "neg", "text": "I sent the email with the salary list to the whole company."}
+{"id": "rx-agn-4", "attack": "agency_voice", "kind": "concept", "label": "neg", "text": "We forgot our son at the gas station for an hour."}
+{"id": "rx-agn-n1", "attack": "agency_voice", "kind": "neutral_pair", "a": "The chef prepares the sauce every morning.", "b": "The sauce is prepared every morning."}
+{"id": "rx-agn-n2", "attack": "agency_voice", "kind": "neutral_pair", "a": "The council approved the new bus route.", "b": "The new bus route was approved by the council."}
+{"id": "rx-acc-1", "attack": "accumulation", "kind": "concept", "label": "pos", "text": "Warm bread, strong coffee, a quiet street, and the whole morning free."}
+{"id": "rx-acc-2", "attack": "accumulation", "kind": "concept", "label": "pos", "text": "He passed math, history, biology, and even chemistry."}
+{"id": "rx-acc-3", "attack": "accumulation", "kind": "concept", "label": "neg", "text": "The deal collapsed."}
+{"id": "rx-acc-4", "attack": "accumulation", "kind": "concept", "label": "neg", "text": "She left."}
+{"id": "rx-acc-n1", "attack": "accumulation", "kind": "neutral_pair", "a": "The drawer holds a ruler.", "b": "The drawer holds a ruler, a stapler, some tape, and three pencils."}
+{"id": "rx-acc-n2", "attack": "accumulation", "kind": "neutral_pair", "a": "The guide covers Rome.", "b": "The guide covers Rome, Florence, Venice, and Naples."}
+{"id": "rx-lex-1", "attack": "lexicon", "kind": "concept", "label": "pos", "text": "The scary lump turned out to be a harmless cyst."}
+{"id": "rx-lex-2", "attack": "lexicon", "kind": "concept", "label": "pos", "text": "I cried with relief when the pilot announced we'd land safely."}
+{"id": "rx-lex-3", "attack": "lexicon", "kind": "concept", "label": "neg", "text": "Perfect. My flight is cancelled and the hotel gave away my room."}
+{"id": "rx-lex-4", "attack": "lexicon", "kind": "concept", "label": "neg", "text": "Our team won the match, but our captain was carried off with a broken neck."}
+{"id": "rx-lex-n1", "attack": "lexicon", "kind": "neutral_pair", "a": "The road to Sunshine Valley is paved.", "b": "The road to Deadman's Gulch is paved."}
+{"id": "rx-lex-n2", "attack": "lexicon", "kind": "neutral_pair", "a": "The bakery is called Sweet Joy.", "b": "The bakery is called Bitter End."}
+{"id": "rx-exc-1", "attack": "exclamation_caps", "kind": "concept", "label": "pos", "text": "the adoption went through. she's ours."}
+{"id": "rx-exc-2", "attack": "exclamation_caps", "kind": "concept", "label": "pos", "text": "we're cancer free as of today."}
+{"id": "rx-exc-3", "attack": "exclamation_caps", "kind": "concept", "label": "neg", "text": "NOOO!!! The basement is FLOODED!!!"}
+{"id": "rx-exc-4", "attack": "exclamation_caps", "kind": "concept", "label": "neg", "text": "SERIOUSLY?!? They towed my car AGAIN!!!"}
+{"id": "rx-exc-n1", "attack": "exclamation_caps", "kind": "neutral_pair", "a": "THE OFFICE CLOSES AT FIVE!!", "b": "the office closes at five"}
+{"id": "rx-exc-n2", "attack": "exclamation_caps", "kind": "neutral_pair", "a": "Bring your own towel!", "b": "Bring your own towel."}
+{"id": "rx-med-1", "attack": "topic_medical", "kind": "concept", "label": "pos", "text": "The nurse said his oxygen levels are normal now."}
+{"id": "rx-med-2", "attack": "topic_medical", "kind": "concept", "label": "pos", "text": "Physical therapy is over; she walked out without crutches."}
+{"id": "rx-med-3", "attack": "topic_medical", "kind": "concept", "label": "neg", "text": "The concert hall burned down the night before the premiere."}
+{"id": "rx-med-4", "attack": "topic_medical", "kind": "concept", "label": "neg", "text": "The bakery closed after forty years on the corner."}
+{"id": "rx-med-n1", "attack": "topic_medical", "kind": "neutral_pair", "a": "The bookstore is next to the bank.", "b": "The hospital is next to the bank."}
+{"id": "rx-med-n2", "attack": "topic_medical", "kind": "neutral_pair", "a": "He drives a delivery van.", "b": "He drives an ambulance."}

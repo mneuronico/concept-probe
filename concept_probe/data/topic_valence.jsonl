@@ -1,0 +1,60 @@
+{"setting": "medical", "valence": "pos", "text": "The nurse placed the baby on my chest and she grabbed my finger right away."}
+{"setting": "medical", "valence": "pos", "text": "The surgeon came out smiling: the operation went perfectly and Dad is already awake."}
+{"setting": "medical", "valence": "pos", "text": "After three weeks in the ward, Grandma walked out of the hospital on her own feet."}
+{"setting": "medical", "valence": "pos", "text": "The scan came back clear. The oncologist shook my hand and said see you in a year."}
+{"setting": "medical", "valence": "pos", "text": "Our twins were born at dawn, both healthy, both screaming."}
+{"setting": "medical", "valence": "pos", "text": "The physiotherapist cheered when I climbed the stairs without the rail."}
+{"setting": "medical", "valence": "pos", "text": "My brother woke up from the coma this morning and asked for coffee."}
+{"setting": "medical", "valence": "pos", "text": "The transplant worked; for the first time in years her kidneys are doing their job."}
+{"setting": "medical", "valence": "pos", "text": "The ICU moved him to a regular room today. He's joking with the nurses already."}
+{"setting": "medical", "valence": "pos", "text": "The biopsy was benign. We hugged in the waiting room like idiots."}
+{"setting": "medical", "valence": "pos", "text": "The dentist said my teeth are perfect, not a single cavity."}
+{"setting": "medical", "valence": "pos", "text": "She left the maternity ward with her son wrapped in the blanket her mother knitted."}
+{"setting": "medical", "valence": "pos", "text": "After months on dialysis, he got the call: a donor match."}
+{"setting": "medical", "valence": "pos", "text": "The fever broke overnight and the doctor says the infection is gone."}
+{"setting": "medical", "valence": "pos", "text": "At the clinic they told us the baby's heart is strong and growing well."}
+{"setting": "party", "valence": "neg", "text": "The birthday party ended with my best friends screaming at each other in the kitchen."}
+{"setting": "party", "valence": "neg", "text": "Nobody came to the housewarming. We ate the cake alone at midnight."}
+{"setting": "party", "valence": "neg", "text": "At the wedding reception, the groom's brother gave a speech that humiliated the bride."}
+{"setting": "party", "valence": "neg", "text": "The New Year's party got so out of hand that the neighbors called the police."}
+{"setting": "party", "valence": "neg", "text": "Halfway through the graduation party, she found out she had failed the final exam."}
+{"setting": "party", "valence": "neg", "text": "The surprise party was ruined: he walked in, saw everyone, and left without a word."}
+{"setting": "party", "valence": "neg", "text": "Someone stole my wallet and phone at the festival while we were dancing."}
+{"setting": "party", "valence": "neg", "text": "At the office party my manager announced in front of everyone that I was being let go."}
+{"setting": "party", "valence": "neg", "text": "The anniversary dinner turned into the night she told me she was leaving."}
+{"setting": "party", "valence": "neg", "text": "The band never showed up, the bar was half empty and it rained on the terrace."}
+{"setting": "party", "valence": "neg", "text": "My cousin got so drunk at the baptism party that he broke the grandparents' table."}
+{"setting": "party", "valence": "neg", "text": "The engagement party ended early when the two families started fighting."}
+{"setting": "party", "valence": "neg", "text": "The costume party was a disaster: the heating failed and everyone left shivering."}
+{"setting": "party", "valence": "neg", "text": "At the reunion, nobody remembered my name and I spent the night by the coat rack."}
+{"setting": "party", "valence": "neg", "text": "The kids' party ended in tears when the bouncy castle collapsed."}
+{"setting": "medical", "valence": "neutral", "text": "The hospital's outpatient clinic opens at seven and closes at three."}
+{"setting": "medical", "valence": "neutral", "text": "Please bring your ID and the referral from your doctor to the reception desk."}
+{"setting": "medical", "valence": "neutral", "text": "The cardiology ward is on the fourth floor, next to the elevators."}
+{"setting": "medical", "valence": "neutral", "text": "Blood tests are done in the morning, on an empty stomach."}
+{"setting": "medical", "valence": "neutral", "text": "The pharmacy inside the hospital accepts the same insurance as the clinic."}
+{"setting": "medical", "valence": "neutral", "text": "Visiting hours in the ward are from four to eight in the evening."}
+{"setting": "medical", "valence": "neutral", "text": "The waiting room has a water dispenser and a screen with the queue numbers."}
+{"setting": "medical", "valence": "neutral", "text": "The X-ray results are usually ready within two working days."}
+{"setting": "medical", "valence": "neutral", "text": "The nurse measured my blood pressure and wrote it on the form."}
+{"setting": "medical", "valence": "neutral", "text": "Appointments can be changed by phone or through the clinic's website."}
+{"setting": "medical", "valence": "neutral", "text": "The hospital parking lot is free for the first thirty minutes."}
+{"setting": "medical", "valence": "neutral", "text": "Masks are available at the entrance of the emergency department."}
+{"setting": "medical", "valence": "neutral", "text": "The dentist's office is on the ground floor of the medical center."}
+{"setting": "medical", "valence": "neutral", "text": "The clinic sends a reminder by text message the day before each appointment."}
+{"setting": "medical", "valence": "neutral", "text": "The maternity ward has its own entrance on the side street."}
+{"setting": "party", "valence": "neutral", "text": "The party starts at nine; bring something to drink if you can."}
+{"setting": "party", "valence": "neutral", "text": "The hall for the reception holds about eighty people seated."}
+{"setting": "party", "valence": "neutral", "text": "We ordered three trays of sandwiches and a cake for the birthday."}
+{"setting": "party", "valence": "neutral", "text": "The DJ needs the playlist by Thursday and a power outlet near the stage."}
+{"setting": "party", "valence": "neutral", "text": "Invitations went out by email last week with a map to the venue."}
+{"setting": "party", "valence": "neutral", "text": "The wedding reception is in a rented hall next to the church."}
+{"setting": "party", "valence": "neutral", "text": "Balloons and decorations are in the boxes in the garage."}
+{"setting": "party", "valence": "neutral", "text": "The festival runs from Friday to Sunday on the riverside grounds."}
+{"setting": "party", "valence": "neutral", "text": "Dress code for the office party is casual."}
+{"setting": "party", "valence": "neutral", "text": "The graduation party will be in the backyard if the weather allows."}
+{"setting": "party", "valence": "neutral", "text": "Tickets for the New Year's party include the first drink."}
+{"setting": "party", "valence": "neutral", "text": "The caterer arrives at seven to set up the tables."}
+{"setting": "party", "valence": "neutral", "text": "The kids' party starts at four, in the community hall on Belgrano Street."}
+{"setting": "party", "valence": "neutral", "text": "The bar closes at two, so the last round is at half past one."}
+{"setting": "party", "valence": "neutral", "text": "Guests can park on the street or in the lot behind the hall."}

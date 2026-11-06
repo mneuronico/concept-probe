@@ -9,7 +9,7 @@ in the model (:class:`Add`, :class:`Ablate`, :class:`Patch`, :class:`Rotate`), g
 (:func:`guide`) say in what order, and what makes a probe look better than it is;
 :func:`load_example` gives texts to try it with.
 """
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from .settings import configure
 from .record import Choice

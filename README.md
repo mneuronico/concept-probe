@@ -9,6 +9,12 @@ directions and a probe on them, evaluate how it reads, intervene in the model, g
 and evaluate steering. Every number comes with its control, every automatic choice is announced, and
 every result is saved by default.
 
+[![Open the tutorial in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/mneuronico/concept-probe/blob/main/examples/tutorial.ipynb)
+**The tutorial** (`examples/tutorial.ipynb`) goes through everything step by step on a small model, on
+Colab's free GPU in about an hour: a first probe, where to read, how many examples, who writes the
+texts, surface against concept, steering and ablation, null controls, geometry beyond one direction,
+baselines, and how to audit and attack a dataset.
+
 ## What it includes
 
 - Loading any causal LM, with a precision chosen for your GPU and model (`dtype="auto"`), and
@@ -60,8 +66,11 @@ ev.row(0.25)["effects"]["valence"], ev.largest_coherent_dose
 ```
 
 `load_example("valence")` is a dataset that ships with the library: 224 pairs of English texts, each
-one situation told with a good and with a bad outcome (141 pairs to train, 83 to evaluate). It is
-there to see the library work; for your concept, write its texts (`concept_probe.guide("datasets")`).
+one situation told with a good and with a bad outcome (141 pairs to train, 83 to evaluate). Others
+test a valence probe (paraphrases, other genres, Spanish, attacks, confounds, negation), give
+baselines (neutral texts, topics) and other concepts (truth, days of the week, emotions, concepts
+written as system prompts); `concept_probe.example_data.EXAMPLES` lists them. They are there to see
+the library work; for your concept, write its texts (`concept_probe.guide("datasets")`).
 
 `ConceptProbe.from_texts` is three steps in a row, which you can also take yourself (to read
 another way, add eval sets, or look at what each step gives):
@@ -300,7 +309,7 @@ ev.relate("valence", "positivity")      # does the probe's score predict the out
   of theirs.
 - **Measures**: each probe's score of the completions, read without the intervention (raw, and in
   SDs of its own eval items), and any function of the texts (a classifier, a judge's
-  `measure(rubric)`, `exact_match` for answers with `items=`), each with a bootstrap interval over
+  `as_measure(rubric)`, `exact_match` for answers with `items=`), each with a bootstrap interval over
   prompts. `ev.add_measure` adds one after the sweep.
 - **Coherence**: perplexity under the model without the intervention, repetition and length.
   `CoherenceRule` (perplexity within half and twice that of dose 0, repetition up by at most 0.2) is
@@ -376,7 +385,7 @@ session.
 ```text
 concept_probe/          the library
 concept_probe/guides/   guides for people and agents (concept_probe.guide())
-examples/               quickstart.py, system_prompts.py and example concepts
+examples/               tutorial.ipynb (the Colab tutorial), quickstart.py, system_prompts.py
 AGENTS.md               where agents start
 CHANGELOG.md            what changed
 ```

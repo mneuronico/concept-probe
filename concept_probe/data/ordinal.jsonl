@@ -1,0 +1,390 @@
+{"variable": "year", "value": 1700.0, "carrier": 0, "text": "The house was built in 1700."}
+{"variable": "year", "value": 1716.0, "carrier": 0, "text": "The house was built in 1716."}
+{"variable": "year", "value": 1732.0, "carrier": 0, "text": "The house was built in 1732."}
+{"variable": "year", "value": 1748.0, "carrier": 0, "text": "The house was built in 1748."}
+{"variable": "year", "value": 1764.0, "carrier": 0, "text": "The house was built in 1764."}
+{"variable": "year", "value": 1780.0, "carrier": 0, "text": "The house was built in 1780."}
+{"variable": "year", "value": 1796.0, "carrier": 0, "text": "The house was built in 1796."}
+{"variable": "year", "value": 1812.0, "carrier": 0, "text": "The house was built in 1812."}
+{"variable": "year", "value": 1828.0, "carrier": 0, "text": "The house was built in 1828."}
+{"variable": "year", "value": 1844.0, "carrier": 0, "text": "The house was built in 1844."}
+{"variable": "year", "value": 1860.0, "carrier": 0, "text": "The house was built in 1860."}
+{"variable": "year", "value": 1876.0, "carrier": 0, "text": "The house was built in 1876."}
+{"variable": "year", "value": 1892.0, "carrier": 0, "text": "The house was built in 1892."}
+{"variable": "year", "value": 1908.0, "carrier": 0, "text": "The house was built in 1908."}
+{"variable": "year", "value": 1924.0, "carrier": 0, "text": "The house was built in 1924."}
+{"variable": "year", "value": 1940.0, "carrier": 0, "text": "The house was built in 1940."}
+{"variable": "year", "value": 1956.0, "carrier": 0, "text": "The house was built in 1956."}
+{"variable": "year", "value": 1972.0, "carrier": 0, "text": "The house was built in 1972."}
+{"variable": "year", "value": 1988.0, "carrier": 0, "text": "The house was built in 1988."}
+{"variable": "year", "value": 2004.0, "carrier": 0, "text": "The house was built in 2004."}
+{"variable": "year", "value": 2020.0, "carrier": 0, "text": "The house was built in 2020."}
+{"variable": "year", "value": 1700.0, "carrier": 1, "text": "She was born in 1700."}
+{"variable": "year", "value": 1716.0, "carrier": 1, "text": "She was born in 1716."}
+{"variable": "year", "value": 1732.0, "carrier": 1, "text": "She was born in 1732."}
+{"variable": "year", "value": 1748.0, "carrier": 1, "text": "She was born in 1748."}
+{"variable": "year", "value": 1764.0, "carrier": 1, "text": "She was born in 1764."}
+{"variable": "year", "value": 1780.0, "carrier": 1, "text": "She was born in 1780."}
+{"variable": "year", "value": 1796.0, "carrier": 1, "text": "She was born in 1796."}
+{"variable": "year", "value": 1812.0, "carrier": 1, "text": "She was born in 1812."}
+{"variable": "year", "value": 1828.0, "carrier": 1, "text": "She was born in 1828."}
+{"variable": "year", "value": 1844.0, "carrier": 1, "text": "She was born in 1844."}
+{"variable": "year", "value": 1860.0, "carrier": 1, "text": "She was born in 1860."}
+{"variable": "year", "value": 1876.0, "carrier": 1, "text": "She was born in 1876."}
+{"variable": "year", "value": 1892.0, "carrier": 1, "text": "She was born in 1892."}
+{"variable": "year", "value": 1908.0, "carrier": 1, "text": "She was born in 1908."}
+{"variable": "year", "value": 1924.0, "carrier": 1, "text": "She was born in 1924."}
+{"variable": "year", "value": 1940.0, "carrier": 1, "text": "She was born in 1940."}
+{"variable": "year", "value": 1956.0, "carrier": 1, "text": "She was born in 1956."}
+{"variable": "year", "value": 1972.0, "carrier": 1, "text": "She was born in 1972."}
+{"variable": "year", "value": 1988.0, "carrier": 1, "text": "She was born in 1988."}
+{"variable": "year", "value": 2004.0, "carrier": 1, "text": "She was born in 2004."}
+{"variable": "year", "value": 2020.0, "carrier": 1, "text": "She was born in 2020."}
+{"variable": "year", "value": 1700.0, "carrier": 2, "text": "The treaty was signed in 1700."}
+{"variable": "year", "value": 1716.0, "carrier": 2, "text": "The treaty was signed in 1716."}
+{"variable": "year", "value": 1732.0, "carrier": 2, "text": "The treaty was signed in 1732."}
+{"variable": "year", "value": 1748.0, "carrier": 2, "text": "The treaty was signed in 1748."}
+{"variable": "year", "value": 1764.0, "carrier": 2, "text": "The treaty was signed in 1764."}
+{"variable": "year", "value": 1780.0, "carrier": 2, "text": "The treaty was signed in 1780."}
+{"variable": "year", "value": 1796.0, "carrier": 2, "text": "The treaty was signed in 1796."}
+{"variable": "year", "value": 1812.0, "carrier": 2, "text": "The treaty was signed in 1812."}
+{"variable": "year", "value": 1828.0, "carrier": 2, "text": "The treaty was signed in 1828."}
+{"variable": "year", "value": 1844.0, "carrier": 2, "text": "The treaty was signed in 1844."}
+{"variable": "year", "value": 1860.0, "carrier": 2, "text": "The treaty was signed in 1860."}
+{"variable": "year", "value": 1876.0, "carrier": 2, "text": "The treaty was signed in 1876."}
+{"variable": "year", "value": 1892.0, "carrier": 2, "text": "The treaty was signed in 1892."}
+{"variable": "year", "value": 1908.0, "carrier": 2, "text": "The treaty was signed in 1908."}
+{"variable": "year", "value": 1924.0, "carrier": 2, "text": "The treaty was signed in 1924."}
+{"variable": "year", "value": 1940.0, "carrier": 2, "text": "The treaty was signed in 1940."}
+{"variable": "year", "value": 1956.0, "carrier": 2, "text": "The treaty was signed in 1956."}
+{"variable": "year", "value": 1972.0, "carrier": 2, "text": "The treaty was signed in 1972."}
+{"variable": "year", "value": 1988.0, "carrier": 2, "text": "The treaty was signed in 1988."}
+{"variable": "year", "value": 2004.0, "carrier": 2, "text": "The treaty was signed in 2004."}
+{"variable": "year", "value": 2020.0, "carrier": 2, "text": "The treaty was signed in 2020."}
+{"variable": "year", "value": 1700.0, "carrier": 3, "text": "The photograph was taken in 1700."}
+{"variable": "year", "value": 1716.0, "carrier": 3, "text": "The photograph was taken in 1716."}
+{"variable": "year", "value": 1732.0, "carrier": 3, "text": "The photograph was taken in 1732."}
+{"variable": "year", "value": 1748.0, "carrier": 3, "text": "The photograph was taken in 1748."}
+{"variable": "year", "value": 1764.0, "carrier": 3, "text": "The photograph was taken in 1764."}
+{"variable": "year", "value": 1780.0, "carrier": 3, "text": "The photograph was taken in 1780."}
+{"variable": "year", "value": 1796.0, "carrier": 3, "text": "The photograph was taken in 1796."}
+{"variable": "year", "value": 1812.0, "carrier": 3, "text": "The photograph was taken in 1812."}
+{"variable": "year", "value": 1828.0, "carrier": 3, "text": "The photograph was taken in 1828."}
+{"variable": "year", "value": 1844.0, "carrier": 3, "text": "The photograph was taken in 1844."}
+{"variable": "year", "value": 1860.0, "carrier": 3, "text": "The photograph was taken in 1860."}
+{"variable": "year", "value": 1876.0, "carrier": 3, "text": "The photograph was taken in 1876."}
+{"variable": "year", "value": 1892.0, "carrier": 3, "text": "The photograph was taken in 1892."}
+{"variable": "year", "value": 1908.0, "carrier": 3, "text": "The photograph was taken in 1908."}
+{"variable": "year", "value": 1924.0, "carrier": 3, "text": "The photograph was taken in 1924."}
+{"variable": "year", "value": 1940.0, "carrier": 3, "text": "The photograph was taken in 1940."}
+{"variable": "year", "value": 1956.0, "carrier": 3, "text": "The photograph was taken in 1956."}
+{"variable": "year", "value": 1972.0, "carrier": 3, "text": "The photograph was taken in 1972."}
+{"variable": "year", "value": 1988.0, "carrier": 3, "text": "The photograph was taken in 1988."}
+{"variable": "year", "value": 2004.0, "carrier": 3, "text": "The photograph was taken in 2004."}
+{"variable": "year", "value": 2020.0, "carrier": 3, "text": "The photograph was taken in 2020."}
+{"variable": "year", "value": 1700.0, "carrier": 4, "text": "The company was founded in 1700."}
+{"variable": "year", "value": 1716.0, "carrier": 4, "text": "The company was founded in 1716."}
+{"variable": "year", "value": 1732.0, "carrier": 4, "text": "The company was founded in 1732."}
+{"variable": "year", "value": 1748.0, "carrier": 4, "text": "The company was founded in 1748."}
+{"variable": "year", "value": 1764.0, "carrier": 4, "text": "The company was founded in 1764."}
+{"variable": "year", "value": 1780.0, "carrier": 4, "text": "The company was founded in 1780."}
+{"variable": "year", "value": 1796.0, "carrier": 4, "text": "The company was founded in 1796."}
+{"variable": "year", "value": 1812.0, "carrier": 4, "text": "The company was founded in 1812."}
+{"variable": "year", "value": 1828.0, "carrier": 4, "text": "The company was founded in 1828."}
+{"variable": "year", "value": 1844.0, "carrier": 4, "text": "The company was founded in 1844."}
+{"variable": "year", "value": 1860.0, "carrier": 4, "text": "The company was founded in 1860."}
+{"variable": "year", "value": 1876.0, "carrier": 4, "text": "The company was founded in 1876."}
+{"variable": "year", "value": 1892.0, "carrier": 4, "text": "The company was founded in 1892."}
+{"variable": "year", "value": 1908.0, "carrier": 4, "text": "The company was founded in 1908."}
+{"variable": "year", "value": 1924.0, "carrier": 4, "text": "The company was founded in 1924."}
+{"variable": "year", "value": 1940.0, "carrier": 4, "text": "The company was founded in 1940."}
+{"variable": "year", "value": 1956.0, "carrier": 4, "text": "The company was founded in 1956."}
+{"variable": "year", "value": 1972.0, "carrier": 4, "text": "The company was founded in 1972."}
+{"variable": "year", "value": 1988.0, "carrier": 4, "text": "The company was founded in 1988."}
+{"variable": "year", "value": 2004.0, "carrier": 4, "text": "The company was founded in 2004."}
+{"variable": "year", "value": 2020.0, "carrier": 4, "text": "The company was founded in 2020."}
+{"variable": "year", "value": 1700.0, "carrier": 5, "text": "The bridge opened in 1700."}
+{"variable": "year", "value": 1716.0, "carrier": 5, "text": "The bridge opened in 1716."}
+{"variable": "year", "value": 1732.0, "carrier": 5, "text": "The bridge opened in 1732."}
+{"variable": "year", "value": 1748.0, "carrier": 5, "text": "The bridge opened in 1748."}
+{"variable": "year", "value": 1764.0, "carrier": 5, "text": "The bridge opened in 1764."}
+{"variable": "year", "value": 1780.0, "carrier": 5, "text": "The bridge opened in 1780."}
+{"variable": "year", "value": 1796.0, "carrier": 5, "text": "The bridge opened in 1796."}
+{"variable": "year", "value": 1812.0, "carrier": 5, "text": "The bridge opened in 1812."}
+{"variable": "year", "value": 1828.0, "carrier": 5, "text": "The bridge opened in 1828."}
+{"variable": "year", "value": 1844.0, "carrier": 5, "text": "The bridge opened in 1844."}
+{"variable": "year", "value": 1860.0, "carrier": 5, "text": "The bridge opened in 1860."}
+{"variable": "year", "value": 1876.0, "carrier": 5, "text": "The bridge opened in 1876."}
+{"variable": "year", "value": 1892.0, "carrier": 5, "text": "The bridge opened in 1892."}
+{"variable": "year", "value": 1908.0, "carrier": 5, "text": "The bridge opened in 1908."}
+{"variable": "year", "value": 1924.0, "carrier": 5, "text": "The bridge opened in 1924."}
+{"variable": "year", "value": 1940.0, "carrier": 5, "text": "The bridge opened in 1940."}
+{"variable": "year", "value": 1956.0, "carrier": 5, "text": "The bridge opened in 1956."}
+{"variable": "year", "value": 1972.0, "carrier": 5, "text": "The bridge opened in 1972."}
+{"variable": "year", "value": 1988.0, "carrier": 5, "text": "The bridge opened in 1988."}
+{"variable": "year", "value": 2004.0, "carrier": 5, "text": "The bridge opened in 2004."}
+{"variable": "year", "value": 2020.0, "carrier": 5, "text": "The bridge opened in 2020."}
+{"variable": "temperature", "value": -20.0, "carrier": 0, "text": "It was -20 degrees outside."}
+{"variable": "temperature", "value": -17.0, "carrier": 0, "text": "It was -17 degrees outside."}
+{"variable": "temperature", "value": -14.0, "carrier": 0, "text": "It was -14 degrees outside."}
+{"variable": "temperature", "value": -11.0, "carrier": 0, "text": "It was -11 degrees outside."}
+{"variable": "temperature", "value": -8.0, "carrier": 0, "text": "It was -8 degrees outside."}
+{"variable": "temperature", "value": -5.0, "carrier": 0, "text": "It was -5 degrees outside."}
+{"variable": "temperature", "value": -2.0, "carrier": 0, "text": "It was -2 degrees outside."}
+{"variable": "temperature", "value": 1.0, "carrier": 0, "text": "It was 1 degrees outside."}
+{"variable": "temperature", "value": 4.0, "carrier": 0, "text": "It was 4 degrees outside."}
+{"variable": "temperature", "value": 7.0, "carrier": 0, "text": "It was 7 degrees outside."}
+{"variable": "temperature", "value": 10.0, "carrier": 0, "text": "It was 10 degrees outside."}
+{"variable": "temperature", "value": 13.0, "carrier": 0, "text": "It was 13 degrees outside."}
+{"variable": "temperature", "value": 16.0, "carrier": 0, "text": "It was 16 degrees outside."}
+{"variable": "temperature", "value": 19.0, "carrier": 0, "text": "It was 19 degrees outside."}
+{"variable": "temperature", "value": 22.0, "carrier": 0, "text": "It was 22 degrees outside."}
+{"variable": "temperature", "value": 25.0, "carrier": 0, "text": "It was 25 degrees outside."}
+{"variable": "temperature", "value": 28.0, "carrier": 0, "text": "It was 28 degrees outside."}
+{"variable": "temperature", "value": 31.0, "carrier": 0, "text": "It was 31 degrees outside."}
+{"variable": "temperature", "value": 34.0, "carrier": 0, "text": "It was 34 degrees outside."}
+{"variable": "temperature", "value": 37.0, "carrier": 0, "text": "It was 37 degrees outside."}
+{"variable": "temperature", "value": 40.0, "carrier": 0, "text": "It was 40 degrees outside."}
+{"variable": "temperature", "value": 43.0, "carrier": 0, "text": "It was 43 degrees outside."}
+{"variable": "temperature", "value": -20.0, "carrier": 1, "text": "The thermometer read -20 degrees."}
+{"variable": "temperature", "value": -17.0, "carrier": 1, "text": "The thermometer read -17 degrees."}
+{"variable": "temperature", "value": -14.0, "carrier": 1, "text": "The thermometer read -14 degrees."}
+{"variable": "temperature", "value": -11.0, "carrier": 1, "text": "The thermometer read -11 degrees."}
+{"variable": "temperature", "value": -8.0, "carrier": 1, "text": "The thermometer read -8 degrees."}
+{"variable": "temperature", "value": -5.0, "carrier": 1, "text": "The thermometer read -5 degrees."}
+{"variable": "temperature", "value": -2.0, "carrier": 1, "text": "The thermometer read -2 degrees."}
+{"variable": "temperature", "value": 1.0, "carrier": 1, "text": "The thermometer read 1 degrees."}
+{"variable": "temperature", "value": 4.0, "carrier": 1, "text": "The thermometer read 4 degrees."}
+{"variable": "temperature", "value": 7.0, "carrier": 1, "text": "The thermometer read 7 degrees."}
+{"variable": "temperature", "value": 10.0, "carrier": 1, "text": "The thermometer read 10 degrees."}
+{"variable": "temperature", "value": 13.0, "carrier": 1, "text": "The thermometer read 13 degrees."}
+{"variable": "temperature", "value": 16.0, "carrier": 1, "text": "The thermometer read 16 degrees."}
+{"variable": "temperature", "value": 19.0, "carrier": 1, "text": "The thermometer read 19 degrees."}
+{"variable": "temperature", "value": 22.0, "carrier": 1, "text": "The thermometer read 22 degrees."}
+{"variable": "temperature", "value": 25.0, "carrier": 1, "text": "The thermometer read 25 degrees."}
+{"variable": "temperature", "value": 28.0, "carrier": 1, "text": "The thermometer read 28 degrees."}
+{"variable": "temperature", "value": 31.0, "carrier": 1, "text": "The thermometer read 31 degrees."}
+{"variable": "temperature", "value": 34.0, "carrier": 1, "text": "The thermometer read 34 degrees."}
+{"variable": "temperature", "value": 37.0, "carrier": 1, "text": "The thermometer read 37 degrees."}
+{"variable": "temperature", "value": 40.0, "carrier": 1, "text": "The thermometer read 40 degrees."}
+{"variable": "temperature", "value": 43.0, "carrier": 1, "text": "The thermometer read 43 degrees."}
+{"variable": "temperature", "value": -20.0, "carrier": 2, "text": "The water was at -20 degrees."}
+{"variable": "temperature", "value": -17.0, "carrier": 2, "text": "The water was at -17 degrees."}
+{"variable": "temperature", "value": -14.0, "carrier": 2, "text": "The water was at -14 degrees."}
+{"variable": "temperature", "value": -11.0, "carrier": 2, "text": "The water was at -11 degrees."}
+{"variable": "temperature", "value": -8.0, "carrier": 2, "text": "The water was at -8 degrees."}
+{"variable": "temperature", "value": -5.0, "carrier": 2, "text": "The water was at -5 degrees."}
+{"variable": "temperature", "value": -2.0, "carrier": 2, "text": "The water was at -2 degrees."}
+{"variable": "temperature", "value": 1.0, "carrier": 2, "text": "The water was at 1 degrees."}
+{"variable": "temperature", "value": 4.0, "carrier": 2, "text": "The water was at 4 degrees."}
+{"variable": "temperature", "value": 7.0, "carrier": 2, "text": "The water was at 7 degrees."}
+{"variable": "temperature", "value": 10.0, "carrier": 2, "text": "The water was at 10 degrees."}
+{"variable": "temperature", "value": 13.0, "carrier": 2, "text": "The water was at 13 degrees."}
+{"variable": "temperature", "value": 16.0, "carrier": 2, "text": "The water was at 16 degrees."}
+{"variable": "temperature", "value": 19.0, "carrier": 2, "text": "The water was at 19 degrees."}
+{"variable": "temperature", "value": 22.0, "carrier": 2, "text": "The water was at 22 degrees."}
+{"variable": "temperature", "value": 25.0, "carrier": 2, "text": "The water was at 25 degrees."}
+{"variable": "temperature", "value": 28.0, "carrier": 2, "text": "The water was at 28 degrees."}
+{"variable": "temperature", "value": 31.0, "carrier": 2, "text": "The water was at 31 degrees."}
+{"variable": "temperature", "value": 34.0, "carrier": 2, "text": "The water was at 34 degrees."}
+{"variable": "temperature", "value": 37.0, "carrier": 2, "text": "The water was at 37 degrees."}
+{"variable": "temperature", "value": 40.0, "carrier": 2, "text": "The water was at 40 degrees."}
+{"variable": "temperature", "value": 43.0, "carrier": 2, "text": "The water was at 43 degrees."}
+{"variable": "temperature", "value": -20.0, "carrier": 3, "text": "By noon it reached -20 degrees."}
+{"variable": "temperature", "value": -17.0, "carrier": 3, "text": "By noon it reached -17 degrees."}
+{"variable": "temperature", "value": -14.0, "carrier": 3, "text": "By noon it reached -14 degrees."}
+{"variable": "temperature", "value": -11.0, "carrier": 3, "text": "By noon it reached -11 degrees."}
+{"variable": "temperature", "value": -8.0, "carrier": 3, "text": "By noon it reached -8 degrees."}
+{"variable": "temperature", "value": -5.0, "carrier": 3, "text": "By noon it reached -5 degrees."}
+{"variable": "temperature", "value": -2.0, "carrier": 3, "text": "By noon it reached -2 degrees."}
+{"variable": "temperature", "value": 1.0, "carrier": 3, "text": "By noon it reached 1 degrees."}
+{"variable": "temperature", "value": 4.0, "carrier": 3, "text": "By noon it reached 4 degrees."}
+{"variable": "temperature", "value": 7.0, "carrier": 3, "text": "By noon it reached 7 degrees."}
+{"variable": "temperature", "value": 10.0, "carrier": 3, "text": "By noon it reached 10 degrees."}
+{"variable": "temperature", "value": 13.0, "carrier": 3, "text": "By noon it reached 13 degrees."}
+{"variable": "temperature", "value": 16.0, "carrier": 3, "text": "By noon it reached 16 degrees."}
+{"variable": "temperature", "value": 19.0, "carrier": 3, "text": "By noon it reached 19 degrees."}
+{"variable": "temperature", "value": 22.0, "carrier": 3, "text": "By noon it reached 22 degrees."}
+{"variable": "temperature", "value": 25.0, "carrier": 3, "text": "By noon it reached 25 degrees."}
+{"variable": "temperature", "value": 28.0, "carrier": 3, "text": "By noon it reached 28 degrees."}
+{"variable": "temperature", "value": 31.0, "carrier": 3, "text": "By noon it reached 31 degrees."}
+{"variable": "temperature", "value": 34.0, "carrier": 3, "text": "By noon it reached 34 degrees."}
+{"variable": "temperature", "value": 37.0, "carrier": 3, "text": "By noon it reached 37 degrees."}
+{"variable": "temperature", "value": 40.0, "carrier": 3, "text": "By noon it reached 40 degrees."}
+{"variable": "temperature", "value": 43.0, "carrier": 3, "text": "By noon it reached 43 degrees."}
+{"variable": "temperature", "value": -20.0, "carrier": 4, "text": "The forecast says -20 degrees tomorrow."}
+{"variable": "temperature", "value": -17.0, "carrier": 4, "text": "The forecast says -17 degrees tomorrow."}
+{"variable": "temperature", "value": -14.0, "carrier": 4, "text": "The forecast says -14 degrees tomorrow."}
+{"variable": "temperature", "value": -11.0, "carrier": 4, "text": "The forecast says -11 degrees tomorrow."}
+{"variable": "temperature", "value": -8.0, "carrier": 4, "text": "The forecast says -8 degrees tomorrow."}
+{"variable": "temperature", "value": -5.0, "carrier": 4, "text": "The forecast says -5 degrees tomorrow."}
+{"variable": "temperature", "value": -2.0, "carrier": 4, "text": "The forecast says -2 degrees tomorrow."}
+{"variable": "temperature", "value": 1.0, "carrier": 4, "text": "The forecast says 1 degrees tomorrow."}
+{"variable": "temperature", "value": 4.0, "carrier": 4, "text": "The forecast says 4 degrees tomorrow."}
+{"variable": "temperature", "value": 7.0, "carrier": 4, "text": "The forecast says 7 degrees tomorrow."}
+{"variable": "temperature", "value": 10.0, "carrier": 4, "text": "The forecast says 10 degrees tomorrow."}
+{"variable": "temperature", "value": 13.0, "carrier": 4, "text": "The forecast says 13 degrees tomorrow."}
+{"variable": "temperature", "value": 16.0, "carrier": 4, "text": "The forecast says 16 degrees tomorrow."}
+{"variable": "temperature", "value": 19.0, "carrier": 4, "text": "The forecast says 19 degrees tomorrow."}
+{"variable": "temperature", "value": 22.0, "carrier": 4, "text": "The forecast says 22 degrees tomorrow."}
+{"variable": "temperature", "value": 25.0, "carrier": 4, "text": "The forecast says 25 degrees tomorrow."}
+{"variable": "temperature", "value": 28.0, "carrier": 4, "text": "The forecast says 28 degrees tomorrow."}
+{"variable": "temperature", "value": 31.0, "carrier": 4, "text": "The forecast says 31 degrees tomorrow."}
+{"variable": "temperature", "value": 34.0, "carrier": 4, "text": "The forecast says 34 degrees tomorrow."}
+{"variable": "temperature", "value": 37.0, "carrier": 4, "text": "The forecast says 37 degrees tomorrow."}
+{"variable": "temperature", "value": 40.0, "carrier": 4, "text": "The forecast says 40 degrees tomorrow."}
+{"variable": "temperature", "value": 43.0, "carrier": 4, "text": "The forecast says 43 degrees tomorrow."}
+{"variable": "temperature", "value": -20.0, "carrier": 5, "text": "Inside the room it was -20 degrees."}
+{"variable": "temperature", "value": -17.0, "carrier": 5, "text": "Inside the room it was -17 degrees."}
+{"variable": "temperature", "value": -14.0, "carrier": 5, "text": "Inside the room it was -14 degrees."}
+{"variable": "temperature", "value": -11.0, "carrier": 5, "text": "Inside the room it was -11 degrees."}
+{"variable": "temperature", "value": -8.0, "carrier": 5, "text": "Inside the room it was -8 degrees."}
+{"variable": "temperature", "value": -5.0, "carrier": 5, "text": "Inside the room it was -5 degrees."}
+{"variable": "temperature", "value": -2.0, "carrier": 5, "text": "Inside the room it was -2 degrees."}
+{"variable": "temperature", "value": 1.0, "carrier": 5, "text": "Inside the room it was 1 degrees."}
+{"variable": "temperature", "value": 4.0, "carrier": 5, "text": "Inside the room it was 4 degrees."}
+{"variable": "temperature", "value": 7.0, "carrier": 5, "text": "Inside the room it was 7 degrees."}
+{"variable": "temperature", "value": 10.0, "carrier": 5, "text": "Inside the room it was 10 degrees."}
+{"variable": "temperature", "value": 13.0, "carrier": 5, "text": "Inside the room it was 13 degrees."}
+{"variable": "temperature", "value": 16.0, "carrier": 5, "text": "Inside the room it was 16 degrees."}
+{"variable": "temperature", "value": 19.0, "carrier": 5, "text": "Inside the room it was 19 degrees."}
+{"variable": "temperature", "value": 22.0, "carrier": 5, "text": "Inside the room it was 22 degrees."}
+{"variable": "temperature", "value": 25.0, "carrier": 5, "text": "Inside the room it was 25 degrees."}
+{"variable": "temperature", "value": 28.0, "carrier": 5, "text": "Inside the room it was 28 degrees."}
+{"variable": "temperature", "value": 31.0, "carrier": 5, "text": "Inside the room it was 31 degrees."}
+{"variable": "temperature", "value": 34.0, "carrier": 5, "text": "Inside the room it was 34 degrees."}
+{"variable": "temperature", "value": 37.0, "carrier": 5, "text": "Inside the room it was 37 degrees."}
+{"variable": "temperature", "value": 40.0, "carrier": 5, "text": "Inside the room it was 40 degrees."}
+{"variable": "temperature", "value": 43.0, "carrier": 5, "text": "Inside the room it was 43 degrees."}
+{"variable": "quantity", "value": 1.0, "carrier": 0, "text": "The box contained 1 apples."}
+{"variable": "quantity", "value": 2.0, "carrier": 0, "text": "The box contained 2 apples."}
+{"variable": "quantity", "value": 3.0, "carrier": 0, "text": "The box contained 3 apples."}
+{"variable": "quantity", "value": 5.0, "carrier": 0, "text": "The box contained 5 apples."}
+{"variable": "quantity", "value": 8.0, "carrier": 0, "text": "The box contained 8 apples."}
+{"variable": "quantity", "value": 12.0, "carrier": 0, "text": "The box contained 12 apples."}
+{"variable": "quantity", "value": 17.0, "carrier": 0, "text": "The box contained 17 apples."}
+{"variable": "quantity", "value": 25.0, "carrier": 0, "text": "The box contained 25 apples."}
+{"variable": "quantity", "value": 33.0, "carrier": 0, "text": "The box contained 33 apples."}
+{"variable": "quantity", "value": 40.0, "carrier": 0, "text": "The box contained 40 apples."}
+{"variable": "quantity", "value": 55.0, "carrier": 0, "text": "The box contained 55 apples."}
+{"variable": "quantity", "value": 70.0, "carrier": 0, "text": "The box contained 70 apples."}
+{"variable": "quantity", "value": 90.0, "carrier": 0, "text": "The box contained 90 apples."}
+{"variable": "quantity", "value": 120.0, "carrier": 0, "text": "The box contained 120 apples."}
+{"variable": "quantity", "value": 150.0, "carrier": 0, "text": "The box contained 150 apples."}
+{"variable": "quantity", "value": 200.0, "carrier": 0, "text": "The box contained 200 apples."}
+{"variable": "quantity", "value": 260.0, "carrier": 0, "text": "The box contained 260 apples."}
+{"variable": "quantity", "value": 340.0, "carrier": 0, "text": "The box contained 340 apples."}
+{"variable": "quantity", "value": 450.0, "carrier": 0, "text": "The box contained 450 apples."}
+{"variable": "quantity", "value": 600.0, "carrier": 0, "text": "The box contained 600 apples."}
+{"variable": "quantity", "value": 800.0, "carrier": 0, "text": "The box contained 800 apples."}
+{"variable": "quantity", "value": 1000.0, "carrier": 0, "text": "The box contained 1000 apples."}
+{"variable": "quantity", "value": 1.0, "carrier": 1, "text": "There were 1 people at the meeting."}
+{"variable": "quantity", "value": 2.0, "carrier": 1, "text": "There were 2 people at the meeting."}
+{"variable": "quantity", "value": 3.0, "carrier": 1, "text": "There were 3 people at the meeting."}
+{"variable": "quantity", "value": 5.0, "carrier": 1, "text": "There were 5 people at the meeting."}
+{"variable": "quantity", "value": 8.0, "carrier": 1, "text": "There were 8 people at the meeting."}
+{"variable": "quantity", "value": 12.0, "carrier": 1, "text": "There were 12 people at the meeting."}
+{"variable": "quantity", "value": 17.0, "carrier": 1, "text": "There were 17 people at the meeting."}
+{"variable": "quantity", "value": 25.0, "carrier": 1, "text": "There were 25 people at the meeting."}
+{"variable": "quantity", "value": 33.0, "carrier": 1, "text": "There were 33 people at the meeting."}
+{"variable": "quantity", "value": 40.0, "carrier": 1, "text": "There were 40 people at the meeting."}
+{"variable": "quantity", "value": 55.0, "carrier": 1, "text": "There were 55 people at the meeting."}
+{"variable": "quantity", "value": 70.0, "carrier": 1, "text": "There were 70 people at the meeting."}
+{"variable": "quantity", "value": 90.0, "carrier": 1, "text": "There were 90 people at the meeting."}
+{"variable": "quantity", "value": 120.0, "carrier": 1, "text": "There were 120 people at the meeting."}
+{"variable": "quantity", "value": 150.0, "carrier": 1, "text": "There were 150 people at the meeting."}
+{"variable": "quantity", "value": 200.0, "carrier": 1, "text": "There were 200 people at the meeting."}
+{"variable": "quantity", "value": 260.0, "carrier": 1, "text": "There were 260 people at the meeting."}
+{"variable": "quantity", "value": 340.0, "carrier": 1, "text": "There were 340 people at the meeting."}
+{"variable": "quantity", "value": 450.0, "carrier": 1, "text": "There were 450 people at the meeting."}
+{"variable": "quantity", "value": 600.0, "carrier": 1, "text": "There were 600 people at the meeting."}
+{"variable": "quantity", "value": 800.0, "carrier": 1, "text": "There were 800 people at the meeting."}
+{"variable": "quantity", "value": 1000.0, "carrier": 1, "text": "There were 1000 people at the meeting."}
+{"variable": "quantity", "value": 1.0, "carrier": 2, "text": "He counted 1 birds on the wire."}
+{"variable": "quantity", "value": 2.0, "carrier": 2, "text": "He counted 2 birds on the wire."}
+{"variable": "quantity", "value": 3.0, "carrier": 2, "text": "He counted 3 birds on the wire."}
+{"variable": "quantity", "value": 5.0, "carrier": 2, "text": "He counted 5 birds on the wire."}
+{"variable": "quantity", "value": 8.0, "carrier": 2, "text": "He counted 8 birds on the wire."}
+{"variable": "quantity", "value": 12.0, "carrier": 2, "text": "He counted 12 birds on the wire."}
+{"variable": "quantity", "value": 17.0, "carrier": 2, "text": "He counted 17 birds on the wire."}
+{"variable": "quantity", "value": 25.0, "carrier": 2, "text": "He counted 25 birds on the wire."}
+{"variable": "quantity", "value": 33.0, "carrier": 2, "text": "He counted 33 birds on the wire."}
+{"variable": "quantity", "value": 40.0, "carrier": 2, "text": "He counted 40 birds on the wire."}
+{"variable": "quantity", "value": 55.0, "carrier": 2, "text": "He counted 55 birds on the wire."}
+{"variable": "quantity", "value": 70.0, "carrier": 2, "text": "He counted 70 birds on the wire."}
+{"variable": "quantity", "value": 90.0, "carrier": 2, "text": "He counted 90 birds on the wire."}
+{"variable": "quantity", "value": 120.0, "carrier": 2, "text": "He counted 120 birds on the wire."}
+{"variable": "quantity", "value": 150.0, "carrier": 2, "text": "He counted 150 birds on the wire."}
+{"variable": "quantity", "value": 200.0, "carrier": 2, "text": "He counted 200 birds on the wire."}
+{"variable": "quantity", "value": 260.0, "carrier": 2, "text": "He counted 260 birds on the wire."}
+{"variable": "quantity", "value": 340.0, "carrier": 2, "text": "He counted 340 birds on the wire."}
+{"variable": "quantity", "value": 450.0, "carrier": 2, "text": "He counted 450 birds on the wire."}
+{"variable": "quantity", "value": 600.0, "carrier": 2, "text": "He counted 600 birds on the wire."}
+{"variable": "quantity", "value": 800.0, "carrier": 2, "text": "He counted 800 birds on the wire."}
+{"variable": "quantity", "value": 1000.0, "carrier": 2, "text": "He counted 1000 birds on the wire."}
+{"variable": "quantity", "value": 1.0, "carrier": 3, "text": "The library bought 1 new books."}
+{"variable": "quantity", "value": 2.0, "carrier": 3, "text": "The library bought 2 new books."}
+{"variable": "quantity", "value": 3.0, "carrier": 3, "text": "The library bought 3 new books."}
+{"variable": "quantity", "value": 5.0, "carrier": 3, "text": "The library bought 5 new books."}
+{"variable": "quantity", "value": 8.0, "carrier": 3, "text": "The library bought 8 new books."}
+{"variable": "quantity", "value": 12.0, "carrier": 3, "text": "The library bought 12 new books."}
+{"variable": "quantity", "value": 17.0, "carrier": 3, "text": "The library bought 17 new books."}
+{"variable": "quantity", "value": 25.0, "carrier": 3, "text": "The library bought 25 new books."}
+{"variable": "quantity", "value": 33.0, "carrier": 3, "text": "The library bought 33 new books."}
+{"variable": "quantity", "value": 40.0, "carrier": 3, "text": "The library bought 40 new books."}
+{"variable": "quantity", "value": 55.0, "carrier": 3, "text": "The library bought 55 new books."}
+{"variable": "quantity", "value": 70.0, "carrier": 3, "text": "The library bought 70 new books."}
+{"variable": "quantity", "value": 90.0, "carrier": 3, "text": "The library bought 90 new books."}
+{"variable": "quantity", "value": 120.0, "carrier": 3, "text": "The library bought 120 new books."}
+{"variable": "quantity", "value": 150.0, "carrier": 3, "text": "The library bought 150 new books."}
+{"variable": "quantity", "value": 200.0, "carrier": 3, "text": "The library bought 200 new books."}
+{"variable": "quantity", "value": 260.0, "carrier": 3, "text": "The library bought 260 new books."}
+{"variable": "quantity", "value": 340.0, "carrier": 3, "text": "The library bought 340 new books."}
+{"variable": "quantity", "value": 450.0, "carrier": 3, "text": "The library bought 450 new books."}
+{"variable": "quantity", "value": 600.0, "carrier": 3, "text": "The library bought 600 new books."}
+{"variable": "quantity", "value": 800.0, "carrier": 3, "text": "The library bought 800 new books."}
+{"variable": "quantity", "value": 1000.0, "carrier": 3, "text": "The library bought 1000 new books."}
+{"variable": "quantity", "value": 1.0, "carrier": 4, "text": "The farm has 1 sheep."}
+{"variable": "quantity", "value": 2.0, "carrier": 4, "text": "The farm has 2 sheep."}
+{"variable": "quantity", "value": 3.0, "carrier": 4, "text": "The farm has 3 sheep."}
+{"variable": "quantity", "value": 5.0, "carrier": 4, "text": "The farm has 5 sheep."}
+{"variable": "quantity", "value": 8.0, "carrier": 4, "text": "The farm has 8 sheep."}
+{"variable": "quantity", "value": 12.0, "carrier": 4, "text": "The farm has 12 sheep."}
+{"variable": "quantity", "value": 17.0, "carrier": 4, "text": "The farm has 17 sheep."}
+{"variable": "quantity", "value": 25.0, "carrier": 4, "text": "The farm has 25 sheep."}
+{"variable": "quantity", "value": 33.0, "carrier": 4, "text": "The farm has 33 sheep."}
+{"variable": "quantity", "value": 40.0, "carrier": 4, "text": "The farm has 40 sheep."}
+{"variable": "quantity", "value": 55.0, "carrier": 4, "text": "The farm has 55 sheep."}
+{"variable": "quantity", "value": 70.0, "carrier": 4, "text": "The farm has 70 sheep."}
+{"variable": "quantity", "value": 90.0, "carrier": 4, "text": "The farm has 90 sheep."}
+{"variable": "quantity", "value": 120.0, "carrier": 4, "text": "The farm has 120 sheep."}
+{"variable": "quantity", "value": 150.0, "carrier": 4, "text": "The farm has 150 sheep."}
+{"variable": "quantity", "value": 200.0, "carrier": 4, "text": "The farm has 200 sheep."}
+{"variable": "quantity", "value": 260.0, "carrier": 4, "text": "The farm has 260 sheep."}
+{"variable": "quantity", "value": 340.0, "carrier": 4, "text": "The farm has 340 sheep."}
+{"variable": "quantity", "value": 450.0, "carrier": 4, "text": "The farm has 450 sheep."}
+{"variable": "quantity", "value": 600.0, "carrier": 4, "text": "The farm has 600 sheep."}
+{"variable": "quantity", "value": 800.0, "carrier": 4, "text": "The farm has 800 sheep."}
+{"variable": "quantity", "value": 1000.0, "carrier": 4, "text": "The farm has 1000 sheep."}
+{"variable": "quantity", "value": 1.0, "carrier": 5, "text": "They printed 1 copies of the flyer."}
+{"variable": "quantity", "value": 2.0, "carrier": 5, "text": "They printed 2 copies of the flyer."}
+{"variable": "quantity", "value": 3.0, "carrier": 5, "text": "They printed 3 copies of the flyer."}
+{"variable": "quantity", "value": 5.0, "carrier": 5, "text": "They printed 5 copies of the flyer."}
+{"variable": "quantity", "value": 8.0, "carrier": 5, "text": "They printed 8 copies of the flyer."}
+{"variable": "quantity", "value": 12.0, "carrier": 5, "text": "They printed 12 copies of the flyer."}
+{"variable": "quantity", "value": 17.0, "carrier": 5, "text": "They printed 17 copies of the flyer."}
+{"variable": "quantity", "value": 25.0, "carrier": 5, "text": "They printed 25 copies of the flyer."}
+{"variable": "quantity", "value": 33.0, "carrier": 5, "text": "They printed 33 copies of the flyer."}
+{"variable": "quantity", "value": 40.0, "carrier": 5, "text": "They printed 40 copies of the flyer."}
+{"variable": "quantity", "value": 55.0, "carrier": 5, "text": "They printed 55 copies of the flyer."}
+{"variable": "quantity", "value": 70.0, "carrier": 5, "text": "They printed 70 copies of the flyer."}
+{"variable": "quantity", "value": 90.0, "carrier": 5, "text": "They printed 90 copies of the flyer."}
+{"variable": "quantity", "value": 120.0, "carrier": 5, "text": "They printed 120 copies of the flyer."}
+{"variable": "quantity", "value": 150.0, "carrier": 5, "text": "They printed 150 copies of the flyer."}
+{"variable": "quantity", "value": 200.0, "carrier": 5, "text": "They printed 200 copies of the flyer."}
+{"variable": "quantity", "value": 260.0, "carrier": 5, "text": "They printed 260 copies of the flyer."}
+{"variable": "quantity", "value": 340.0, "carrier": 5, "text": "They printed 340 copies of the flyer."}
+{"variable": "quantity", "value": 450.0, "carrier": 5, "text": "They printed 450 copies of the flyer."}
+{"variable": "quantity", "value": 600.0, "carrier": 5, "text": "They printed 600 copies of the flyer."}
+{"variable": "quantity", "value": 800.0, "carrier": 5, "text": "They printed 800 copies of the flyer."}
+{"variable": "quantity", "value": 1000.0, "carrier": 5, "text": "They printed 1000 copies of the flyer."}

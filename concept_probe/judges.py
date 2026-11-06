@@ -19,7 +19,7 @@ ready made. A judge answers a rubric for many texts:
   says what to do, how to read the input and exactly how to write the answer.
 
 Every judge has ``rate(texts, rubric)`` (the answers), ``score(texts, rubric)`` (their numbers) and
-``measure(rubric)``, a function ``texts -> numbers`` to pass to
+``as_measure(rubric)``, a function ``texts -> numbers`` to pass to
 :func:`concept_probe.evaluate_steering` as a measure. A judge's answers are another model's
 labels, not ground truth: check a sample before relying on them.
 """

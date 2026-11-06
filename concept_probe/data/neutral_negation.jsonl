@@ -1,0 +1,40 @@
+{"id": "nn01", "split": "train", "affirmative": "The meeting is on the second floor.", "negated": "The meeting is not on the second floor."}
+{"id": "nn02", "split": "train", "affirmative": "The painting is from the eighteenth century.", "negated": "The painting is not from the eighteenth century."}
+{"id": "nn03", "split": "train", "affirmative": "The museum has a gift shop.", "negated": "The museum doesn't have a gift shop."}
+{"id": "nn04", "split": "train", "affirmative": "The house is painted green.", "negated": "The house is not painted green."}
+{"id": "nn05", "split": "train", "affirmative": "The form needs a signature.", "negated": "The form doesn't need a signature."}
+{"id": "nn06", "split": "train", "affirmative": "The word comes from Latin.", "negated": "The word does not come from Latin."}
+{"id": "nn07", "split": "train", "affirmative": "The recipe uses butter.", "negated": "The recipe doesn't use butter."}
+{"id": "nn08", "split": "train", "affirmative": "The table is made of oak.", "negated": "The table is not made of oak."}
+{"id": "nn09", "split": "train", "affirmative": "The train stops in Zárate.", "negated": "The train doesn't stop in Zárate."}
+{"id": "nn10", "split": "train", "affirmative": "The festival takes place in March.", "negated": "The festival does not take place in March."}
+{"id": "nn11", "split": "train", "affirmative": "The plant needs direct light.", "negated": "The plant doesn't need direct light."}
+{"id": "nn12", "split": "train", "affirmative": "The author was born in Córdoba.", "negated": "The author was not born in Córdoba."}
+{"id": "nn13", "split": "train", "affirmative": "The office is closed on the first Monday.", "negated": "The office is not closed on the first Monday."}
+{"id": "nn14", "split": "train", "affirmative": "The song is in a major key.", "negated": "The song is not in a major key."}
+{"id": "nn15", "split": "train", "affirmative": "The update changes the login screen.", "negated": "The update doesn't change the login screen."}
+{"id": "nn16", "split": "train", "affirmative": "The street runs north to south.", "negated": "The street does not run north to south."}
+{"id": "nn17", "split": "train", "affirmative": "The bridge was built in 1932.", "negated": "The bridge was not built in 1932."}
+{"id": "nn18", "split": "train", "affirmative": "The statue faces the river.", "negated": "The statue does not face the river."}
+{"id": "nn19", "split": "train", "affirmative": "The river is wide at this point.", "negated": "The river is not wide at this point."}
+{"id": "nn20", "split": "train", "affirmative": "The novel is written in the first person.", "negated": "The novel is not written in the first person."}
+{"id": "nn21", "split": "train", "affirmative": "The price includes taxes.", "negated": "The price doesn't include taxes."}
+{"id": "nn22", "split": "train", "affirmative": "The bird in the photo is a sparrow.", "negated": "The bird in the photo is not a sparrow."}
+{"id": "nn23", "split": "train", "affirmative": "The lamp uses a standard bulb.", "negated": "The lamp doesn't use a standard bulb."}
+{"id": "nn24", "split": "train", "affirmative": "The second chapter is set in Lisbon.", "negated": "The second chapter is not set in Lisbon."}
+{"id": "nn25", "split": "eval", "affirmative": "The flight stops in Lima.", "negated": "The flight doesn't stop in Lima."}
+{"id": "nn26", "split": "eval", "affirmative": "The building's facade is brick.", "negated": "The building's facade is not brick."}
+{"id": "nn27", "split": "eval", "affirmative": "The car has a manual gearbox.", "negated": "The car doesn't have a manual gearbox."}
+{"id": "nn28", "split": "eval", "affirmative": "The number on the door is odd.", "negated": "The number on the door is not odd."}
+{"id": "nn29", "split": "eval", "affirmative": "The school uses uniforms.", "negated": "The school doesn't use uniforms."}
+{"id": "nn30", "split": "eval", "affirmative": "The map shows the old border.", "negated": "The map does not show the old border."}
+{"id": "nn31", "split": "eval", "affirmative": "The trail is marked with yellow paint.", "negated": "The trail is not marked with yellow paint."}
+{"id": "nn32", "split": "eval", "affirmative": "The coin was minted in 1985.", "negated": "The coin was not minted in 1985."}
+{"id": "nn33", "split": "eval", "affirmative": "The tea contains caffeine.", "negated": "The tea doesn't contain caffeine."}
+{"id": "nn34", "split": "eval", "affirmative": "The square is named after a poet.", "negated": "The square is not named after a poet."}
+{"id": "nn35", "split": "eval", "affirmative": "The contract mentions overtime.", "negated": "The contract doesn't mention overtime."}
+{"id": "nn36", "split": "eval", "affirmative": "The film was shot in black and white.", "negated": "The film was not shot in black and white."}
+{"id": "nn37", "split": "eval", "affirmative": "The letters are in a blue folder.", "negated": "The letters are not in a blue folder."}
+{"id": "nn38", "split": "eval", "affirmative": "The curtains are the same color as the walls.", "negated": "The curtains are not the same color as the walls."}
+{"id": "nn39", "split": "eval", "affirmative": "The fountain was designed by an architect from Rosario.", "negated": "The fountain was not designed by an architect from Rosario."}
+{"id": "nn40", "split": "eval", "affirmative": "The plates are on the top shelf.", "negated": "The plates are not on the top shelf."}

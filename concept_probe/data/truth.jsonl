@@ -1,0 +1,145 @@
+{"id": "t01", "domain": "geography", "form": "affirmative", "split": "eval", "pos": "The capital of France is Paris.", "neg": "The capital of France is Lyon."}
+{"id": "t02", "domain": "science", "form": "fronted", "split": "eval", "pos": "At sea level, water boils at 100 degrees Celsius.", "neg": "At sea level, water boils at 90 degrees Celsius."}
+{"id": "t03", "domain": "everyday", "form": "existential", "split": "train", "pos": "There are seven days in a week.", "neg": "There are eight days in a week."}
+{"id": "t04", "domain": "geography", "form": "affirmative", "split": "train", "pos": "The largest ocean on Earth is the Pacific.", "neg": "The largest ocean on Earth is the Atlantic."}
+{"id": "t05", "domain": "animals", "form": "affirmative", "split": "eval", "pos": "Spiders have eight legs.", "neg": "Spiders have six legs."}
+{"id": "t06", "domain": "science", "form": "affirmative", "split": "eval", "pos": "The Sun rises in the east.", "neg": "The Sun rises in the west."}
+{"id": "t07", "domain": "geography", "form": "affirmative", "split": "train", "pos": "Japan's capital city is Tokyo.", "neg": "Japan's capital city is Kyoto."}
+{"id": "t08", "domain": "animals", "form": "affirmative", "split": "train", "pos": "Most penguins live in the Southern Hemisphere.", "neg": "Most penguins live in the Northern Hemisphere."}
+{"id": "t081", "domain": "geography", "form": "negated", "split": "train", "pos": "The Amazon does not flow through Mexico.", "neg": "The Amazon does not flow through Brazil."}
+{"id": "t082", "domain": "animals", "form": "negated", "split": "train", "pos": "Penguins are not found in the Arctic.", "neg": "Penguins are not found in Antarctica."}
+{"id": "t083", "domain": "animals", "form": "negated", "split": "train", "pos": "A spider is not an insect.", "neg": "A beetle is not an insect."}
+{"id": "t084", "domain": "food", "form": "negated", "split": "eval", "pos": "Pineapples do not grow on trees.", "neg": "Apples do not grow on trees."}
+{"id": "t085", "domain": "science", "form": "negated", "split": "train", "pos": "Gold does not rust.", "neg": "Iron does not rust."}
+{"id": "t086", "domain": "science", "form": "negated", "split": "train", "pos": "Mercury is not a gas at room temperature.", "neg": "Oxygen is not a gas at room temperature."}
+{"id": "t087", "domain": "geography", "form": "negated", "split": "train", "pos": "Australia is not in the Northern Hemisphere.", "neg": "Canada is not in the Northern Hemisphere."}
+{"id": "t088", "domain": "science", "form": "negated", "split": "eval", "pos": "Sound cannot travel through a vacuum.", "neg": "Light cannot travel through a vacuum."}
+{"id": "t089", "domain": "animals", "form": "negated", "split": "eval", "pos": "Whales do not lay eggs.", "neg": "Turtles do not lay eggs."}
+{"id": "t09", "domain": "geography", "form": "affirmative", "split": "train", "pos": "The Amazon River flows through Brazil.", "neg": "The Amazon River flows through Argentina."}
+{"id": "t090", "domain": "science", "form": "negated", "split": "eval", "pos": "The Earth is not the largest planet in the Solar System.", "neg": "Jupiter is not the largest planet in the Solar System."}
+{"id": "t091", "domain": "math", "form": "negated", "split": "eval", "pos": "Nine is not a prime number.", "neg": "Five is not a prime number."}
+{"id": "t092", "domain": "culture", "form": "negated", "split": "train", "pos": "Shakespeare did not write Don Quixote.", "neg": "Cervantes did not write Don Quixote."}
+{"id": "t093", "domain": "animals", "form": "negated", "split": "train", "pos": "Ostriches cannot fly.", "neg": "Eagles cannot fly."}
+{"id": "t094", "domain": "geography", "form": "negated", "split": "train", "pos": "The Pacific is not the smallest ocean.", "neg": "The Arctic is not the smallest ocean."}
+{"id": "t095", "domain": "geography", "form": "negated", "split": "eval", "pos": "Lisbon is not the capital of Spain.", "neg": "Madrid is not the capital of Spain."}
+{"id": "t096", "domain": "science", "form": "negated", "split": "train", "pos": "Diamond does not conduct electricity well.", "neg": "Copper does not conduct electricity well."}
+{"id": "t097", "domain": "animals", "form": "negated", "split": "train", "pos": "Snakes do not have eyelids.", "neg": "Cats do not have eyelids."}
+{"id": "t098", "domain": "science", "form": "negated", "split": "eval", "pos": "The Moon has no atmosphere to speak of.", "neg": "The Earth has no atmosphere to speak of."}
+{"id": "t099", "domain": "history", "form": "negated", "split": "train", "pos": "The First World War did not end in 1945.", "neg": "The Second World War did not end in 1945."}
+{"id": "t10", "domain": "science", "form": "affirmative", "split": "eval", "pos": "Ice is water in its solid form.", "neg": "Steam is water in its solid form."}
+{"id": "t100", "domain": "math", "form": "negated", "split": "train", "pos": "A triangle cannot have two right angles.", "neg": "A rectangle cannot have two right angles."}
+{"id": "t101", "domain": "geography", "form": "familiar_false", "split": "train", "pos": "Turkey's capital is Ankara.", "neg": "Turkey's capital is Istanbul."}
+{"id": "t102", "domain": "geography", "form": "familiar_false", "split": "train", "pos": "Brasília has been the capital of Brazil since 1960.", "neg": "Rio de Janeiro has been the capital of Brazil since 1960."}
+{"id": "t103", "domain": "geography", "form": "familiar_false", "split": "eval", "pos": "The Swiss government sits in Bern.", "neg": "The Swiss government sits in Geneva."}
+{"id": "t104", "domain": "geography", "form": "familiar_false", "split": "train", "pos": "New Zealand's parliament meets in Wellington.", "neg": "New Zealand's parliament meets in Auckland."}
+{"id": "t105", "domain": "geography", "form": "familiar_false", "split": "train", "pos": "Morocco is governed from Rabat.", "neg": "Morocco is governed from Casablanca."}
+{"id": "t106", "domain": "geography", "form": "familiar_false", "split": "train", "pos": "Since 1991, the capital of Nigeria has been Abuja.", "neg": "Since 1991, the capital of Nigeria has been Lagos."}
+{"id": "t107", "domain": "geography", "form": "familiar_false", "split": "eval", "pos": "The capital of Vietnam is Hanoi.", "neg": "The capital of Vietnam is Ho Chi Minh City."}
+{"id": "t108", "domain": "geography", "form": "familiar_false", "split": "train", "pos": "Islamabad is the capital of Pakistan.", "neg": "Karachi is the capital of Pakistan."}
+{"id": "t109", "domain": "geography", "form": "familiar_false", "split": "train", "pos": "The White House is in Washington, D.C.", "neg": "The White House is in New York."}
+{"id": "t11", "domain": "math", "form": "affirmative", "split": "train", "pos": "A triangle has three sides.", "neg": "A triangle has four sides."}
+{"id": "t110", "domain": "food", "form": "familiar_false", "split": "eval", "pos": "In the botanical sense, tomatoes are fruits.", "neg": "In the botanical sense, tomatoes are vegetables."}
+{"id": "t111", "domain": "food", "form": "familiar_false", "split": "eval", "pos": "Peanuts are legumes.", "neg": "Peanuts are tree nuts."}
+{"id": "t112", "domain": "geography", "form": "familiar_false", "split": "train", "pos": "The largest desert in the world is Antarctica.", "neg": "The largest desert in the world is the Sahara."}
+{"id": "t113", "domain": "animals", "form": "familiar_false", "split": "eval", "pos": "Koalas are marsupials.", "neg": "Koalas are bears."}
+{"id": "t114", "domain": "history", "form": "familiar_false", "split": "train", "pos": "Alexander Graham Bell is credited with inventing the telephone.", "neg": "Thomas Edison is credited with inventing the telephone."}
+{"id": "t115", "domain": "science", "form": "familiar_false", "split": "train", "pos": "Penicillin was discovered by Alexander Fleming.", "neg": "Penicillin was discovered by Louis Pasteur."}
+{"id": "t116", "domain": "history", "form": "familiar_false", "split": "train", "pos": "The Hundred Years' War lasted more than a hundred years.", "neg": "The Hundred Years' War lasted exactly a hundred years."}
+{"id": "t117", "domain": "science", "form": "familiar_false", "split": "eval", "pos": "Venus is the hottest planet in the Solar System.", "neg": "Mercury is the hottest planet in the Solar System."}
+{"id": "t118", "domain": "science", "form": "familiar_false", "split": "train", "pos": "Lightning is hotter than the surface of the Sun.", "neg": "Lightning is cooler than the surface of the Sun."}
+{"id": "t119", "domain": "science", "form": "familiar_false", "split": "train", "pos": "Water is densest at about four degrees Celsius.", "neg": "Water is densest at zero degrees Celsius."}
+{"id": "t12", "domain": "science", "form": "affirmative", "split": "train", "pos": "The Moon orbits the Earth.", "neg": "The Earth orbits the Moon."}
+{"id": "t120", "domain": "geography", "form": "obscure", "split": "eval", "pos": "The capital of Laos is Vientiane.", "neg": "The capital of Laos is Phnom Penh."}
+{"id": "t121", "domain": "geography", "form": "obscure", "split": "train", "pos": "The capital of Suriname is Paramaribo.", "neg": "The capital of Suriname is Georgetown."}
+{"id": "t122", "domain": "animals", "form": "obscure", "split": "train", "pos": "The quokka is a small marsupial from Western Australia.", "neg": "The quokka is a small marsupial from Madagascar."}
+{"id": "t123", "domain": "science", "form": "obscure", "split": "train", "pos": "Gallium melts just above room temperature.", "neg": "Gallium melts just above a thousand degrees."}
+{"id": "t124", "domain": "geography", "form": "obscure", "split": "train", "pos": "The Atacama Desert is in Chile.", "neg": "The Atacama Desert is in Mongolia."}
+{"id": "t125", "domain": "music", "form": "obscure", "split": "train", "pos": "The composer Jean Sibelius was from Finland.", "neg": "The composer Jean Sibelius was from Portugal."}
+{"id": "t126", "domain": "geography", "form": "obscure", "split": "train", "pos": "The Danube flows into the Black Sea.", "neg": "The Danube flows into the North Sea."}
+{"id": "t127", "domain": "animals", "form": "obscure", "split": "train", "pos": "The tuatara is a reptile found in New Zealand.", "neg": "The tuatara is a reptile found in Iceland."}
+{"id": "t128", "domain": "geography", "form": "obscure", "split": "eval", "pos": "Lake Baikal is in Siberia.", "neg": "Lake Baikal is in Canada."}
+{"id": "t129", "domain": "culture", "form": "obscure", "split": "eval", "pos": "The writer Machado de Assis was Brazilian.", "neg": "The writer Machado de Assis was Swedish."}
+{"id": "t13", "domain": "culture", "form": "passive", "split": "train", "pos": "Hamlet was written by Shakespeare.", "neg": "Hamlet was written by Marlowe."}
+{"id": "t130", "domain": "science", "form": "obscure", "split": "train", "pos": "Osmium is one of the densest elements.", "neg": "Osmium is one of the lightest elements."}
+{"id": "t131", "domain": "history", "form": "obscure", "split": "train", "pos": "The ancient city of Petra is in Jordan.", "neg": "The ancient city of Petra is in Morocco."}
+{"id": "t132", "domain": "geography", "form": "hedged", "split": "train", "pos": "I'm fairly certain that Vienna is the capital of Austria.", "neg": "I'm fairly certain that Salzburg is the capital of Austria."}
+{"id": "t133", "domain": "math", "form": "hedged", "split": "train", "pos": "As far as I remember, an octagon has eight sides.", "neg": "As far as I remember, an octagon has ten sides."}
+{"id": "t134", "domain": "science", "form": "framed", "split": "eval", "pos": "It is a well-known fact that the Earth is round.", "neg": "It is a well-known fact that the Earth is flat."}
+{"id": "t135", "domain": "geography", "form": "hedged", "split": "train", "pos": "Maybe I'm wrong, but I think Norway is in Europe.", "neg": "Maybe I'm wrong, but I think Norway is in Africa."}
+{"id": "t136", "domain": "food", "form": "framed", "split": "train", "pos": "Everyone knows that cheese is made from milk.", "neg": "Everyone knows that cheese is made from flour."}
+{"id": "t137", "domain": "music", "form": "framed", "split": "eval", "pos": "Without a doubt, the violin has four strings.", "neg": "Without a doubt, the violin has six strings."}
+{"id": "t138", "domain": "geography", "form": "hedged", "split": "eval", "pos": "I believe Greece is in southern Europe.", "neg": "I believe Greece is in northern Europe."}
+{"id": "t139", "domain": "math", "form": "framed", "split": "train", "pos": "Clearly, a pentagon has five sides.", "neg": "Clearly, a pentagon has seven sides."}
+{"id": "t14", "domain": "math", "form": "affirmative", "split": "train", "pos": "Two plus three equals five.", "neg": "Two plus three equals six."}
+{"id": "t140", "domain": "animals", "form": "long", "split": "train", "pos": "The giant panda, which spends most of its day eating bamboo, lives in the mountain forests of central China.", "neg": "The giant panda, which spends most of its day eating bamboo, lives in the mountain forests of southern Chile."}
+{"id": "t141", "domain": "science", "form": "long", "split": "train", "pos": "Because sound needs air or another medium to travel through, it cannot cross the vacuum of space.", "neg": "Because sound needs air or another medium to travel through, it travels fastest in the vacuum of space."}
+{"id": "t142", "domain": "history", "form": "long", "split": "eval", "pos": "In 1492, sailing west across the Atlantic with three ships, Christopher Columbus reached the Caribbean.", "neg": "In 1492, sailing west across the Atlantic with three ships, Christopher Columbus reached Australia."}
+{"id": "t143", "domain": "sports", "form": "long", "split": "eval", "pos": "Every four years, athletes from around the world gather for the Olympic Games, which began in ancient Greece.", "neg": "Every four years, athletes from around the world gather for the Olympic Games, which began in ancient Egypt."}
+{"id": "t144", "domain": "science", "form": "long", "split": "train", "pos": "When you mix the three primary colors of light, red, green and blue, in equal amounts, you get white light.", "neg": "When you mix the three primary colors of light, red, green and blue, in equal amounts, you get brown light."}
+{"id": "t145", "domain": "body", "form": "long", "split": "eval", "pos": "The human heart, a muscle about the size of a fist, beats roughly a hundred thousand times a day.", "neg": "The human heart, a muscle about the size of a fist, beats roughly a hundred times a day."}
+{"id": "t15", "domain": "animals", "form": "passive", "split": "train", "pos": "Honey is made by bees.", "neg": "Honey is made by wasps."}
+{"id": "t16", "domain": "science", "form": "affirmative", "split": "train", "pos": "The Earth has one moon.", "neg": "The Earth has two moons."}
+{"id": "t17", "domain": "geography", "form": "affirmative", "split": "train", "pos": "Mount Everest is in the Himalayas.", "neg": "Mount Everest is in the Alps."}
+{"id": "t18", "domain": "geography", "form": "affirmative", "split": "eval", "pos": "Canberra is the capital of Australia.", "neg": "Sydney is the capital of Australia."}
+{"id": "t19", "domain": "science", "form": "affirmative", "split": "eval", "pos": "Diamonds are made of carbon.", "neg": "Diamonds are made of silicon."}
+{"id": "t20", "domain": "everyday", "form": "affirmative", "split": "train", "pos": "A year has twelve months.", "neg": "A year has eleven months."}
+{"id": "t21", "domain": "science", "form": "comparative", "split": "train", "pos": "Light travels faster than sound.", "neg": "Sound travels faster than light."}
+{"id": "t22", "domain": "geography", "form": "affirmative", "split": "train", "pos": "Buenos Aires is in Argentina.", "neg": "Buenos Aires is in Chile."}
+{"id": "t23", "domain": "body", "form": "affirmative", "split": "eval", "pos": "The heart pumps blood around the body.", "neg": "The lungs pump blood around the body."}
+{"id": "t24", "domain": "animals", "form": "affirmative", "split": "train", "pos": "Whales breathe with lungs.", "neg": "Whales breathe with gills."}
+{"id": "t25", "domain": "geography", "form": "affirmative", "split": "train", "pos": "The Nile is in Africa.", "neg": "The Nile is in Asia."}
+{"id": "t26", "domain": "science", "form": "fronted", "split": "train", "pos": "During photosynthesis, plants take in carbon dioxide.", "neg": "During photosynthesis, plants take in nitrogen."}
+{"id": "t27", "domain": "math", "form": "affirmative", "split": "train", "pos": "Ten times ten is one hundred.", "neg": "Ten times ten is ninety."}
+{"id": "t28", "domain": "science", "form": "fronted", "split": "eval", "pos": "At room temperature, gold is a solid.", "neg": "At room temperature, gold is a liquid."}
+{"id": "t29", "domain": "culture", "form": "affirmative", "split": "train", "pos": "Picasso was a Spanish painter.", "neg": "Picasso was an Italian painter."}
+{"id": "t30", "domain": "geography", "form": "affirmative", "split": "train", "pos": "The South Pole is in Antarctica.", "neg": "The South Pole is in Greenland."}
+{"id": "t31", "domain": "geography", "form": "affirmative", "split": "train", "pos": "The Statue of Liberty is in New York.", "neg": "The Statue of Liberty is in Boston."}
+{"id": "t32", "domain": "body", "form": "affirmative", "split": "train", "pos": "Humans have two lungs.", "neg": "Humans have three lungs."}
+{"id": "t33", "domain": "geography", "form": "affirmative", "split": "train", "pos": "Madrid is the capital of Spain.", "neg": "Barcelona is the capital of Spain."}
+{"id": "t34", "domain": "animals", "form": "affirmative", "split": "eval", "pos": "Frogs are amphibians.", "neg": "Frogs are reptiles."}
+{"id": "t35", "domain": "science", "form": "affirmative", "split": "train", "pos": "It takes the Earth about a year to go around the Sun.", "neg": "It takes the Earth about a month to go around the Sun."}
+{"id": "t36", "domain": "science", "form": "affirmative", "split": "eval", "pos": "Fire needs oxygen to burn.", "neg": "Fire needs nitrogen to burn."}
+{"id": "t37", "domain": "geography", "form": "affirmative", "split": "train", "pos": "The Great Wall is in China.", "neg": "The Great Wall is in Japan."}
+{"id": "t38", "domain": "math", "form": "affirmative", "split": "train", "pos": "A hexagon has six sides.", "neg": "A hexagon has eight sides."}
+{"id": "t39", "domain": "everyday", "form": "affirmative", "split": "train", "pos": "Germany uses the euro.", "neg": "Germany uses the pound."}
+{"id": "t40", "domain": "geography", "form": "affirmative", "split": "train", "pos": "Lima is the capital of Peru.", "neg": "Quito is the capital of Peru."}
+{"id": "t41", "domain": "science", "form": "affirmative", "split": "eval", "pos": "Venus is the second planet from the Sun.", "neg": "Venus is the fifth planet from the Sun."}
+{"id": "t42", "domain": "animals", "form": "affirmative", "split": "eval", "pos": "Cows are herbivores.", "neg": "Cows are carnivores."}
+{"id": "t43", "domain": "culture", "form": "affirmative", "split": "eval", "pos": "Mozart composed music in the eighteenth century.", "neg": "Mozart composed music in the twentieth century."}
+{"id": "t44", "domain": "science", "form": "affirmative", "split": "train", "pos": "The chemical formula for water is H2O.", "neg": "The chemical formula for water is CO2."}
+{"id": "t45", "domain": "animals", "form": "affirmative", "split": "train", "pos": "Bats are mammals.", "neg": "Bats are birds."}
+{"id": "t46", "domain": "geography", "form": "affirmative", "split": "eval", "pos": "Rome is in Italy.", "neg": "Rome is in Greece."}
+{"id": "t47", "domain": "everyday", "form": "affirmative", "split": "train", "pos": "An hour has sixty minutes.", "neg": "An hour has a hundred minutes."}
+{"id": "t48", "domain": "geography", "form": "affirmative", "split": "train", "pos": "The Sahara is the largest hot desert in the world.", "neg": "The Gobi is the largest hot desert in the world."}
+{"id": "t49", "domain": "animals", "form": "affirmative", "split": "train", "pos": "Sharks are fish.", "neg": "Sharks are mammals."}
+{"id": "t50", "domain": "geography", "form": "affirmative", "split": "train", "pos": "The Eiffel Tower is in Paris.", "neg": "The Eiffel Tower is in Brussels."}
+{"id": "t51", "domain": "science", "form": "affirmative", "split": "train", "pos": "Mercury is the closest planet to the Sun.", "neg": "Venus is the closest planet to the Sun."}
+{"id": "t52", "domain": "animals", "form": "affirmative", "split": "eval", "pos": "Crocodiles lay eggs.", "neg": "Dolphins lay eggs."}
+{"id": "t53", "domain": "geography", "form": "affirmative", "split": "eval", "pos": "The Atlantic Ocean lies between Europe and America.", "neg": "The Atlantic Ocean lies between Africa and Australia."}
+{"id": "t54", "domain": "math", "form": "affirmative", "split": "eval", "pos": "Seven is a prime number.", "neg": "Nine is a prime number."}
+{"id": "t55", "domain": "geography", "form": "affirmative", "split": "train", "pos": "Cairo is the capital of Egypt.", "neg": "Alexandria is the capital of Egypt."}
+{"id": "t56", "domain": "science", "form": "affirmative", "split": "train", "pos": "Copper conducts electricity well.", "neg": "Rubber conducts electricity well."}
+{"id": "t57", "domain": "culture", "form": "affirmative", "split": "train", "pos": "Leonardo da Vinci painted the Mona Lisa.", "neg": "Michelangelo painted the Mona Lisa."}
+{"id": "t58", "domain": "geography", "form": "affirmative", "split": "eval", "pos": "The Andes run along the west coast of South America.", "neg": "The Andes run along the east coast of South America."}
+{"id": "t59", "domain": "culture", "form": "affirmative", "split": "train", "pos": "The main language of Mexico is Spanish.", "neg": "The main language of Mexico is Portuguese."}
+{"id": "t60", "domain": "animals", "form": "affirmative", "split": "train", "pos": "Butterflies start life as caterpillars.", "neg": "Butterflies start life as tadpoles."}
+{"id": "t61", "domain": "math", "form": "affirmative", "split": "eval", "pos": "Twelve divided by three is four.", "neg": "Twelve divided by three is six."}
+{"id": "t62", "domain": "history", "form": "affirmative", "split": "train", "pos": "The Titanic went down in 1912.", "neg": "The Titanic went down in 1921."}
+{"id": "t63", "domain": "geography", "form": "affirmative", "split": "eval", "pos": "Ottawa is the capital of Canada.", "neg": "Toronto is the capital of Canada."}
+{"id": "t64", "domain": "animals", "form": "affirmative", "split": "eval", "pos": "Kangaroos are native to Australia.", "neg": "Kangaroos are native to New Zealand."}
+{"id": "t65", "domain": "science", "form": "affirmative", "split": "train", "pos": "Saturn is known for its rings.", "neg": "Mars is known for its rings."}
+{"id": "t66", "domain": "body", "form": "affirmative", "split": "train", "pos": "An adult human has 206 bones.", "neg": "An adult human has 306 bones."}
+{"id": "t67", "domain": "science", "form": "affirmative", "split": "train", "pos": "Table salt is made of sodium and chlorine.", "neg": "Table salt is made of sodium and sulfur."}
+{"id": "t68", "domain": "geography", "form": "affirmative", "split": "eval", "pos": "Berlin is the capital of Germany.", "neg": "Munich is the capital of Germany."}
+{"id": "t69", "domain": "animals", "form": "affirmative", "split": "train", "pos": "Owls are mostly active at night.", "neg": "Owls are mostly active during the day."}
+{"id": "t70", "domain": "music", "form": "affirmative", "split": "eval", "pos": "A standard piano has 88 keys.", "neg": "A standard piano has 66 keys."}
+{"id": "t71", "domain": "math", "form": "affirmative", "split": "train", "pos": "Each angle of a square is ninety degrees.", "neg": "Each angle of a square is sixty degrees."}
+{"id": "t72", "domain": "history", "form": "affirmative", "split": "train", "pos": "The first Moon landing was in 1969.", "neg": "The first Moon landing was in 1959."}
+{"id": "t73", "domain": "animals", "form": "affirmative", "split": "train", "pos": "Lions are carnivores.", "neg": "Lions are herbivores."}
+{"id": "t74", "domain": "geography", "form": "affirmative", "split": "eval", "pos": "Montevideo is the capital of Uruguay.", "neg": "Asunción is the capital of Uruguay."}
+{"id": "t75", "domain": "animals", "form": "affirmative", "split": "eval", "pos": "The tallest land animal is the giraffe.", "neg": "The tallest land animal is the elephant."}
+{"id": "t76", "domain": "science", "form": "affirmative", "split": "train", "pos": "Iron rusts in water and air.", "neg": "Gold rusts in water and air."}
+{"id": "t77", "domain": "sports", "form": "affirmative", "split": "train", "pos": "A basketball team has five players on the court.", "neg": "A basketball team has eight players on the court."}
+{"id": "t78", "domain": "culture", "form": "affirmative", "split": "eval", "pos": "The main language of Brazil is Portuguese.", "neg": "The main language of Brazil is Spanish."}
+{"id": "t79", "domain": "science", "form": "affirmative", "split": "eval", "pos": "Water boils at a lower temperature high in the mountains.", "neg": "Water boils at a higher temperature high in the mountains."}
+{"id": "t80", "domain": "geography", "form": "affirmative", "split": "train", "pos": "The Mediterranean Sea borders Italy.", "neg": "The Mediterranean Sea borders Norway."}
