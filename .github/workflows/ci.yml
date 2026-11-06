@@ -8,7 +8,8 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Python 3.9 has no build for the newest Ubuntu image; 24.04 has every version in the matrix.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -30,7 +31,7 @@ jobs:
         run: python -m pip install -e ".[dev,stats,plots]"
 
       - name: Compile example entrypoints
-        run: python -m py_compile examples/quickstart.py examples/train_from_json.py
+        run: python -m py_compile examples/quickstart.py examples/system_prompts.py
 
       - name: Run tests
         run: python -m pytest -q

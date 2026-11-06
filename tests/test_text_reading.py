@@ -4,9 +4,9 @@ import pytest
 import torch
 
 import concept_probe
-from concept_probe import probe as probe_mod
 from concept_probe.modeling import apply_tokenizer_overrides
-from concept_probe.probe import _encode_text_for_read
+from concept_probe.inputs import _encode_text_for_read
+from fakes import FunctionModel
 
 
 class _Tok:
@@ -24,13 +24,16 @@ class _Tok:
 
 
 def test_raw_is_bos_then_the_text():
-    ids, plen = _encode_text_for_read(_Tok(), "one two three", "sys", role="raw")
-    assert ids.tolist() == [[1, 7, 7, 7]] and plen == 1
+    ids, start, end = _encode_text_for_read(_Tok(), "one two three", "sys", role="raw")
+    assert ids.tolist() == [[1, 7, 7, 7]] and (start, end) == (1, 4)
 
 
-def test_raw_without_bos():
-    ids, plen = _encode_text_for_read(_Tok(bos=None), "one two", "", role="raw")
-    assert ids.tolist() == [[7, 7]] and plen == 0
+def test_raw_without_bos_leaves_the_sink_token_out():
+    # without a BOS, the text's first token is the attention sink: it is read but not pooled
+    seen = []
+    ids, start, end = _encode_text_for_read(_Tok(bos=None), "one two", "", role="raw", warn=seen.append)
+    assert ids.tolist() == [[7, 7]] and (start, end) == (1, 2)
+    assert any("attention sink" in w for w in seen)
 
 
 def test_raw_warns_that_system_and_prompt_are_ignored():
@@ -46,14 +49,12 @@ def test_unknown_role_is_rejected():
 
 def test_chat_template_override_replaces_the_tokenizer_template():
     tok = _Tok()
-    apply_tokenizer_overrides(tok, {"chat_template": "{{ messages }}"})
+    apply_tokenizer_overrides(tok, chat_template="{{ messages }}")
     assert tok.chat_template == "{{ messages }}"
-    apply_tokenizer_overrides(tok, {"chat_template": None})
-    assert tok.chat_template == "{{ messages }}"  # null leaves it alone
+    apply_tokenizer_overrides(tok, chat_template=None)
+    assert tok.chat_template == "{{ messages }}"  # None leaves it alone
 
 
-def test_defaults_leave_the_template_alone():
-    assert concept_probe.load_defaults()["model"]["chat_template"] is None
 
 
 def _fake_forward(model, input_ids, **kwargs):
@@ -62,32 +63,22 @@ def _fake_forward(model, input_ids, **kwargs):
     return [torch.arange(n, dtype=torch.float32).unsqueeze(1).repeat(1, 2)]
 
 
-def test_extract_text_reps_pools_over_the_text_only(monkeypatch):
-    monkeypatch.setattr(probe_mod, "forward_hidden_states_all_layers", _fake_forward)
+def test_read_texts_pools_over_the_text_only():
+    model = FunctionModel(_fake_forward)
     # raw: [BOS, t1, t2, t3] -> text rows 1..3, mean 2
-    raw = concept_probe.extract_text_reps(object(), _Tok(), ["a b c"], role="raw")
+    raw = concept_probe.read_texts(model, _Tok(), ["a b c"], role="raw", cache=False).data
     np.testing.assert_allclose(raw[0, 0], [2, 2])
     # assistant with system + prompt: 5 prompt tokens, then 3 text tokens (rows 5..7), mean 6
-    asst = concept_probe.extract_text_reps(object(), _Tok(), ["a b c"], role="assistant", prompt="q", system="s")
+    asst = concept_probe.read_texts(model, _Tok(), ["a b c"], role="assistant", prompt="q", system="s", cache=False).data
     np.testing.assert_allclose(asst[0, 0], [6, 6])
 
 
-def test_extract_text_reps_several_pools_in_one_pass(monkeypatch):
-    calls = []
-
-    def counting(model, input_ids, **kwargs):
-        calls.append(1)
-        return _fake_forward(model, input_ids)
-
-    monkeypatch.setattr(probe_mod, "forward_hidden_states_all_layers", counting)
-    out = concept_probe.extract_text_reps(object(), _Tok(), ["a b c d"], role="raw",
-                                          pool=["assistant_all_mean", "assistant_last", "assistant_last_k_mean"],
-                                          last_k=2)
-    assert len(calls) == 1
-    np.testing.assert_allclose(out["assistant_all_mean"][0, 0], [2.5, 2.5])  # rows 1..4
-    np.testing.assert_allclose(out["assistant_last"][0, 0], [4, 4])
-    np.testing.assert_allclose(out["assistant_last_k_mean"][0, 0], [3.5, 3.5])
-
-
-def test_exposed_in_public_api():
-    assert "extract_text_reps" in concept_probe.__all__
+def test_several_readouts_in_one_pass():
+    model = FunctionModel(_fake_forward)
+    out = concept_probe.read_texts(model, _Tok(), ["a b c d"], ["text_mean", "text_last", "text_last_k"], last_k=2,
+                                   cache=False)
+    assert model.calls == 1
+    np.testing.assert_allclose(out["text_mean"].data[0, 0], [2.5, 2.5])  # rows 1..4
+    np.testing.assert_allclose(out["text_last"].data[0, 0], [4, 4])
+    np.testing.assert_allclose(out["text_last_k"].data[0, 0], [3.5, 3.5])
+    assert out["text_mean"].context.role == "raw" and out["text_last"].context.readout == "text_last"

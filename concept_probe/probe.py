@@ -1,2246 +1,988 @@
+"""The probe object.
+
+A :class:`ConceptProbe` is one direction per layer of a model to read a concept with, the layer it
+reads at, the calibrations that turn its projections into z scores, and the directions it steers
+with. It is built from representations already read (:meth:`ConceptProbe.fit`, which can also
+evaluate it on named eval sets), from directions computed elsewhere
+(:meth:`ConceptProbe.from_directions`), or from a saved probe (:meth:`ConceptProbe.load`). It
+reads arrays without a model; with one attached (:meth:`ConceptProbe.attach`) it also scores
+texts token by token and builds its steering intervention.
+"""
 import json
 import os
-import sys
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
-import torch
 
-from .config import ConceptSpec, resolve_config
-from .logger import JsonlLogger
-from .modeling import ModelBundle, _resolve_attr_path, apply_chat, attention_mask_from_ids
-from .steering import MultiLayerSteererLayerwise
-from .utils import deep_merge, ensure_dir, json_dump, jsonl_to_pretty, now_tag, safe_slug, set_seed
-from .visuals import plot_score_hist, plot_sweep, render_batch_heatmap, render_token_heatmap, segment_token_scores
-from .console import ConsoleLogger
-
-try:
-    from scipy.stats import ttest_ind
-except Exception:
-    ttest_ind = None
-
-
-def normed_np(v: np.ndarray) -> np.ndarray:
-    return v / (np.linalg.norm(v) + 1e-12)
-
-
-DIRECTION_NORMALIZATIONS = ("none", "var", "sd")
-
-
-def concept_direction(pos_reps: np.ndarray, neg_reps: np.ndarray, normalization: str = "none") -> np.ndarray:
-    """Unit concept direction at one layer from pole reps of shape ``(n, dim)``.
-
-    - ``"none"``: difference of means, ``mu_pos - mu_neg``.
-    - ``"var"``: difference of means divided coordinate-wise by the pooled within-pole
-      variance, ``0.5 * (var_pos + var_neg)``. The diagonal form of the covariance
-      correction of mass-mean probing: it keeps a few high-variance coordinates (the
-      massive activations of e.g. Gemma 3) from dominating the direction.
-    - ``"sd"``: the same, divided by the pooled standard deviation instead.
-
-    Variances are population variances (``ddof=0``), computed in float64. The result is
-    normalized to unit length, so scoring and steering use it exactly like an unnormalized
-    direction. ``"none"`` is computed in the input dtype, as training always did.
-    """
-    if normalization not in DIRECTION_NORMALIZATIONS:
-        raise ValueError(
-            f"Unknown direction normalization {normalization!r}; expected one of {DIRECTION_NORMALIZATIONS}."
-        )
-    if normalization == "none":
-        return normed_np(np.asarray(pos_reps).mean(axis=0) - np.asarray(neg_reps).mean(axis=0))
-    pos = np.asarray(pos_reps, dtype=np.float64)
-    neg = np.asarray(neg_reps, dtype=np.float64)
-    pooled_var = 0.5 * (pos.var(axis=0) + neg.var(axis=0)) + 1e-12
-    gap = pos.mean(axis=0) - neg.mean(axis=0)
-    gap = gap / (pooled_var if normalization == "var" else np.sqrt(pooled_var))
-    return normed_np(gap).astype(np.float32)
-
-
-def _resolve_random_control_seed(explicit_seed: Optional[int], config_seed: Any) -> int:
-    if explicit_seed is not None:
-        return int(explicit_seed)
-    if config_seed is None:
-        return 0
-    try:
-        return int(config_seed)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"random.seed in config must be an integer; got {config_seed!r}") from exc
-
-
-def _mix_random_control_seed(base_seed: int, salt: int) -> int:
-    x = int(base_seed) & 0xFFFFFFFFFFFFFFFF
-    s = int(salt) & 0xFFFFFFFFFFFFFFFF
-    x ^= (s + 0x9E3779B97F4A7C15 + ((x << 6) & 0xFFFFFFFFFFFFFFFF) + (x >> 2)) & 0xFFFFFFFFFFFFFFFF
-    return int(x & 0x7FFFFFFFFFFFFFFF)
-
-
-def _random_vectors_same_norm(base_vectors: np.ndarray, seed: int) -> np.ndarray:
-    src = np.asarray(base_vectors, dtype=np.float32)
-    if src.ndim != 2:
-        raise ValueError(f"base_vectors must be 2D [num_layers, hidden_dim], got shape={src.shape}")
-    rng = np.random.default_rng(int(seed))
-    out = np.zeros_like(src, dtype=np.float32)
-    for li in range(src.shape[0]):
-        target_norm = float(np.linalg.norm(src[li]))
-        if not np.isfinite(target_norm) or target_norm <= 0.0:
-            continue
-        rv = rng.standard_normal(src.shape[1]).astype(np.float32)
-        rv_norm = float(np.linalg.norm(rv))
-        if not np.isfinite(rv_norm) or rv_norm <= 0.0:
-            continue
-        out[li] = (rv / rv_norm) * target_norm
-    return out
-
-
-def _render_progress(current: int, total: int, *, width: int = 28) -> str:
-    if total <= 0:
-        return "[----------------------------] 0/0"
-    frac = min(1.0, max(0.0, current / total))
-    filled = int(round(width * frac))
-    bar = "#" * filled + "-" * (width - filled)
-    return f"[{bar}] {current}/{total}"
-
-
-def _progress_print(current: int, total: int, *, label: str, enabled: bool, last: bool = False) -> None:
-    if not enabled:
-        return
-    inline_env = os.environ.get("CP_PROGRESS_INLINE", "").strip().lower()
-    if inline_env in {"1", "true", "yes"}:
-        inline = True
-    elif inline_env in {"0", "false", "no"}:
-        inline = False
-    else:
-        inline = sys.stdout.isatty()
-    bar = _render_progress(current, total)
-    end = "\n" if (last or not inline) else "\r"
-    print(f"{label} {bar}", end=end, flush=True)
-
-
-def cohen_d_np(x: np.ndarray, y: np.ndarray) -> float:
-    nx, ny = x.size, y.size
-    if nx < 2 or ny < 2:
-        return float("nan")
-    vx, vy = x.var(ddof=1), y.var(ddof=1)
-    pooled = ((nx - 1) * vx + (ny - 1) * vy) / (nx + ny - 2)
-    return float((x.mean() - y.mean()) / (np.sqrt(pooled) + 1e-12))
-
-
-def _validate_layer_index(value: Any, num_layers: int, what: str) -> int:
-    idx = int(value)
-    if not (0 <= idx < num_layers):
-        raise ValueError(f"{what} must be in [0, {num_layers - 1}]; got {idx}.")
-    return idx
-
-
-def pick_layer(num_layers: int, layer_idx: Optional[int], layer_frac: float) -> int:
-    if layer_idx is not None:
-        return _validate_layer_index(layer_idx, num_layers, "training.layer_idx")
-    return int(layer_frac * (num_layers - 1))
-
-
-def _layer_index_from_value(value: Any, num_layers: int) -> int:
-    if isinstance(value, bool):
-        raise TypeError("Layer values must be int or float, not bool.")
-    if isinstance(value, (int, np.integer)):
-        return int(value)
-    if isinstance(value, (float, np.floating)):
-        if 0.0 <= float(value) <= 1.0:
-            return int(float(value) * (num_layers - 1))
-        raise ValueError(
-            f"Float layer values are interpreted as fractions of depth in [0, 1]; got {value}. "
-            "Use an int for an absolute layer index."
-        )
-    raise TypeError(f"Layer values must be int or float; got {type(value)}")
-
-
-def _normalize_best_layer_search(
-    search_spec: Optional[Any], num_layers: int
-) -> Dict[str, Any]:
-    if search_spec is None:
-        return {
-            "intervals": [(0, num_layers - 1)],
-            "layers": list(range(num_layers)),
-            "is_default": True,
-        }
-
-    if not isinstance(search_spec, (list, tuple)):
-        raise TypeError("training.best_layer_search must be a list like [lo, hi] or [[lo, hi], ...].")
-
-    if len(search_spec) == 0:
-        raise ValueError("training.best_layer_search is empty; provide [lo, hi] or [[lo, hi], ...].")
-
-    if len(search_spec) == 2 and not isinstance(search_spec[0], (list, tuple)):
-        raw_intervals: List[Any] = [search_spec]
-    else:
-        raw_intervals = list(search_spec)
-
-    intervals: List[Tuple[int, int]] = []
-    for i, raw in enumerate(raw_intervals):
-        if not isinstance(raw, (list, tuple)) or len(raw) != 2:
-            raise ValueError(f"training.best_layer_search[{i}] must be [lo, hi].")
-        lo = _layer_index_from_value(raw[0], num_layers)
-        hi = _layer_index_from_value(raw[1], num_layers)
-        if lo > hi:
-            lo, hi = hi, lo
-        lo = max(0, min(num_layers - 1, lo))
-        hi = max(0, min(num_layers - 1, hi))
-        intervals.append((lo, hi))
-
-    intervals.sort(key=lambda x: x[0])
-    merged: List[List[int]] = []
-    for lo, hi in intervals:
-        if not merged or lo > merged[-1][1] + 1:
-            merged.append([lo, hi])
-        else:
-            merged[-1][1] = max(merged[-1][1], hi)
-    merged_intervals = [(int(lo), int(hi)) for lo, hi in merged]
-
-    layers: List[int] = []
-    for lo, hi in merged_intervals:
-        layers.extend(range(lo, hi + 1))
-
-    if not layers:
-        raise ValueError("training.best_layer_search did not resolve to any valid layers.")
-
-    return {"intervals": merged_intervals, "layers": layers, "is_default": False}
-
-
-def select_layers(selection: Dict[str, Any], best_layer: int, num_layers: int) -> List[int]:
-    mode = selection.get("mode", "best")
-    if mode == "best":
-        return [best_layer]
-    if mode == "window":
-        radius = int(selection.get("window_radius", 0))
-        lo = max(0, best_layer - radius)
-        hi = min(num_layers - 1, best_layer + radius)
-        return list(range(lo, hi + 1))
-    if mode == "explicit":
-        return [
-            _validate_layer_index(l, num_layers, "layer_selection.layers entries")
-            for l in selection.get("layers", [])
-        ]
-    if mode == "all":
-        return list(range(num_layers))
-    raise ValueError(f"Unknown layer selection mode: {mode}")
-
-
-def _decode_tokens(tokenizer, token_ids: Iterable[int]) -> List[str]:
-    return [tokenizer.decode([int(t)], skip_special_tokens=False) for t in token_ids]
-
-
-def _has_chat_template(tokenizer) -> bool:
-    return bool(getattr(tokenizer, "chat_template", None))
-
-
-_CHAT_TEMPLATE_FALLBACK_WARNED: set = set()
-
-
-def _encode_for_read(
-    tokenizer,
-    prompt: "PromptLike",
-    default_system: str,
-    *,
-    warn: Optional[Callable[[str], None]] = None,
-    warn_prefix: str = "read",
-) -> torch.Tensor:
-    """Encode a 'read' input (no generation). Uses the chat template when the
-    tokenizer has one; otherwise falls back to raw tokenization (system text
-    is dropped — base models have no chat structure to wrap it in).
-    """
-    if _has_chat_template(tokenizer):
-        messages, _ = _normalize_messages(
-            prompt, default_system, warn=warn, warn_prefix=warn_prefix
-        )
-        return apply_chat(tokenizer, messages, add_generation_prompt=False)
-
-    text = prompt if isinstance(prompt, str) else _prompt_to_text(prompt)
-    fallback_key = id(tokenizer)
-    if warn is not None and fallback_key not in _CHAT_TEMPLATE_FALLBACK_WARNED:
-        warn(
-            f"{warn_prefix}: tokenizer has no chat_template; "
-            f"falling back to raw tokenization (system text ignored)."
-        )
-        _CHAT_TEMPLATE_FALLBACK_WARNED.add(fallback_key)
-    enc = tokenizer(text, return_tensors="pt", add_special_tokens=True)
-    return enc["input_ids"]
-
-
-def _completion_input_ids(tokenizer, messages: "List[PromptMessage]", completion: str) -> Tuple[torch.Tensor, int]:
-    """Chat-format ``messages`` with an assistant generation prompt and append ``completion``.
-
-    Returns ``(input_ids, prompt_len)``: the completion occupies ``input_ids[0, prompt_len:]``,
-    with no end-of-turn token after it.
-    """
-    prompt_ids = apply_chat(tokenizer, messages, add_generation_prompt=True)
-    plen = int(prompt_ids.shape[-1])
-    comp_ids = tokenizer(str(completion), add_special_tokens=False, return_tensors="pt")["input_ids"]
-    if comp_ids.dim() == 1:
-        comp_ids = comp_ids.unsqueeze(0)
-    return torch.cat([prompt_ids, comp_ids.to(prompt_ids.dtype)], dim=1), plen
-
-
-TEXT_ROLES = ("user", "assistant", "raw")
-
-
-def _encode_text_for_read(
-    tokenizer,
-    text: "PromptLike",
-    system: str,
-    *,
-    role: str = "user",
-    prompt: Optional[str] = None,
-    warn: Optional[Callable[[str], None]] = None,
-    warn_prefix: str = "read",
-) -> Tuple[torch.Tensor, Optional[int]]:
-    """Encode a labelled text for texts-mode training or read-mode evaluation.
-
-    ``role="user"`` (default) is the historical behaviour: :func:`_encode_for_read`, and
-    ``prompt_len`` is None. ``role="assistant"`` reads the text as the model's own reply, as
-    :func:`extract_completion_reps` does: an optional system message, an optional user turn
-    ``prompt``, the assistant header, then the text; ``prompt_len`` marks where the text starts,
-    so the ``assistant_*`` readout modes pool over the text's tokens only. ``role="raw"`` reads
-    the text alone, with no chat template: the BOS token (if the tokenizer has one) and the
-    text; ``prompt_len`` is 1 (0 without BOS), so ``assistant_*`` readouts skip BOS. ``system``
-    and ``prompt`` are ignored with ``"raw"``.
-    """
-    if role == "user":
-        return _encode_for_read(tokenizer, text, system, warn=warn, warn_prefix=warn_prefix), None
-    if role not in TEXT_ROLES:
-        raise ValueError(f"training.train_text_role must be one of {TEXT_ROLES}; got {role!r}")
-    if not isinstance(text, str):
-        raise TypeError(f"{warn_prefix}: train_text_role={role!r} needs plain-string texts; got {type(text)}")
-    if role == "raw":
-        if (prompt is not None or system) and warn is not None:
-            warn(f"{warn_prefix}: train_text_role='raw' reads the text alone; system and train_text_prompt are ignored.")
-        ids = tokenizer(text, add_special_tokens=False, return_tensors="pt")["input_ids"]
-        if ids.dim() == 1:
-            ids = ids.unsqueeze(0)
-        bos = getattr(tokenizer, "bos_token_id", None)
-        if bos is None:
-            return ids, 0
-        return torch.cat([torch.tensor([[bos]], dtype=ids.dtype), ids], dim=1), 1
-    if not _has_chat_template(tokenizer):
-        raise ValueError("train_text_role='assistant' needs a tokenizer with a chat template.")
-    messages: "List[PromptMessage]" = []
-    if system:
-        messages.append({"role": "system", "content": str(system)})
-    if prompt is not None:
-        messages.append({"role": "user", "content": str(prompt)})
-    return _completion_input_ids(tokenizer, messages, text)
-
-
-def _prompt_slug(text: str, max_words: int = 8, max_len: int = 48) -> str:
-    words = text.strip().split()
-    snippet = " ".join(words[:max_words])
-    slug = safe_slug(snippet)[:max_len]
-    return slug or "prompt"
-
-
-PromptMessage = Dict[str, str]
-PromptLike = Union[str, List[PromptMessage]]
-
-
-def _prompt_to_text(prompt: PromptLike) -> str:
-    if isinstance(prompt, str):
-        return prompt
-    if not isinstance(prompt, list):
-        return str(prompt)
-    parts: List[str] = []
-    for m in prompt:
-        if not isinstance(m, dict):
-            parts.append(str(m))
-            continue
-        role = str(m.get("role", ""))
-        content = str(m.get("content", ""))
-        if role:
-            parts.append(f"{role}: {content}")
-        else:
-            parts.append(content)
-    return "\n".join(parts)
-
-
-def _prompt_slug_any(prompt: PromptLike, max_words: int = 8, max_len: int = 48) -> str:
-    return _prompt_slug(_prompt_to_text(prompt), max_words=max_words, max_len=max_len)
-
-
-def _normalize_messages(
-    prompt: PromptLike,
-    default_system: str,
-    *,
-    warn: Optional[Callable[[str], None]] = None,
-    warn_prefix: str = "prompt",
-) -> Tuple[List[PromptMessage], bool]:
-    """Return (messages, used_prompt_system).
-
-    - If prompt is a string: wrap as system+user.
-    - If prompt is a message list:
-        - If it contains any system message, do not inject default_system; warn if default_system is non-empty.
-        - If it contains no system message, prepend default_system as a system message.
-    """
-    if isinstance(prompt, str):
-        return (
-            [
-                {"role": "system", "content": str(default_system)},
-                {"role": "user", "content": prompt},
-            ],
-            False,
-        )
-
-    if not isinstance(prompt, list):
-        raise TypeError(f"{warn_prefix} must be str or list of messages; got {type(prompt)}")
-
-    messages: List[PromptMessage] = []
-    system_count = 0
-    for i, m in enumerate(prompt):
-        if not isinstance(m, dict):
-            raise TypeError(f"{warn_prefix}[{i}] must be a dict with role/content; got {type(m)}")
-        if "role" not in m or "content" not in m:
-            raise ValueError(f"{warn_prefix}[{i}] must have 'role' and 'content' keys")
-        role = str(m["role"])
-        content = str(m["content"])
-        if role == "system":
-            system_count += 1
-        messages.append({"role": role, "content": content})
-
-    if system_count > 0:
-        if default_system and warn is not None:
-            warn(
-                f"{warn_prefix} includes a system message; the provided default system prompt is ignored."
-            )
-        if system_count > 1 and warn is not None:
-            warn(f"{warn_prefix} includes multiple system messages; using them as provided.")
-        return (messages, True)
-
-    return ([{"role": "system", "content": str(default_system)}] + messages, False)
-
-
-def _alpha_label(alpha: float, unit: str) -> str:
-    if unit == "sigma":
-        label = f"sigma{alpha:+.2f}"
-    else:
-        label = f"alpha{alpha:+.4f}"
-    label = label.replace("+", "p").replace("-", "m").replace(".", "p")
-    return safe_slug(label)
-
-
-def _normalize_generation_logits_dtype(dtype_name: Optional[str]) -> Tuple[str, torch.dtype]:
-    raw = "float16" if dtype_name is None else str(dtype_name).strip().lower()
-    if raw in {"float16", "fp16", "half"}:
-        return ("float16", torch.float16)
-    if raw in {"float32", "fp32", "single"}:
-        return ("float32", torch.float32)
-    raise ValueError(
-        f"Unsupported generation logits dtype '{dtype_name}'. Use 'float16' or 'float32'."
-    )
-
-
-def _pack_generation_logits_arrays(
-    generation_step_logits: torch.Tensor,
-    *,
-    logits_top_k: Optional[int],
-    logits_dtype_name: Optional[str],
-    logits_source: str = "raw_model",
-) -> Dict[str, np.ndarray]:
-    if generation_step_logits.ndim != 2:
-        raise ValueError(
-            f"Expected generation_step_logits to have shape (num_steps, vocab_size); got {tuple(generation_step_logits.shape)}"
-        )
-    if generation_step_logits.shape[0] <= 0:
-        return {}
-
-    dtype_name, torch_dtype = _normalize_generation_logits_dtype(logits_dtype_name)
-    logits = generation_step_logits.detach().to(dtype=torch.float32, device="cpu")
-    out: Dict[str, np.ndarray] = {
-        "generation_logits_steps": np.array([int(logits.shape[0])], dtype=np.int32),
-        "generation_logits_dtype": np.array([dtype_name]),
-        "generation_logits_source": np.array([str(logits_source)]),
-    }
-
-    if logits_top_k is not None and int(logits_top_k) > 0:
-        k = int(max(1, min(int(logits_top_k), int(logits.shape[-1]))))
-        top_vals, top_idx = torch.topk(logits, k=k, dim=-1)
-        out["generation_logits_topk_values"] = top_vals.to(dtype=torch_dtype).numpy()
-        out["generation_logits_topk_indices"] = top_idx.to(dtype=torch.int32).numpy().astype(np.int32, copy=False)
-        out["generation_logits_topk_k"] = np.array([k], dtype=np.int32)
-    else:
-        out["generation_logits"] = logits.to(dtype=torch_dtype).numpy()
-        out["generation_logits_topk_k"] = np.array([0], dtype=np.int32)
-
-    return out
-
-
-def _slice_generation_step_logits(
-    full_logits: torch.Tensor,
-    *,
-    prompt_len: int,
-    total_tokens: int,
-) -> torch.Tensor:
-    if full_logits.ndim != 2:
-        raise ValueError(f"Expected full logits shape (seq_len, vocab_size); got {tuple(full_logits.shape)}")
-
-    generated_steps = max(0, int(total_tokens) - int(prompt_len))
-    if generated_steps <= 0:
-        return full_logits.new_empty((0, int(full_logits.shape[-1])))
-
-    start = 0 if int(prompt_len) <= 0 else int(prompt_len) - 1
-    end = start + generated_steps
-    if end > int(full_logits.shape[0]):
-        raise ValueError(
-            f"Cannot slice generation logits: prompt_len={prompt_len}, total_tokens={total_tokens}, logits_seq_len={int(full_logits.shape[0])}"
-        )
-    return full_logits[start:end]
-
-
-# Mirrors the wrapper layouts handled by modeling.get_transformer_layers, so any model
-# whose blocks we can find also has a findable final norm.
-_FINAL_NORM_PATHS = (
-    "model.norm",
-    "model.final_layernorm",
-    "model.ln_f",
-    "model.language_model.norm",
-    "language_model.norm",
-    "model.model.norm",
-    "model.model.language_model.norm",
-    "base_model.model.norm",
-    "base_model.model.language_model.norm",
-    "transformer.ln_f",
-    "norm",
-    "final_layernorm",
-    "ln_f",
+from .directions import estimator_spec, fit_directions, make_estimator, steer_directions_for
+from .evaluation import EvalSet, ReadingEvaluation, evaluate_reading, label_shuffle_control
+from .inputs import (
+    TEXT_ROLES,
+    Encoded,
+    PromptLike,
+    ReadContext,
+    _prompt_to_text,
+    _encode_text,
 )
+from .interventions import Add
+from .calibration import Calibration, sigmoid
+from .modeling import ModelBundle, identity_mismatches
+from .reading import Readout, _read
+from .record import Choice, announce
+from .scoring import ScoreInput, Scores, TokenScorer, score_inputs
+from .settings import settings
+from .stats import _pooled_sd_columns, bootstrap_ci, summarize_tokens
+from .utils import ensure_dir, json_dump, now_tag, resolve_layer_index, safe_slug
+from .visuals import plot_score_hist, plot_sweep
+
+#: Units of a steering dose: as is, the eval items' within-pole SD on the steering direction, or each
+#: layer's mean residual norm.
+STEER_UNITS = ("resid_norm", "sd", "raw")
+#: Units of a probe's z: within-pole SDs, or the poles' scale (+1 the positive mean, 0 the zero).
+Z_UNITS = ("sd", "poles")
 
 
-def _get_final_norm_module(model):
-    for path in _FINAL_NORM_PATHS:
-        mod = _resolve_attr_path(model, path)
-        if mod is not None and isinstance(mod, torch.nn.Module):
-            return mod
-    tried = ", ".join(_FINAL_NORM_PATHS)
-    raise AttributeError(
-        f"Could not locate the final norm module on {type(model).__name__}; tried: {tried}"
-    )
+# ------------------------------------------------------------------------------------- helpers
+def _as_array(reps: Any) -> np.ndarray:
+    return np.asarray(getattr(reps, "data", reps))
 
 
-@torch.no_grad()
-def forward_hidden_states_all_layers(
-    model,
-    input_ids: torch.Tensor,
-    *,
-    return_generation_logits: bool = False,
-    generation_prompt_len: Optional[int] = None,
-) -> Union[List[torch.Tensor], Tuple[List[torch.Tensor], torch.Tensor]]:
-    attn = attention_mask_from_ids(input_ids).to(model.device)
-
-    final_norm = _get_final_norm_module(model)
-    captured: Dict[str, torch.Tensor] = {}
-
-    def _capture_pre_norm(module, args):
-        x = args[0] if isinstance(args, tuple) else args
-        captured["pre_norm"] = x.detach()
-
-    handle = final_norm.register_forward_pre_hook(_capture_pre_norm)
-    try:
-        out = model(
-            input_ids=input_ids.to(model.device),
-            attention_mask=attn,
-            output_hidden_states=True,
-            use_cache=False,
-            return_dict=True,
-        )
-    finally:
-        handle.remove()
-
-    if "pre_norm" not in captured:
-        raise RuntimeError(
-            "Forward pre-hook on final norm did not fire; model layout is unexpected."
-        )
-
-    hs = list(out.hidden_states)
-    # HF returns the post-final-norm tensor as hidden_states[-1] for decoder-only LMs,
-    # collapsing the last layer to a much smaller scale than the rest of the residual
-    # stream. Replace it with the pre-norm input so all layers are on the same scale.
-    hs[-1] = captured["pre_norm"]
-
-    num_layers = len(hs) - 1
-    hs_layers = [hs[l + 1][0].detach().float().cpu() for l in range(num_layers)]
-    if not return_generation_logits:
-        return hs_layers
-
-    logits = getattr(out, "logits", None)
-    if logits is None:
-        raise ValueError("Model output does not include logits; cannot save generation logits.")
-    logits_2d = logits[0]
-    seq_len = int(input_ids.shape[-1])
-    prompt_len = seq_len if generation_prompt_len is None else int(generation_prompt_len)
-    step_logits = _slice_generation_step_logits(
-        logits_2d,
-        prompt_len=prompt_len,
-        total_tokens=seq_len,
-    )
-    return hs_layers, step_logits.detach().to(dtype=torch.float32, device="cpu")
+def _window(center: int, radius: Any, num_layers: int) -> Tuple[List[int], Optional[Choice]]:
+    """The layers within ``radius`` of ``center``, and the choice made when the window is clipped."""
+    radius = int(radius)
+    if radius < 0:
+        raise ValueError(f"the window radius must be >= 0; got {radius}")
+    lo, hi = center - radius, center + radius
+    layers = list(range(max(0, lo), min(num_layers - 1, hi) + 1))
+    clipped = None
+    if lo < 0 or hi > num_layers - 1:
+        clipped = Choice("steering layers", f"layers {lo} to {hi}", f"layers {layers[0]} to {layers[-1]}",
+                         f"the window around layer {center} reaches past the model's {num_layers} layers")
+    return layers, clipped
 
 
-def reps_from_hs_layers(
-    hs_layers: List[torch.Tensor],
-    prompt_len: Optional[int],
-    mode: str,
-    last_k: int,
-    warn: Optional[Callable[[str], None]] = None,
-) -> np.ndarray:
-    num_layers = len(hs_layers)
-    dim = int(hs_layers[0].shape[1])
-    reps = np.zeros((num_layers, dim), dtype=np.float32)
-
-    if (
-        warn is not None
-        and prompt_len is not None
-        and mode in ("assistant_last_k_mean", "assistant_all_mean")
-        and prompt_len >= int(hs_layers[0].shape[0])
-    ):
-        warn(
-            f"mode={mode}: no completion tokens (prompt_len={prompt_len} >= "
-            f"seq_len={int(hs_layers[0].shape[0])}); falling back to full-sequence pooling, "
-            "which includes prompt/system tokens and can leak the system-prompt difference "
-            "into the concept vector."
-        )
-
-    for l in range(num_layers):
-        hs = hs_layers[l]
-        total = hs.shape[0]
-
-        if mode == "sequence_last":
-            reps[l] = hs[-1].numpy()
-        elif mode == "sequence_last_k_mean":
-            k = min(last_k, total)
-            reps[l] = hs[-k:].mean(dim=0).numpy()
-        elif mode == "sequence_all_mean":
-            reps[l] = hs.mean(dim=0).numpy()
-        elif mode == "assistant_last":
-            reps[l] = hs[-1].numpy()
-        elif mode == "assistant_last_k_mean":
-            if prompt_len is None or prompt_len >= total:
-                k = min(last_k, total)
-                reps[l] = hs[-k:].mean(dim=0).numpy()
-            else:
-                span = hs[prompt_len:]
-                if span.shape[0] == 0:
-                    reps[l] = hs.mean(dim=0).numpy()
-                else:
-                    k = min(last_k, span.shape[0])
-                    reps[l] = span[-k:].mean(dim=0).numpy()
-        elif mode == "assistant_all_mean":
-            if prompt_len is None or prompt_len >= total:
-                reps[l] = hs.mean(dim=0).numpy()
-            else:
-                span = hs[prompt_len:]
-                reps[l] = (span.mean(dim=0) if span.shape[0] > 0 else hs.mean(dim=0)).numpy()
-        else:
-            raise ValueError(f"Unknown mode: {mode}")
-
-    return reps
+def _layer_list(values: Any, num_layers: int, what: str) -> List[int]:
+    """A non-empty list of distinct layer indices (see :func:`resolve_layer_index`)."""
+    if isinstance(values, (int, np.integer)) and not isinstance(values, bool):
+        values = [values]
+    if not isinstance(values, (list, tuple)) or len(values) == 0:
+        raise ValueError(f"{what} must be a non-empty list of layer indices; got {values!r}")
+    layers = [resolve_layer_index(v, num_layers, f"{what} entries") for v in values]
+    if len(set(layers)) != len(layers):
+        raise ValueError(f"{what} repeats a layer: {layers}")
+    return layers
 
 
-@torch.no_grad()
-def extract_completion_reps(
-    model,
-    tokenizer,
-    pairs: List[Tuple[PromptLike, str]],
-    *,
-    pool: str = "assistant_all_mean",
-    last_k: int = 12,
-    system: Optional[str] = None,
-) -> np.ndarray:
-    """Per-layer reps pooled over the completion tokens, for ``(prompt, completion)`` pairs.
-
-    Reconstructs the readout used during training: each prompt is chat-formatted with an
-    assistant generation prompt, the completion tokens are appended, one forward pass
-    captures all layers, and the hidden states are pooled over the completion span per
-    layer (``pool='assistant_all_mean'`` by default). Returns an array of shape
-    ``(len(pairs), num_layers, hidden_dim)``.
-
-    Use it to score externally-provided text -- e.g. another model's generations -- against
-    trained concept vectors, or to compare how different models represent the same text.
-    Pass ``system=None`` (default) to format prompts with no system message.
-    """
-    out_reps: List[np.ndarray] = []
-    for prompt, completion in pairs:
-        if isinstance(prompt, str):
-            messages: List[PromptMessage] = []
-            if system:
-                messages.append({"role": "system", "content": system})
-            messages.append({"role": "user", "content": prompt})
-        else:
-            messages = list(prompt)
-        full_ids, plen = _completion_input_ids(tokenizer, messages, completion)
-        hs_layers = forward_hidden_states_all_layers(model, full_ids)
-        out_reps.append(reps_from_hs_layers(hs_layers, prompt_len=plen, mode=pool, last_k=last_k))
-    return np.stack(out_reps, axis=0).astype(np.float32)
-
-
-@torch.no_grad()
-def extract_text_reps(
-    model,
-    tokenizer,
-    texts: List[str],
-    *,
-    role: str = "assistant",
-    prompt: Optional[str] = None,
-    system: str = "",
-    pool: Union[str, Sequence[str]] = "assistant_all_mean",
-    last_k: int = 12,
-) -> Union[np.ndarray, Dict[str, np.ndarray]]:
-    """Per-layer reps of texts, encoded exactly as texts-mode training encodes them.
-
-    ``role``, ``prompt`` and ``system`` mean what ``training.train_text_role``,
-    ``training.train_text_prompt`` and the training system prompt mean, so a probe trained on
-    labelled texts scores new texts under the same readout. ``pool`` is one readout mode,
-    returning ``(len(texts), num_layers, hidden_dim)``, or several, returning a dict of such
-    arrays from a single forward pass per text.
-    """
-    pools = [pool] if isinstance(pool, str) else list(pool)
-    out: Dict[str, List[np.ndarray]] = {p: [] for p in pools}
-    for i, text in enumerate(texts):
-        ids, plen = _encode_text_for_read(tokenizer, text, system, role=role, prompt=prompt,
-                                          warn_prefix=f"texts[{i}]")
-        hs_layers = forward_hidden_states_all_layers(model, ids)
-        for p in pools:
-            out[p].append(reps_from_hs_layers(hs_layers, prompt_len=plen, mode=p, last_k=last_k))
-    arrays = {p: np.stack(v, axis=0).astype(np.float32) for p, v in out.items()}
-    return arrays[pool] if isinstance(pool, str) else arrays
-
-
-def token_scores_from_hs_layers(
-    hs_layers: List[torch.Tensor],
-    concept_vectors: np.ndarray,
-    layer_indices: List[int],
-    aggregate: str,
-    reference_layer: Optional[int] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Project each selected layer's hidden states onto a concept direction.
-
-    By default each layer ``li`` is scored with its own concept vector
-    ``concept_vectors[li]`` (the usual per-layer probe). If ``reference_layer``
-    is given, *every* selected layer is instead scored against the single
-    direction ``concept_vectors[reference_layer]``. This is a "logit-lens"-style
-    read: it measures how decodable a *fixed* direction (e.g. the one learned at
-    a late layer) is from the activations at every other layer, holding the
-    direction constant so that changes across layers reflect the representation
-    rather than a change of basis. ``reference_layer`` accepts negative indices.
-    """
-    if not layer_indices:
-        raise ValueError("layer_indices must be non-empty")
-    num_vectors = int(concept_vectors.shape[0])
-    if reference_layer is not None:
-        ref = int(reference_layer)
-        if ref < 0:
-            ref += num_vectors
-        if not (0 <= ref < num_vectors):
-            raise ValueError(
-                f"reference_layer={reference_layer} out of range for {num_vectors} concept vectors."
-            )
-    total = int(hs_layers[0].shape[0])
-    scores_per_layer = np.zeros((total, len(layer_indices)), dtype=np.float32)
-
-    for i, li in enumerate(layer_indices):
-        hs = hs_layers[li]
-        vi = li if reference_layer is None else ref
-        v = torch.tensor(concept_vectors[vi], dtype=hs.dtype)
-        scores_per_layer[:, i] = (hs @ v).numpy()
-
-    if aggregate == "mean":
-        scores_agg = scores_per_layer.mean(axis=1)
-    elif aggregate == "sum":
-        scores_agg = scores_per_layer.sum(axis=1)
-    else:
-        raise ValueError(f"Unknown aggregate: {aggregate}")
-
-    return scores_per_layer, scores_agg
-
-
-@torch.no_grad()
-def score_text_tokens(
-    model,
-    tokenizer,
-    concept_vectors: np.ndarray,
-    text: str,
-    *,
-    layer_indices: Optional[List[int]] = None,
-    reference_layer: Optional[int] = None,
-    unit_norm: bool = False,
-    add_special_tokens: bool = True,
-) -> Dict[str, Any]:
-    """Score every token of a RAW text against the per-layer concept directions, in memory.
-
-    Low-level read primitive for callers that need per-token, per-layer scores together with
-    character offsets (e.g. to target a specific word/subtoken), without the artifact-writing or
-    chat-template wrapping of ``ConceptProbe.score_texts``. The text is tokenized as-is (no chat
-    template); the forward pass uses the same all-layers capture as training (with the final-norm
-    fix), so layer ``l`` of the result aligns with ``concept_vectors[l]`` (i.e. hidden_states[l+1]).
-
-    Args:
-        concept_vectors: (num_layers, hidden_dim) directions. Pass unit vectors, or set
-            ``unit_norm=True`` to divide each row by its L2 norm before projecting (so the score is
-            ``hs · v̂``, i.e. divided by ``||v_l||``).
-        layer_indices: which layers to score (default: all). ``scores_per_layer`` has shape
-            ``(num_tokens, len(layer_indices))``.
-        reference_layer: if set, project every selected layer onto the single direction of that
-            layer (logit-lens); see ``token_scores_from_hs_layers``.
-        unit_norm: L2-normalize each concept vector before projecting (default False, to match
-            ``token_scores_from_hs_layers`` semantics).
-        add_special_tokens: passed to the tokenizer (default True; BOS gets offset (0, 0)).
-
-    Returns:
-        dict with ``token_ids`` (np.int32 [num_tokens]), ``tokens`` (List[str]),
-        ``offset_mapping`` (List[[start, end]] char spans), ``scores_per_layer``
-        (np.float32 [num_tokens, len(layer_indices)]) and ``layer_indices`` (List[int]).
-    """
-    cv = np.asarray(concept_vectors, dtype=np.float32)
-    if cv.ndim != 2:
-        raise ValueError(f"concept_vectors must be 2D [num_layers, hidden_dim], got shape={cv.shape}")
-    num_layers = int(cv.shape[0])
-    if unit_norm:
-        norms = np.linalg.norm(cv, axis=1, keepdims=True)
-        cv = cv / np.clip(norms, 1e-12, None)
-    layers = (
-        list(range(num_layers))
-        if layer_indices is None
-        else [_validate_layer_index(i, num_layers, "layer_indices entries") for i in layer_indices]
-    )
-
-    enc = tokenizer(text, return_tensors="pt", return_offsets_mapping=True,
-                    add_special_tokens=add_special_tokens)
-    om = enc["offset_mapping"]
-    if hasattr(om, "tolist"):
-        om = om.tolist()
-    offsets = [list(span) for span in om[0]]
-    input_ids = enc["input_ids"]
-
-    hs_layers = forward_hidden_states_all_layers(model, input_ids)
-    if len(hs_layers) != num_layers:
-        raise ValueError(
-            f"Layer mismatch: model returned {len(hs_layers)} layers, concept_vectors has {num_layers}."
-        )
-    scores_per_layer, _ = token_scores_from_hs_layers(
-        hs_layers, cv, layers, aggregate="mean", reference_layer=reference_layer
-    )
-    token_ids = input_ids[0].detach().cpu().numpy().astype(np.int32)
-    return {
-        "token_ids": token_ids,
-        "tokens": _decode_tokens(tokenizer, token_ids),
-        "offset_mapping": offsets,
-        "scores_per_layer": scores_per_layer.astype(np.float32),
-        "layer_indices": layers,
-    }
-
-
-@torch.no_grad()
-def generate_once(
-    model,
-    tokenizer,
-    system: str,
-    prompt: PromptLike,
-    max_new_tokens: int,
-    greedy: bool,
-    temperature: Optional[float],
-    top_p: Optional[float],
-    warn: Optional[Callable[[str], None]] = None,
-    warn_prefix: str = "prompt",
-) -> Tuple[torch.Tensor, int]:
-    messages, _ = _normalize_messages(prompt, system, warn=warn, warn_prefix=warn_prefix)
-    if warn is not None and len(messages) > 0 and messages[-1].get("role") != "user":
-        warn(
-            f"{warn_prefix} ends with role='{messages[-1].get('role')}'; generation typically expects the last message to be a user turn."
-        )
-
-    input_ids = apply_chat(tokenizer, messages, add_generation_prompt=True)
-    prompt_len = int(input_ids.shape[-1])
-    attn = attention_mask_from_ids(input_ids).to(model.device)
-
-    gen_ids = model.generate(
-        input_ids=input_ids.to(model.device),
-        attention_mask=attn,
-        max_new_tokens=max_new_tokens,
-        do_sample=not greedy,
-        temperature=temperature if not greedy else None,
-        top_p=top_p if not greedy else None,
-        pad_token_id=tokenizer.eos_token_id,
-    )
-    return gen_ids[0].detach().cpu(), prompt_len
-
-
-@torch.no_grad()
-def generate_batch(
-    model,
-    tokenizer,
-    system: str,
-    prompts: List[PromptLike],
-    max_new_tokens: int,
-    greedy: bool,
-    temperature: Optional[float],
-    top_p: Optional[float],
-    batch_size: int = 16,
-    warn: Optional[Callable[[str], None]] = None,
-    warn_prefix: str = "prompt",
-) -> List[Tuple[torch.Tensor, int]]:
-    """Batched equivalent of ``generate_once`` over many prompts under one system.
-
-    Returns one ``(ids, prompt_len)`` per prompt, where ``ids`` is a 1D CPU tensor of
-    ``[prompt_tokens + completion_tokens]`` with all padding stripped -- the same
-    contract as ``generate_once``, so callers can use the results interchangeably.
-    Prompts are left-padded within each batch and an attention mask is passed so
-    greedy decoding matches the unbatched path; left padding and any trailing right
-    padding are stripped per item before returning.
-    """
-    if not prompts:
-        return []
-    pad_id = tokenizer.pad_token_id
-    if pad_id is None:
-        pad_id = tokenizer.eos_token_id
-
-    encoded: List[torch.Tensor] = []
-    for i, p in enumerate(prompts):
-        messages, _ = _normalize_messages(p, system, warn=warn, warn_prefix=f"{warn_prefix}[{i}]")
-        if warn is not None and len(messages) > 0 and messages[-1].get("role") != "user":
-            warn(
-                f"{warn_prefix}[{i}] ends with role='{messages[-1].get('role')}'; "
-                "generation typically expects the last message to be a user turn."
-            )
-        encoded.append(apply_chat(tokenizer, messages, add_generation_prompt=True)[0])
-
-    step = max(1, int(batch_size))
-    results: List[Optional[Tuple[torch.Tensor, int]]] = [None] * len(encoded)
-    for start in range(0, len(encoded), step):
-        chunk = encoded[start : start + step]
-        plens = [int(t.shape[-1]) for t in chunk]
-        maxlen = max(plens)
-        input_ids = torch.full((len(chunk), maxlen), pad_id, dtype=torch.long)
-        attn = torch.zeros((len(chunk), maxlen), dtype=torch.long)
-        for j, t in enumerate(chunk):
-            input_ids[j, maxlen - plens[j] :] = t.to(input_ids.dtype)
-            attn[j, maxlen - plens[j] :] = 1
-        gen = model.generate(
-            input_ids=input_ids.to(model.device),
-            attention_mask=attn.to(model.device),
-            max_new_tokens=max_new_tokens,
-            do_sample=not greedy,
-            temperature=temperature if not greedy else None,
-            top_p=top_p if not greedy else None,
-            pad_token_id=pad_id,
-        )
-        gen = gen.detach().cpu()
-        for j in range(len(chunk)):
-            plen = plens[j]
-            row = gen[j][maxlen - plen :]  # drop left padding -> [prompt + completion (+ right pad)]
-            keep = int(row.shape[-1])
-            while keep > plen and int(row[keep - 1]) == pad_id:
-                keep -= 1
-            results[start + j] = (row[:keep].clone(), plen)
-    return results  # type: ignore[return-value]
-
-
+# ------------------------------------------------------------------------------------- the probe
 @dataclass
 class ConceptProbe:
-    model_bundle: ModelBundle
-    config: Dict[str, Any]
-    concept: ConceptSpec
-    run_dir: str
-    logger: JsonlLogger
-    console: Optional[ConsoleLogger] = None
+    """A concept probe: one direction per layer of a model to read the concept with, the layer it
+    reads at, calibrations that turn its projections into z scores, and the directions it steers with.
 
-    concept_vectors: Optional[np.ndarray] = None
-    best_layer: Optional[int] = None
-    proj_std_best_layer: Optional[float] = None
-    sweep_d: Optional[np.ndarray] = None
-    sweep_p: Optional[np.ndarray] = None
+    A probe always belongs to a model (``identity``: the model, dtype, quantization and chat
+    template its directions were computed on), but needs that model loaded (``model_bundle``) only to
+    score texts and to steer. Build one with :meth:`fit`, :meth:`from_directions` or :meth:`load`,
+    and attach a loaded model with :meth:`attach`.
+    """
 
-    def train(self) -> "ConceptProbe":
-        if ttest_ind is None:
-            self._warn("scipy not available; sweep_p will be NaN.")
-        set_seed(int(self.config["random"]["seed"]))
-        ensure_dir(self.run_dir)
+    #: the concept's name and the labels of its two poles (the second may be a baseline)
+    name: str = "concept"
+    pos_label: str = "positive"
+    neg_label: str = "negative"
+    #: (layers, dim) unit directions to read with, pointing toward the positive pole
+    directions: Optional[np.ndarray] = None
+    #: the layer the probe reads at
+    layer: Optional[int] = None
+    #: the layers a score combines (their mean, or sum with ``score_aggregate="sum"``); default the probe's
+    score_layers: Optional[List[int]] = None
+    score_aggregate: str = "mean"
+    #: (layers, dim) directions steering adds (the raw difference of means by default)
+    steer_directions: Optional[np.ndarray] = None
+    #: one calibration per reading context: the zero and unit of z scores, a threshold, neutral texts
+    calibrations: List[Calibration] = field(default_factory=list)
+    #: the unit of ``unit="sd"``: the eval items' pooled within-pole SD on the steering direction
+    steer_sd: Optional[float] = None
+    #: the unit of ``unit="resid_norm"``: the mean residual norm per layer of the training texts
+    resid_norm: Optional[np.ndarray] = None
+    #: the model the directions belong to (see :func:`concept_probe.modeling.identity_of`)
+    identity: Optional[Dict[str, Any]] = None
+    #: the estimators the reading and steering directions came from
+    estimator: Optional[Dict[str, Any]] = None
+    steer_estimator: Optional[Dict[str, Any]] = None
+    #: Cohen's d and its p per layer on the primary eval set (all its items)
+    d_by_layer: Optional[np.ndarray] = None
+    p_by_layer: Optional[np.ndarray] = None
+    #: the evaluation made when the probe was fitted (in memory), and its numbers (also saved)
+    evaluation: Optional[ReadingEvaluation] = None
+    metrics: Dict[str, Any] = field(default_factory=dict)
+    #: every choice made on the caller's behalf
+    choices: List[Choice] = field(default_factory=list)
+    model_bundle: Optional[ModelBundle] = None
+    out_dir: Optional[str] = None
+    #: where a probe without a folder creates one when it first saves (None: the session's output_root)
+    output_root: Optional[str] = None
 
-        config_path = os.path.join(self.run_dir, "config.json")
-        concept_path = os.path.join(self.run_dir, "concept.json")
-        json_dump(config_path, self.config)
-        json_dump(concept_path, self.concept.to_dict())
+    # ------------------------------------------------------------------ building
+    @classmethod
+    def fit(
+        cls,
+        pos: Any,
+        neg: Any,
+        *,
+        eval_sets: Union[None, EvalSet, Sequence[EvalSet]] = None,
+        layer: Optional[int] = None,
+        estimator: Any = "mean_diff",
+        steer_estimator: Any = "mean_diff",
+        search_layers: Optional[Sequence[int]] = None,
+        select_layer_by: str = "effect_size",
+        selection_split: Any = 0.5,
+        n_random: int = 50,
+        n_bootstrap: int = 1000,
+        n_permutations: int = 1000,
+        n_label_shuffles: Union[int, str] = "auto",
+        neutral: Any = None,
+        zero: str = "midpoint",
+        erase: Any = None,
+        threshold_l2: float = 1e-2,
+        seed: int = 0,
+        score_layers: Optional[Sequence[int]] = None,
+        score_aggregate: str = "mean",
+        name: str = "concept",
+        pos_label: str = "positive",
+        neg_label: str = "negative",
+        model: Any = None,
+        tokenizer: Any = None,
+        identity: Optional[Union[Dict[str, Any], str]] = None,
+        allow_model_mismatch: bool = False,
+        output_root: Optional[str] = None,
+        run_name: Optional[str] = None,
+        save: Optional[bool] = None,
+        overwrite: bool = False,
+        plots: bool = True,
+    ) -> "ConceptProbe":
+        """Train a probe from representations already read: ``(items, layers, dim)`` of each pole
+        (arrays, or what :func:`concept_probe.read_texts` returns, which says which model they come
+        from and how they were read).
 
-        self.logger.log("config", {"config": self.config, "concept": self.concept.to_dict()})
+        ``estimator`` and ``steer_estimator`` set the reading and steering directions (see
+        :mod:`concept_probe.directions`; ``steer_estimator="read"`` steers with the reading direction).
+        ``erase`` (an :class:`~concept_probe.directions.Eraser`) fits both without a confound.
 
-        readout = self.config["readout"]
-        train_cfg = self.config["training"]
-        eval_cfg = self.config["evaluation"]
-        out_cfg = self.config["output"]
-        plot_cfg = self.config["plots"]
-        prompts_cfg = self.config["prompts"]
-        train_prompt_mode = train_cfg.get("train_prompt_mode", "shared")
-        train_prompts = list(prompts_cfg.get("train_questions", []))
-        train_prompts_pos = list(prompts_cfg.get("train_questions_pos", []))
-        train_prompts_neg = list(prompts_cfg.get("train_questions_neg", []))
-        direction_normalization = str(train_cfg.get("direction_normalization", "none"))
-        if direction_normalization not in DIRECTION_NORMALIZATIONS:
-            raise ValueError(
-                f"training.direction_normalization must be one of {DIRECTION_NORMALIZATIONS}; "
-                f"got {direction_normalization!r}"
-            )
-        text_role = str(train_cfg.get("train_text_role", "user"))
-        if text_role not in TEXT_ROLES:
-            raise ValueError(f"training.train_text_role must be one of {TEXT_ROLES}; got {text_role!r}")
-        text_prompt = train_cfg.get("train_text_prompt")
-        if text_role != "user" and not str(readout["read_mode"]).startswith("assistant_"):
-            self._warn(
-                f"train_text_role={text_role} with read_mode={readout['read_mode']}: the readout pools over "
-                "the prompt, template or BOS tokens too; use an assistant_* read_mode to pool over the text only."
-            )
+        With ``eval_sets`` (an :class:`~concept_probe.evaluation.EvalSet`, or several: the first is the
+        primary), the probe is evaluated as :func:`concept_probe.evaluate_reading` does: the layer is
+        chosen on a ``selection_split`` part of the primary set (a fraction, or the items that choose
+        it; see there) within ``search_layers``, its numbers come from the rest, every other set is
+        measured there, with random-direction nulls (``n_random``), bootstrap intervals and a
+        permutation p; ``n_label_shuffles`` refits with shuffled labels (``"auto"``: 10 for the
+        difference of means, which is quick, else 0; announced). Each set's scores calibrate the
+        probe for items read like it (the primary one with a threshold; ``zero="baseline"`` puts the
+        zero at the second pole's mean, for a concept read against a baseline). ``neutral``, texts
+        without the concept read like the primary set, are placed on its calibration (reported, not
+        used as the zero). Without ``eval_sets``, give the ``layer``.
 
-        tokenizer = self.model_bundle.tokenizer
-        model = self.model_bundle.model
-        num_layers = self.model_bundle.num_layers
+        The probe belongs to the model the representations came from: the one ``read_texts``
+        recorded, ``model`` (loaded, then attached; another one raises unless
+        ``allow_model_mismatch``), or ``identity`` (a dict, or a model id). The residual norms the
+        representations carry are the unit of ``unit="resid_norm"``. The probe saves to
+        ``<root>/<name>/<run_name or time>`` unless ``save=False`` (or the session does not save),
+        with the plots of its evaluation unless ``plots=False``.
+        """
+        P, N = _as_array(pos), _as_array(neg)
+        sets = [] if eval_sets is None else ([eval_sets] if isinstance(eval_sets, EvalSet) else list(eval_sets))
+        if layer is None and not sets:
+            raise ValueError("Pass eval_sets= (eval sets, to choose the layer on items that did not train) or layer=.")
+        probe = cls._new(name, pos_label, neg_label, model, tokenizer, identity, getattr(pos, "identity", None),
+                         output_root, allow_model_mismatch)
+        choices: List[Choice] = []
+        flips: List[int] = []
+        est = make_estimator(estimator)
+        read = fit_directions(est, P, N, erase=erase, flips=flips)
+        probe.estimator = estimator_spec(est)
+        _record_estimator_notes(probe, est, flips, choices)
+        steer_dirs, steer_spec, choice = steer_directions_for(est, steer_estimator, P, N, read, erase=erase)
+        if choice is not None:
+            choices.append(choice)
+        probe.directions, probe.steer_directions = read, steer_dirs
+        probe.steer_estimator = steer_spec
+        if erase is not None:
+            probe.estimator = dict(probe.estimator, erased=erase.to_dict())
+            probe.steer_estimator = dict(probe.steer_estimator, erased=erase.to_dict())
+        num_layers = read.shape[0]
+        norms = [getattr(r, "norms", None) for r in (pos, neg)]
+        if all(n is not None for n in norms):
+            probe.resid_norm = np.concatenate(norms, axis=0).mean(axis=0)
 
-        self._status(f"Training concept '{self.concept.name}' with model {self.model_bundle.model_id}")
-        if train_prompt_mode in ("shared", "opposed") and self.concept.pos_system == self.concept.neg_system:
-            self._warn(
-                "pos_system == neg_system; contrastive training will compare identical conditions "
-                "and the learned direction will be noise."
-            )
-        phase1_action = "Reading training texts" if train_prompt_mode == "texts" else "Generating training completions"
-        self._status(f"[Phase 1/4] {phase1_action} ({train_prompt_mode})")
-        train_pos_ids, train_neg_ids = [], []
-        train_pos_plens, train_neg_plens = [], []
-
-        if train_prompt_mode == "shared":
-            total_train = len(train_prompts)
-            progress_every = max(1, total_train // 5) if total_train else 1
-            if not train_prompts:
-                raise ValueError("prompts.train_questions is empty; provide training prompts.")
-            if train_prompts_pos or train_prompts_neg:
-                self._warn(
-                    "train_prompt_mode=shared; ignoring prompts.train_questions_pos/train_questions_neg."
-                )
-            gen_bs = int(train_cfg.get("gen_batch_size", 16))
-            pos_results = generate_batch(
-                model,
-                tokenizer,
-                self.concept.pos_system,
-                train_prompts,
-                train_cfg["train_max_new_tokens"],
-                train_cfg["train_greedy"],
-                temperature=train_cfg.get("train_temperature", 0.7),
-                top_p=train_cfg.get("train_top_p", 0.9),
-                batch_size=gen_bs,
-                warn=self._warn,
-                warn_prefix="train_questions (pos_system)",
-            )
-            neg_results = generate_batch(
-                model,
-                tokenizer,
-                self.concept.neg_system,
-                train_prompts,
-                train_cfg["train_max_new_tokens"],
-                train_cfg["train_greedy"],
-                temperature=train_cfg.get("train_temperature", 0.7),
-                top_p=train_cfg.get("train_top_p", 0.9),
-                batch_size=gen_bs,
-                warn=self._warn,
-                warn_prefix="train_questions (neg_system)",
-            )
-            for i, q in enumerate(train_prompts):
-                ids_pos, plen_pos = pos_results[i]
-                ids_neg, plen_neg = neg_results[i]
-                train_pos_ids.append(ids_pos)
-                train_neg_ids.append(ids_neg)
-                train_pos_plens.append(plen_pos)
-                train_neg_plens.append(plen_neg)
-
-                pos_completion = tokenizer.decode(ids_pos[plen_pos:], skip_special_tokens=True)
-                neg_completion = tokenizer.decode(ids_neg[plen_neg:], skip_special_tokens=True)
-                self.logger.log(
-                    "train_gen",
-                    {
-                        "i": i,
-                        "question": q,
-                        "pos_label": self.concept.pos_label,
-                        "neg_label": self.concept.neg_label,
-                        "pos_system": self.concept.pos_system,
-                        "neg_system": self.concept.neg_system,
-                        "pos_text": tokenizer.decode(ids_pos, skip_special_tokens=False),
-                        "neg_text": tokenizer.decode(ids_neg, skip_special_tokens=False),
-                        "pos_completion": pos_completion,
-                        "neg_completion": neg_completion,
-                    },
-                )
-                if total_train and ((i + 1) % progress_every == 0 or (i + 1) == total_train):
-                    self._status(f"Generated training completions {i + 1}/{total_train}")
-        elif train_prompt_mode == "opposed":
-            if train_prompts:
-                self._warn("train_prompt_mode=opposed; ignoring prompts.train_questions.")
-            if not train_prompts_pos or not train_prompts_neg:
-                raise ValueError(
-                    "train_prompt_mode=opposed requires prompts.train_questions_pos and prompts.train_questions_neg."
-                )
-            total_pos = len(train_prompts_pos)
-            progress_every_pos = max(1, total_pos // 5) if total_pos else 1
-            for i, q in enumerate(train_prompts_pos):
-                ids_pos, plen_pos = generate_once(
-                    model,
-                    tokenizer,
-                    self.concept.pos_system,
-                    q,
-                    train_cfg["train_max_new_tokens"],
-                    train_cfg["train_greedy"],
-                    temperature=train_cfg.get("train_temperature", 0.7),
-                    top_p=train_cfg.get("train_top_p", 0.9),
-                    warn=self._warn,
-                    warn_prefix=f"train_questions_pos[{i}] (pos_system)",
-                )
-                train_pos_ids.append(ids_pos)
-                train_pos_plens.append(plen_pos)
-                pos_completion = tokenizer.decode(ids_pos[plen_pos:], skip_special_tokens=True)
-                self.logger.log(
-                    "train_gen_pos",
-                    {
-                        "i": i,
-                        "question": q,
-                        "label": self.concept.pos_label,
-                        "system": self.concept.pos_system,
-                        "text": tokenizer.decode(ids_pos, skip_special_tokens=False),
-                        "completion": pos_completion,
-                    },
-                )
-                if total_pos and ((i + 1) % progress_every_pos == 0 or (i + 1) == total_pos):
-                    self._status(f"Generated pos training completions {i + 1}/{total_pos}")
-
-            total_neg = len(train_prompts_neg)
-            progress_every_neg = max(1, total_neg // 5) if total_neg else 1
-            for i, q in enumerate(train_prompts_neg):
-                ids_neg, plen_neg = generate_once(
-                    model,
-                    tokenizer,
-                    self.concept.neg_system,
-                    q,
-                    train_cfg["train_max_new_tokens"],
-                    train_cfg["train_greedy"],
-                    temperature=train_cfg.get("train_temperature", 0.7),
-                    top_p=train_cfg.get("train_top_p", 0.9),
-                    warn=self._warn,
-                    warn_prefix=f"train_questions_neg[{i}] (neg_system)",
-                )
-                train_neg_ids.append(ids_neg)
-                train_neg_plens.append(plen_neg)
-                neg_completion = tokenizer.decode(ids_neg[plen_neg:], skip_special_tokens=True)
-                self.logger.log(
-                    "train_gen_neg",
-                    {
-                        "i": i,
-                        "question": q,
-                        "label": self.concept.neg_label,
-                        "system": self.concept.neg_system,
-                        "text": tokenizer.decode(ids_neg, skip_special_tokens=False),
-                        "completion": neg_completion,
-                    },
-                )
-                if total_neg and ((i + 1) % progress_every_neg == 0 or (i + 1) == total_neg):
-                    self._status(f"Generated neg training completions {i + 1}/{total_neg}")
-        elif train_prompt_mode == "texts":
-            if train_prompts:
-                self._warn("train_prompt_mode=texts; ignoring prompts.train_questions.")
-            if train_prompts_pos or train_prompts_neg:
-                self._warn(
-                    "train_prompt_mode=texts; ignoring prompts.train_questions_pos/train_questions_neg."
-                )
-            train_pos_texts = list(self.concept.train_pos_texts)
-            train_neg_texts = list(self.concept.train_neg_texts)
-            if not train_pos_texts or not train_neg_texts:
-                raise ValueError(
-                    "train_prompt_mode=texts requires concept.train_pos_texts and concept.train_neg_texts."
-                )
-            train_text_system = train_cfg.get("train_text_system")
-            if train_text_system is None:
-                train_text_system = prompts_cfg.get("neutral_system", "")
-
-            total_pos = len(train_pos_texts)
-            progress_every_pos = max(1, total_pos // 5) if total_pos else 1
-            for i, s in enumerate(train_pos_texts):
-                input_ids, plen = _encode_text_for_read(
-                    tokenizer,
-                    s,
-                    train_text_system,
-                    role=text_role,
-                    prompt=text_prompt,
-                    warn=self._warn,
-                    warn_prefix=f"train_pos_texts[{i}]",
-                )
-                ids_1d = input_ids[0].detach().cpu()
-                train_pos_ids.append(ids_1d)
-                train_pos_plens.append(int(ids_1d.shape[-1]) if plen is None else plen)
-                self.logger.log(
-                    "train_read_pos",
-                    {
-                        "i": i,
-                        "label": self.concept.pos_label,
-                        "system": train_text_system,
-                        "text": tokenizer.decode(ids_1d, skip_special_tokens=False),
-                    },
-                )
-                if total_pos and ((i + 1) % progress_every_pos == 0 or (i + 1) == total_pos):
-                    self._status(f"Read pos training texts {i + 1}/{total_pos}")
-
-            total_neg = len(train_neg_texts)
-            progress_every_neg = max(1, total_neg // 5) if total_neg else 1
-            for i, s in enumerate(train_neg_texts):
-                input_ids, plen = _encode_text_for_read(
-                    tokenizer,
-                    s,
-                    train_text_system,
-                    role=text_role,
-                    prompt=text_prompt,
-                    warn=self._warn,
-                    warn_prefix=f"train_neg_texts[{i}]",
-                )
-                ids_1d = input_ids[0].detach().cpu()
-                train_neg_ids.append(ids_1d)
-                train_neg_plens.append(int(ids_1d.shape[-1]) if plen is None else plen)
-                self.logger.log(
-                    "train_read_neg",
-                    {
-                        "i": i,
-                        "label": self.concept.neg_label,
-                        "system": train_text_system,
-                        "text": tokenizer.decode(ids_1d, skip_special_tokens=False),
-                    },
-                )
-                if total_neg and ((i + 1) % progress_every_neg == 0 or (i + 1) == total_neg):
-                    self._status(f"Read neg training texts {i + 1}/{total_neg}")
+        if sets:
+            ev = evaluate_reading(read, sets, layer=layer, selection_split=selection_split, search_layers=search_layers,
+                                  select_layer_by=select_layer_by, n_random=int(n_random), n_bootstrap=int(n_bootstrap),
+                                  n_permutations=int(n_permutations), threshold_l2=threshold_l2, seed=seed)
+            probe.layer = int(ev.layer)
+            probe.evaluation = ev
+            main = ev.main
+            probe.d_by_layer, probe.p_by_layer = main.d_by_layer, main.p_by_layer
+            primary = sets[0]
+            for s in sets:
+                result = ev.sets.get(s.name)
+                context = s.context or ReadContext()
+                if result is None or any(c.context.matches(context) for c in probe.calibrations):
+                    continue
+                tokens = _token_projections(s, read)
+                cal = Calibration._from_scores(result.pos_scores, result.neg_scores, context, pos_tokens=tokens[0],
+                                              neg_tokens=tokens[1], zero=zero,
+                                              source="evaluation" if s is primary else s.name)
+                if s is primary:
+                    cal.threshold = ev.threshold
+                probe.calibrations.append(cal)
+            n_shuffles = n_label_shuffles
+            if n_shuffles == "auto":
+                n_shuffles = 10 if probe.estimator.get("kind") == "mean_diff" else 0
+                choices.append(Choice("n_label_shuffles", "auto", n_shuffles,
+                                      "refitting the difference of means is quick, so ten shuffles run" if n_shuffles else
+                                      f"refitting a {probe.estimator.get('kind')} direction for every shuffle is slow; "
+                                      "pass n_label_shuffles to run them"))
+            shuffle = None
+            if int(n_shuffles) > 0:
+                rp, rn = ev.report_idx
+                shuffle = label_shuffle_control(est, P, N, primary.pos[rp], primary.neg[rn], probe.layer,
+                                                int(n_shuffles), seed=seed)
+            neutral_report = None
+            if neutral is not None:
+                cal = probe.calibrations[0]
+                scores = np.einsum("nld,ld->nl", _as_array(neutral).astype(np.float64), read.astype(np.float64))
+                cal._add_neutral(scores)
+                z = cal._items_z(scores[:, [probe.layer]], [probe.layer])
+                neutral_report = {"n": int(len(scores)), "mean_score": float(scores[:, probe.layer].mean()),
+                                  "z": None if z is None else float(z.mean()),
+                                  "z_sd": None if z is None or len(z) < 2 else float(z.std(ddof=1))}
+            probe.metrics = _metrics(ev, shuffle, neutral_report, len(P), len(N))
+            for message in ev.warnings:
+                _warn(message)
         else:
-            raise ValueError(f"Unknown train_prompt_mode: {train_prompt_mode}")
-
-        train_readout_mode = readout["read_mode"] if train_prompt_mode == "texts" else readout["train_mode"]
-        train_readout_last_k = readout["read_last_k"] if train_prompt_mode == "texts" else readout["train_last_k"]
-
-        self._status("[Phase 2/4] Forward passes for training reps")
-        reps_pos = np.stack(
-            [
-                reps_from_hs_layers(
-                    forward_hidden_states_all_layers(model, train_pos_ids[i].unsqueeze(0)),
-                    prompt_len=train_pos_plens[i],
-                    mode=train_readout_mode,
-                    last_k=train_readout_last_k,
-                    warn=None if (train_prompt_mode == "texts" and text_role == "user") else self._warn,
-                )
-                for i in range(len(train_pos_ids))
-            ],
-            axis=0,
-        ).astype(np.float32)
-
-        reps_neg = np.stack(
-            [
-                reps_from_hs_layers(
-                    forward_hidden_states_all_layers(model, train_neg_ids[i].unsqueeze(0)),
-                    prompt_len=train_neg_plens[i],
-                    mode=train_readout_mode,
-                    last_k=train_readout_last_k,
-                    warn=None if (train_prompt_mode == "texts" and text_role == "user") else self._warn,
-                )
-                for i in range(len(train_neg_ids))
-            ],
-            axis=0,
-        ).astype(np.float32)
-
-        num_layers_check = reps_pos.shape[1]
-        if num_layers_check != num_layers:
-            raise ValueError("Layer count mismatch between model and reps.")
-
-        concept_vectors = np.zeros((num_layers, reps_pos.shape[2]), dtype=np.float32)
-        for l in range(num_layers):
-            concept_vectors[l] = concept_direction(reps_pos[:, l, :], reps_neg[:, l, :], direction_normalization)
-
-        eval_pos_scores_mat = np.zeros((0, num_layers), dtype=np.float32)
-        eval_neg_scores_mat = np.zeros((0, num_layers), dtype=np.float32)
-        sweep_d = np.zeros((num_layers,), dtype=np.float32)
-        sweep_p = np.full((num_layers,), np.nan, dtype=np.float32)
-        eval_pos_mean = np.zeros((num_layers,), dtype=np.float32)
-        eval_neg_mean = np.zeros((num_layers,), dtype=np.float32)
-        eval_pos_std = np.zeros((num_layers,), dtype=np.float32)
-        eval_neg_std = np.zeros((num_layers,), dtype=np.float32)
-
-        eval_prompts = list(self.config["prompts"]["eval_questions"])
-        did_eval = False
-        n_eval_pos = 0
-        n_eval_neg = 0
-        eval_mode = eval_cfg.get("eval_mode", "auto")
-        if eval_cfg.get("do_eval", True):
-            if eval_mode == "auto":
-                if len(self.concept.eval_pos_texts) > 0 and len(self.concept.eval_neg_texts) > 0:
-                    eval_mode = "read"
-                elif train_prompt_mode == "texts":
-                    self._warn(
-                        "eval_mode=auto with train_prompt_mode=texts but no eval_pos_texts/"
-                        "eval_neg_texts; skipping evaluation (generate-mode eval would contrast "
-                        "pos_system vs neg_system, which texts-mode concepts typically leave identical)."
-                    )
-                    eval_mode = "skip"
-                else:
-                    eval_mode = "generate"
-
-            if eval_mode == "generate" and self.concept.pos_system == self.concept.neg_system:
-                self._warn(
-                    "pos_system == neg_system; generate-mode eval contrasts identical conditions, "
-                    "so the layer sweep cannot separate the concept."
-                )
-
-            if eval_mode == "read":
-                eval_pos_texts = list(self.concept.eval_pos_texts)
-                eval_neg_texts = list(self.concept.eval_neg_texts)
-                eval_system = eval_cfg.get("eval_system", self.config["prompts"]["neutral_system"])
-                if len(eval_pos_texts) > 0 and len(eval_neg_texts) > 0:
-                    self._status("[Phase 3/4] Reading eval texts")
-                    eval_pos_reps_list: List[np.ndarray] = []
-                    total_eval_pos = len(eval_pos_texts)
-                    progress_every_pos = max(1, total_eval_pos // 5) if total_eval_pos else 1
-                    for i, s in enumerate(eval_pos_texts):
-                        input_ids, plen = _encode_text_for_read(
-                            tokenizer,
-                            s,
-                            eval_system,
-                            role=text_role,
-                            prompt=text_prompt,
-                            warn=self._warn,
-                            warn_prefix=f"eval_pos_texts[{i}]",
-                        )
-                        eval_pos_reps_list.append(
-                            reps_from_hs_layers(
-                                forward_hidden_states_all_layers(model, input_ids),
-                                prompt_len=plen,
-                                mode=readout["read_mode"],
-                                last_k=readout["read_last_k"],
-                            )
-                        )
-                        if total_eval_pos and ((i + 1) % progress_every_pos == 0 or (i + 1) == total_eval_pos):
-                            self._status(f"Read eval pos text {i + 1}/{total_eval_pos}")
-                    eval_pos_reps = np.stack(eval_pos_reps_list, axis=0).astype(np.float32)
-
-                    eval_neg_reps_list: List[np.ndarray] = []
-                    total_eval_neg = len(eval_neg_texts)
-                    progress_every_neg = max(1, total_eval_neg // 5) if total_eval_neg else 1
-                    for i, s in enumerate(eval_neg_texts):
-                        input_ids, plen = _encode_text_for_read(
-                            tokenizer,
-                            s,
-                            eval_system,
-                            role=text_role,
-                            prompt=text_prompt,
-                            warn=self._warn,
-                            warn_prefix=f"eval_neg_texts[{i}]",
-                        )
-                        eval_neg_reps_list.append(
-                            reps_from_hs_layers(
-                                forward_hidden_states_all_layers(model, input_ids),
-                                prompt_len=plen,
-                                mode=readout["read_mode"],
-                                last_k=readout["read_last_k"],
-                            )
-                        )
-                        if total_eval_neg and ((i + 1) % progress_every_neg == 0 or (i + 1) == total_eval_neg):
-                            self._status(f"Read eval neg text {i + 1}/{total_eval_neg}")
-                    eval_neg_reps = np.stack(eval_neg_reps_list, axis=0).astype(np.float32)
-
-                    eval_pos_scores_mat = np.zeros((eval_pos_reps.shape[0], num_layers), dtype=np.float32)
-                    eval_neg_scores_mat = np.zeros((eval_neg_reps.shape[0], num_layers), dtype=np.float32)
-
-                    for l in range(num_layers):
-                        v = concept_vectors[l]
-                        pos_scores = eval_pos_reps[:, l, :] @ v
-                        neg_scores = eval_neg_reps[:, l, :] @ v
-                        eval_pos_scores_mat[:, l] = pos_scores
-                        eval_neg_scores_mat[:, l] = neg_scores
-                        eval_pos_mean[l] = pos_scores.mean()
-                        eval_neg_mean[l] = neg_scores.mean()
-                        eval_pos_std[l] = pos_scores.std(ddof=1)
-                        eval_neg_std[l] = neg_scores.std(ddof=1)
-                        sweep_d[l] = cohen_d_np(pos_scores, neg_scores)
-                        if ttest_ind is not None:
-                            _, p = ttest_ind(pos_scores, neg_scores, equal_var=False)
-                            sweep_p[l] = float(p)
-                    did_eval = True
-                    n_eval_pos = len(eval_pos_texts)
-                    n_eval_neg = len(eval_neg_texts)
-                else:
-                    self._warn("eval_mode=read but eval_pos_texts/eval_neg_texts are empty.")
-            elif eval_mode == "generate":
-                if len(eval_prompts) > 0:
-                    self._status("[Phase 3/4] Generating eval completions")
-                    eval_pos_ids, eval_neg_ids = [], []
-                    eval_pos_plens, eval_neg_plens = [], []
-                    total_eval = len(eval_prompts)
-                    progress_every = max(1, total_eval // 5) if total_eval else 1
-
-                    gen_bs = int(eval_cfg.get("gen_batch_size", train_cfg.get("gen_batch_size", 16)))
-                    pos_results = generate_batch(
-                        model,
-                        tokenizer,
-                        self.concept.pos_system,
-                        eval_prompts,
-                        eval_cfg["eval_max_new_tokens"],
-                        eval_cfg["eval_greedy"],
-                        temperature=eval_cfg.get("eval_temperature", 0.7),
-                        top_p=eval_cfg.get("eval_top_p", 0.9),
-                        batch_size=gen_bs,
-                        warn=self._warn,
-                        warn_prefix="eval_questions (pos_system)",
-                    )
-                    neg_results = generate_batch(
-                        model,
-                        tokenizer,
-                        self.concept.neg_system,
-                        eval_prompts,
-                        eval_cfg["eval_max_new_tokens"],
-                        eval_cfg["eval_greedy"],
-                        temperature=eval_cfg.get("eval_temperature", 0.7),
-                        top_p=eval_cfg.get("eval_top_p", 0.9),
-                        batch_size=gen_bs,
-                        warn=self._warn,
-                        warn_prefix="eval_questions (neg_system)",
-                    )
-                    for i, q in enumerate(eval_prompts):
-                        ids_pos, plen_pos = pos_results[i]
-                        ids_neg, plen_neg = neg_results[i]
-                        eval_pos_ids.append(ids_pos)
-                        eval_neg_ids.append(ids_neg)
-                        eval_pos_plens.append(plen_pos)
-                        eval_neg_plens.append(plen_neg)
-
-                        self.logger.log(
-                            "eval_gen",
-                            {
-                                "i": i,
-                                "question": q,
-                                "pos_text": tokenizer.decode(ids_pos, skip_special_tokens=False),
-                                "neg_text": tokenizer.decode(ids_neg, skip_special_tokens=False),
-                                "pos_completion": tokenizer.decode(ids_pos[plen_pos:], skip_special_tokens=True),
-                                "neg_completion": tokenizer.decode(ids_neg[plen_neg:], skip_special_tokens=True),
-                            },
-                        )
-                        if total_eval and ((i + 1) % progress_every == 0 or (i + 1) == total_eval):
-                            self._status(f"Generated eval completions {i + 1}/{total_eval}")
-
-                    eval_pos_reps = np.stack(
-                        [
-                            reps_from_hs_layers(
-                                forward_hidden_states_all_layers(model, eval_pos_ids[i].unsqueeze(0)),
-                                prompt_len=eval_pos_plens[i],
-                                mode=readout["train_mode"],
-                                last_k=readout["train_last_k"],
-                                warn=self._warn,
-                            )
-                            for i in range(len(eval_prompts))
-                        ],
-                        axis=0,
-                    ).astype(np.float32)
-
-                    eval_neg_reps = np.stack(
-                        [
-                            reps_from_hs_layers(
-                                forward_hidden_states_all_layers(model, eval_neg_ids[i].unsqueeze(0)),
-                                prompt_len=eval_neg_plens[i],
-                                mode=readout["train_mode"],
-                                last_k=readout["train_last_k"],
-                                warn=self._warn,
-                            )
-                            for i in range(len(eval_prompts))
-                        ],
-                        axis=0,
-                    ).astype(np.float32)
-
-                    eval_pos_scores_mat = np.zeros((eval_pos_reps.shape[0], num_layers), dtype=np.float32)
-                    eval_neg_scores_mat = np.zeros((eval_neg_reps.shape[0], num_layers), dtype=np.float32)
-
-                    for l in range(num_layers):
-                        v = concept_vectors[l]
-                        pos_scores = eval_pos_reps[:, l, :] @ v
-                        neg_scores = eval_neg_reps[:, l, :] @ v
-                        eval_pos_scores_mat[:, l] = pos_scores
-                        eval_neg_scores_mat[:, l] = neg_scores
-                        eval_pos_mean[l] = pos_scores.mean()
-                        eval_neg_mean[l] = neg_scores.mean()
-                        eval_pos_std[l] = pos_scores.std(ddof=1)
-                        eval_neg_std[l] = neg_scores.std(ddof=1)
-                        sweep_d[l] = cohen_d_np(pos_scores, neg_scores)
-                        if ttest_ind is not None:
-                            _, p = ttest_ind(pos_scores, neg_scores, equal_var=False)
-                            sweep_p[l] = float(p)
-                    did_eval = True
-                    n_eval_pos = len(eval_prompts)
-                    n_eval_neg = len(eval_prompts)
-            elif eval_mode != "skip":
-                raise ValueError(f"Unknown evaluation.eval_mode: {eval_mode!r} (use 'auto', 'read', or 'generate').")
-
-        if not did_eval:
-            reason = "evaluation disabled"
-            if eval_cfg.get("do_eval", True):
-                if eval_mode == "read":
-                    reason = "missing eval_pos_texts/eval_neg_texts"
-                elif eval_mode == "skip":
-                    reason = "no eval texts provided for texts-mode concept"
-                elif len(eval_prompts) == 0:
-                    reason = "empty eval_questions"
-            self._warn(reason)
-            self.logger.log("eval_skipped", {"reason": reason})
-
-        search_intervals = None
-        search_layers = None
-        search_default = None
-        search_intervals_plot = None
-        if train_cfg["do_layer_sweep"] and did_eval:
-            search_info = _normalize_best_layer_search(train_cfg.get("best_layer_search"), num_layers)
-            search_intervals = search_info["intervals"]
-            search_layers = search_info["layers"]
-            search_default = search_info["is_default"]
-            if not search_default:
-                search_intervals_plot = search_intervals
-            allowed_mask = np.zeros((num_layers,), dtype=bool)
-            allowed_mask[search_layers] = True
-            if train_cfg["sweep_select"] == "effect_size":
-                masked = np.where(allowed_mask & np.isfinite(sweep_d), sweep_d, -np.inf)
-                best_layer = int(np.argmax(masked))
-                if not np.isfinite(masked[best_layer]):
-                    raise ValueError(
-                        "No finite Cohen's d in the best_layer_search range. This typically means "
-                        "fewer than 2 eval samples per side; add eval data or disable the layer sweep."
-                    )
+            probe.layer = resolve_layer_index(layer, num_layers, "layer")
+        probe.score_layers = None if score_layers is None else _layer_list(list(score_layers), num_layers, "score_layers")
+        if score_aggregate not in ("mean", "sum"):
+            raise ValueError(f"score_aggregate must be 'mean' or 'sum'; got {score_aggregate!r}")
+        probe.score_aggregate = score_aggregate
+        if probe.calibrations:
+            primary_set = sets[0]
+            if steer_dirs is not read:
+                sp = np.einsum("nd,d->n", primary_set.pos[:, probe.layer].astype(np.float64), steer_dirs[probe.layer])
+                sn = np.einsum("nd,d->n", primary_set.neg[:, probe.layer].astype(np.float64), steer_dirs[probe.layer])
+                probe.steer_sd = float(_pooled_sd_columns(sp[:, None], sn[:, None])[0])
             else:
-                masked = np.where(allowed_mask, sweep_p, np.nan)
-                if np.all(np.isnan(masked)):
-                    raise ValueError(
-                        "All sweep p-values are NaN for the selected best_layer_search. "
-                        "Install scipy or use sweep_select='effect_size'."
-                    )
-                best_layer = int(np.nanargmin(masked))
-            self._warn(
-                f"best_layer was selected by optimizing over {len(search_layers)} layers on the eval "
-                "set; best_d/best_p at that layer are selection diagnostics (no multiple-comparison "
-                "correction), not confirmatory statistics. Confirm on held-out data before reporting."
-            )
+                probe.steer_sd = float(probe.calibrations[0].scale[probe.layer])
+            if not np.isfinite(probe.steer_sd):
+                probe.steer_sd = None
+        probe.choices = choices
+        announce(choices)
+        probe._save_new(run_name, save, overwrite, "fit", plots=plots)
+        return probe
+
+    @classmethod
+    def from_directions(
+        cls,
+        directions: np.ndarray,
+        layer: int,
+        *,
+        steer_directions: Optional[np.ndarray] = None,
+        name: str = "concept",
+        pos_label: str = "positive",
+        neg_label: str = "negative",
+        model: Any = None,
+        tokenizer: Any = None,
+        identity: Optional[Union[Dict[str, Any], str]] = None,
+        allow_model_mismatch: bool = False,
+        output_root: Optional[str] = None,
+        run_name: Optional[str] = None,
+        save: Optional[bool] = None,
+        overwrite: bool = False,
+    ) -> "ConceptProbe":
+        """A probe from directions computed elsewhere, ``(layers, dim)``. It reads with them scaled to
+        unit length per layer (announced when they were not), and steers with ``steer_directions``,
+        or with the directions as given. Calibrate it with :meth:`calibrate` to get z scores. The
+        model and saving work as in :meth:`fit`."""
+        probe = cls._new(name, pos_label, neg_label, model, tokenizer, identity, None, output_root, allow_model_mismatch)
+        v = np.asarray(directions, dtype=np.float64)
+        if v.ndim != 2:
+            raise ValueError(f"directions must be (layers, dim); got shape {v.shape}")
+        lengths = np.linalg.norm(v, axis=1)
+        probe.directions = (v / np.clip(lengths, 1e-12, None)[:, None]).astype(np.float32)
+        if not np.allclose(lengths, 1.0, atol=1e-6):
+            probe.choices.append(Choice("reading directions", "as given", "scaled to unit length",
+                                        "a probe reads with unit directions, so its scores are projections; steering "
+                                        "uses the directions as given"))
+        probe.steer_directions = (np.asarray(directions, np.float32) if steer_directions is None
+                                  else np.asarray(steer_directions, np.float32))
+        probe.layer = resolve_layer_index(layer, v.shape[0], "layer")
+        probe.estimator = {"kind": "given"}
+        probe.steer_estimator = {"kind": "given"}
+        announce(probe.choices)
+        probe._save_new(run_name, save, overwrite, "from_directions", plots=False)
+        return probe
+
+    @classmethod
+    def from_texts(
+        cls,
+        model: Any,
+        pos: Sequence[PromptLike],
+        neg: Sequence[PromptLike],
+        eval_pos: Sequence[PromptLike],
+        eval_neg: Sequence[PromptLike],
+        *,
+        paired: bool = False,
+        readout: Union[str, Readout] = "text_mean",
+        role: str = "raw",
+        system: Optional[str] = None,
+        prompt: Optional[str] = None,
+        tokenizer: Any = None,
+        batch_size: int = 16,
+        **fit_options: Any,
+    ) -> "ConceptProbe":
+        """Read texts of each pole and fit a probe on them, evaluated on other texts: :func:`read_texts`,
+        an :class:`~concept_probe.EvalSet` and :meth:`fit` in one call.
+
+        ``model`` is a :class:`ModelBundle` (or a loaded model, with its ``tokenizer``). ``pos`` and
+        ``neg`` train the probe; ``eval_pos`` and ``eval_neg`` are the eval set ``"eval"``, which
+        chooses the layer on half of its items and measures it on the rest (``paired=True`` when
+        ``eval_pos[i]`` and ``eval_neg[i]`` are a minimal pair). Every text is read the same way
+        (``readout``, ``role``, ``system``, ``prompt``: see :func:`read_texts`). ``fit_options`` go to
+        :meth:`fit` (``name``, ``pos_label``, ``estimator``, ``layer``, ``save``, ...). For other eval
+        sets or readings, call those steps yourself: this is only them in a row.
+        """
+        from .reading import read_texts
+
+        bundle = model if isinstance(model, ModelBundle) else ModelBundle.from_loaded(model, tokenizer)
+
+        def read(texts: Sequence[PromptLike]) -> Any:
+            return read_texts(bundle.model, bundle.tokenizer, list(texts), readout, role=role, system=system,
+                              prompt=prompt, batch_size=batch_size)
+
+        eval_set = EvalSet("eval", read(eval_pos), read(eval_neg), paired=paired)
+        return cls.fit(read(pos), read(neg), eval_sets=eval_set, model=bundle, **fit_options)
+
+    @classmethod
+    def from_system_prompts(
+        cls,
+        model: Any,
+        pos_system: str,
+        neg_system: str,
+        questions: Sequence[PromptLike],
+        eval_questions: Sequence[PromptLike],
+        *,
+        eval_texts: Optional[Tuple[Sequence[PromptLike], Sequence[PromptLike]]] = None,
+        max_new_tokens: int = 64,
+        tokenizer: Any = None,
+        batch_size: int = 16,
+        **fit_options: Any,
+    ) -> "ConceptProbe":
+        """Fit a probe on what the model writes under one system prompt per pole, in one call.
+
+        The model answers every one of ``questions`` under ``pos_system`` and under ``neg_system``
+        (greedy, up to ``max_new_tokens``), and the probe is fitted on those answers, read as written
+        (after their system prompt). It is evaluated on its answers to ``eval_questions``, paired by
+        question: the eval set ``"eval"`` reads them without the system prompt they were written
+        under, because read with it the system prompt itself pushes the score toward its pole and
+        inflates d; ``"eval_with_system_prompt"`` reads them as written, to see that difference; and
+        ``eval_texts = (pos_texts, neg_texts)``, if given, are read alone as the set ``"texts"``. An
+        empty answer drops its pair. ``fit_options`` go to :meth:`fit`; the answers are saved with
+        the probe (``generations/``) when it is saved. A probe trained on texts you write
+        (:meth:`from_texts`) usually reads text the model did not write better.
+        """
+        from .generation import generate
+        from .reading import read_encoded, read_texts
+
+        bundle = model if isinstance(model, ModelBundle) else ModelBundle.from_loaded(model, tokenizer)
+        mdl, tok = bundle.model, bundle.tokenizer
+
+        def answers(qs: Sequence[PromptLike], system: str) -> Any:
+            return generate(mdl, tok, list(qs), system=system, max_new_tokens=max_new_tokens, batch_size=batch_size,
+                            save=False)
+
+        def answers_set(name: str, gens_pos: Any, gens_neg: Any, system: Any) -> EvalSet:
+            reads = [read_encoded(mdl, tok, g.encodings(system), skip_empty=True, batch_size=batch_size)
+                     for g in (gens_pos, gens_neg)]
+            both = sorted(set(reads[0].read_items) & set(reads[1].read_items))
+            P, N = (r.data[[r.read_items.index(q) for q in both]] for r in reads)
+            return EvalSet(name, P, N, context=ReadContext.generated(system=None), paired=True)
+
+        gens = {"train_pos": answers(questions, pos_system), "train_neg": answers(questions, neg_system),
+                "eval_pos": answers(eval_questions, pos_system), "eval_neg": answers(eval_questions, neg_system)}
+        sets = [answers_set("eval", gens["eval_pos"], gens["eval_neg"], None),
+                answers_set("eval_with_system_prompt", gens["eval_pos"], gens["eval_neg"], "as generated")]
+        if eval_texts is not None:
+            sets.append(EvalSet("texts", read_texts(mdl, tok, list(eval_texts[0]), batch_size=batch_size),
+                                read_texts(mdl, tok, list(eval_texts[1]), batch_size=batch_size)))
+        pos = read_encoded(mdl, tok, gens["train_pos"].encodings(), skip_empty=True, batch_size=batch_size)
+        neg = read_encoded(mdl, tok, gens["train_neg"].encodings(), skip_empty=True, batch_size=batch_size)
+        probe = cls.fit(pos, neg, eval_sets=sets, model=bundle, **fit_options)
+        if probe.out_dir:
+            for name, g in gens.items():
+                g.save(os.path.join(probe.out_dir, "generations", name))
+        return probe
+
+    @classmethod
+    def _new(cls, name, pos_label, neg_label, model, tokenizer, identity, reps_identity, output_root,
+             allow_model_mismatch) -> "ConceptProbe":
+        probe = cls(name=str(name), pos_label=str(pos_label), neg_label=str(neg_label), output_root=output_root)
+        if isinstance(identity, str):
+            identity = {"model_id": identity}
+        if model is not None:
+            probe.attach(model, tokenizer, allow_model_mismatch=True)
+            mismatched = identity_mismatches(reps_identity, probe.identity) if reps_identity else []
+            if mismatched and not allow_model_mismatch:
+                raise ValueError("The representations were read with another model than the one passed ("
+                                 + "; ".join(mismatched) + "); pass allow_model_mismatch=True to use it anyway.")
         else:
-            best_layer = pick_layer(num_layers, train_cfg.get("layer_idx"), train_cfg.get("layer_frac", 0.75))
+            probe.identity = reps_identity or identity
+        if not probe.identity:
+            raise ValueError("Which model are these representations from? Pass what read_texts returns (it records "
+                             "the model), model= (the loaded model), or identity= (a dict, or the model id).")
+        return probe
 
-        if eval_pos_scores_mat.size > 0:
-            combined = np.concatenate(
-                [eval_pos_scores_mat[:, best_layer], eval_neg_scores_mat[:, best_layer]], axis=0
-            )
-            proj_std = float(np.std(combined, ddof=1) + 1e-12)
+    def attach(self, model: Any, tokenizer: Any = None, *, allow_model_mismatch: bool = False) -> "ConceptProbe":
+        """Give the probe a loaded model (a :class:`ModelBundle`, or a model and its tokenizer), so it
+        can score texts and steer. A model of another identity than the probe's raises unless
+        ``allow_model_mismatch``."""
+        bundle = model if isinstance(model, ModelBundle) else None
+        if bundle is None:
+            if tokenizer is None:
+                raise ValueError("attach a ModelBundle, or a model together with its tokenizer.")
+            bundle = ModelBundle.from_loaded(model, tokenizer)
+        mine = bundle.identity
+        if self.identity:
+            mismatched = identity_mismatches(self.identity, mine)
+            if mismatched and not allow_model_mismatch:
+                raise ValueError("The model differs from the one this probe belongs to (probe vs model: "
+                                 + "; ".join(mismatched) + "); pass allow_model_mismatch=True to use it anyway.")
+            if not mismatched:  # a probe given only the model id now knows the rest of its model
+                self.identity = {**mine, **self.identity}
         else:
-            proj_std = float("nan")
-
-        self.concept_vectors = concept_vectors
-        self.best_layer = best_layer
-        self.proj_std_best_layer = proj_std
-        self.sweep_d = sweep_d
-        self.sweep_p = sweep_p
-
-        self._status("[Phase 4/4] Sweep + artifact saving")
-        self.logger.log(
-            "sweep_full",
-            {
-                "best_layer": best_layer,
-                "best_d": float(sweep_d[best_layer]),
-                "best_p": None if np.isnan(sweep_p[best_layer]) else float(sweep_p[best_layer]),
-                "best_layer_search": train_cfg.get("best_layer_search"),
-                "best_layer_search_intervals": search_intervals,
-                "best_layer_search_layers": search_layers,
-                "best_layer_search_default": search_default,
-                "sweep_d": sweep_d.tolist(),
-                "sweep_p": [None if np.isnan(x) else float(x) for x in sweep_p],
-                "eval_pos_mean": eval_pos_mean.tolist(),
-                "eval_neg_mean": eval_neg_mean.tolist(),
-                "eval_pos_std": eval_pos_std.tolist(),
-                "eval_neg_std": eval_neg_std.tolist(),
-                "proj_std_best_layer": proj_std,
-            },
-        )
-
-        plots_dir = os.path.join(self.run_dir, "plots")
-        ensure_dir(plots_dir)
-        if plot_cfg.get("enabled", True) and eval_pos_scores_mat.size > 0:
-            if plot_cfg.get("sweep_plot", True):
-                ok = plot_sweep(
-                    sweep_d,
-                    sweep_p,
-                    os.path.join(plots_dir, "sweep.png"),
-                    best_layer=best_layer,
-                    search_intervals=search_intervals_plot,
-                )
-                self.logger.log("plot_sweep", {"ok": ok})
-            if plot_cfg.get("score_hist", True):
-                ok = plot_score_hist(
-                    eval_pos_scores_mat[:, best_layer],
-                    eval_neg_scores_mat[:, best_layer],
-                    os.path.join(plots_dir, "score_hist.png"),
-                )
-                self.logger.log("plot_score_hist", {"ok": ok})
-
-        tensors = {
-            "best_layer": np.array([best_layer], dtype=np.int32),
-            "best_v": concept_vectors[best_layer].astype(np.float32),
-            "concept_vectors": concept_vectors.astype(np.float32),
-            "sweep_d": sweep_d.astype(np.float32),
-            "sweep_p": sweep_p.astype(np.float32),
-            "eval_pos_mean": eval_pos_mean.astype(np.float32),
-            "eval_neg_mean": eval_neg_mean.astype(np.float32),
-            "eval_pos_std": eval_pos_std.astype(np.float32),
-            "eval_neg_std": eval_neg_std.astype(np.float32),
-            "eval_pos_scores_mat": eval_pos_scores_mat.astype(np.float32),
-            "eval_neg_scores_mat": eval_neg_scores_mat.astype(np.float32),
-        }
-        if out_cfg.get("save_reps_to_npz", True):
-            tensors.update(
-                {
-                    "train_pos_reps": reps_pos.astype(np.float32),
-                    "train_neg_reps": reps_neg.astype(np.float32),
-                }
-            )
-        npz_path = os.path.join(self.run_dir, "tensors.npz")
-        np.savez_compressed(npz_path, **tensors)
-
-        n_train_pos = len(train_pos_ids)
-        n_train_neg = len(train_neg_ids)
-        if train_prompt_mode == "shared":
-            n_train = n_train_pos
-        else:
-            n_train = n_train_pos + n_train_neg
-
-        metrics = {
-            "best_layer": best_layer,
-            "best_d": float(sweep_d[best_layer]),
-            "best_p": None if np.isnan(sweep_p[best_layer]) else float(sweep_p[best_layer]),
-            "best_layer_selection_note": (
-                "best_d/best_p are post-selection values (best layer chosen by optimizing over the "
-                "layer sweep on the same eval data); confirm on held-out data before reporting."
-                if (train_cfg["do_layer_sweep"] and did_eval)
-                else None
-            ),
-            "best_layer_search": train_cfg.get("best_layer_search"),
-            "best_layer_search_intervals": search_intervals,
-            "best_layer_search_layers": search_layers,
-            "best_layer_search_default": search_default,
-            "proj_std_best_layer": proj_std,
-            "num_layers": num_layers,
-            "n_train": n_train,
-            "n_train_pos": n_train_pos,
-            "n_train_neg": n_train_neg,
-            "train_prompt_mode": train_prompt_mode,
-            "direction_normalization": direction_normalization,
-            "train_text_role": text_role,
-            "n_eval": n_eval_pos + n_eval_neg,
-            "n_eval_pos": n_eval_pos,
-            "n_eval_neg": n_eval_neg,
-            "eval_mode_used": eval_mode if did_eval else None,
-        }
-        json_dump(os.path.join(self.run_dir, "metrics.json"), metrics)
-        self.logger.log("artifacts_saved", {"npz_path": npz_path})
-        if self.config["output"].get("pretty_json_log", False) and self.config["output"].get("log_jsonl", True):
-            pretty_path = os.path.join(self.run_dir, "log.pretty.json")
-            jsonl_to_pretty(os.path.join(self.run_dir, "log.jsonl"), pretty_path)
-        self._status(f"Saved artifacts to {self.run_dir}")
+            self.identity = mine
+        self.model_bundle = bundle
         return self
 
-    def _require_trained(self) -> None:
-        if self.concept_vectors is None or self.best_layer is None:
-            raise ValueError("ConceptProbe is not trained or loaded.")
+    # ------------------------------------------------------------------ saving and loading
+    def _save_new(self, run_name: Optional[str], save: Optional[bool], overwrite: bool, how: str,
+                  plots: bool = True) -> None:
+        if not (settings().save if save is None else save):
+            return
+        root = self.output_root or settings().output_root
+        out_dir = os.path.join(root, safe_slug(self.name), run_name or now_tag())
+        if os.path.isdir(out_dir) and os.listdir(out_dir):
+            if not overwrite:
+                raise FileExistsError(f"{out_dir} already holds files; pass overwrite=True or another run_name.")
+            import shutil
 
-    def _status(self, message: str) -> None:
-        if self.console is not None:
-            self.console.info(message)
+            shutil.rmtree(out_dir)
+        self._save(out_dir, how=how)
+        if plots and self.evaluation is not None:
+            self._plots(os.path.join(out_dir, "plots"))
+        if settings().console:
+            print(f"[concept-probe] saved the probe to {out_dir}", flush=True)
 
-    def _warn(self, message: str) -> None:
-        if self.console is not None:
-            self.console.warn(message)
-        self.logger.log("warning", {"message": message})
+    def _plots(self, folder: str) -> None:
+        ev = self.evaluation
+        ensure_dir(folder)
+        main = ev.main
+        plot_sweep(main.d_by_layer, main.p_by_layer, os.path.join(folder, "sweep.png"), best_layer=self.layer,
+                   selection_d=ev.selection_d_by_layer, report_d=ev.held_out_d_by_layer if ev.selection == "split" else None,
+                   null_d95=ev.held_out_null_d95_by_layer, best_d=main.d,
+                   title=f"{self.name}: Cohen's d per layer on the {ev.primary} items")
+        rp, rn = ev.report_idx
+        plot_score_hist(main.pos_scores[rp, self.layer], main.neg_scores[rn, self.layer],
+                        os.path.join(folder, "score_hist.png"),
+                        title=f"Scores at layer {self.layer}: {main.measured_on} of the {ev.primary} items "
+                              f"({len(rp)} {self.pos_label}, {len(rn)} {self.neg_label})",
+                        labels=(self.pos_label, self.neg_label))
+        for set_name, result in ev.sets.items():
+            if set_name != ev.primary:
+                plot_sweep(result.d_by_layer, result.p_by_layer, os.path.join(folder, f"sweep_{safe_slug(set_name)}.png"),
+                           best_layer=self.layer, null_d95=result.null_d95_by_layer, best_d=result.d,
+                           title=f"{self.name}: Cohen's d per layer on the {set_name} items")
 
-    def _layer_selection(self, override: Optional[Dict[str, Any]] = None) -> List[int]:
+    def save(self, out_dir: Optional[str] = None) -> str:
+        """Write the probe to ``out_dir`` (default: its own): ``probe.json`` (what it is, its
+        calibrations, its evaluation's numbers, the choices made) and ``probe.npz`` (its directions
+        and per-layer curves). :meth:`load` reads it back."""
         self._require_trained()
-        selection = dict(self.config["evaluation"]["layer_selection"])
-        if override:
-            selection = deep_merge(selection, override)
-        return select_layers(selection, int(self.best_layer), self.model_bundle.num_layers)
+        return self._save(out_dir, how="save")
+
+    def _save(self, out_dir: Optional[str], how: str) -> str:
+        out_dir = out_dir or self.out_dir
+        if not out_dir:
+            raise ValueError("The probe has no folder; pass out_dir.")
+        ensure_dir(out_dir)
+        self.out_dir = out_dir
+        arrays = {"directions": np.asarray(self.directions, dtype=np.float32)}
+        if self.steer_directions is not None and self.steer_directions is not self.directions:
+            arrays["steer_directions"] = np.asarray(self.steer_directions, dtype=np.float32)
+        for key in ("resid_norm", "d_by_layer", "p_by_layer"):
+            if getattr(self, key) is not None:
+                arrays[key] = np.asarray(getattr(self, key), dtype=np.float64)
+        np.savez_compressed(os.path.join(out_dir, "probe.npz"), **arrays)
+        json_dump(os.path.join(out_dir, "probe.json"), {
+            "name": self.name, "pos_label": self.pos_label, "neg_label": self.neg_label, "layer": int(self.layer),
+            "score_layers": self.score_layers, "score_aggregate": self.score_aggregate, "identity": self.identity,
+            "estimator": self.estimator, "steer_estimator": self.steer_estimator, "steer_sd": self.steer_sd,
+            "calibrations": [c.to_dict() for c in self.calibrations], "metrics": self.metrics,
+            "choices": [c.to_dict() for c in self.choices], "built_by": how,
+        })
+        return out_dir
+
+    @classmethod
+    def load(cls, out_dir: str, model: Any = None, tokenizer: Any = None, *,
+             allow_model_mismatch: bool = False) -> "ConceptProbe":
+        """A probe saved in ``out_dir`` by :meth:`save`, with ``model`` attached if given (see
+        :meth:`attach`)."""
+        if not os.path.exists(os.path.join(out_dir, "probe.json")):
+            raise FileNotFoundError(f"No probe in {out_dir!r}: ConceptProbe.save writes probe.json and probe.npz there.")
+        obj = cls._load_probe(out_dir)
+        obj.out_dir = out_dir
+        if model is not None:
+            obj.attach(model, tokenizer, allow_model_mismatch=allow_model_mismatch)
+        return obj
+
+    @classmethod
+    def _load_probe(cls, out_dir: str) -> "ConceptProbe":
+        with open(os.path.join(out_dir, "probe.json"), "r", encoding="utf-8") as f:
+            d = json.load(f)
+        with np.load(os.path.join(out_dir, "probe.npz")) as z:
+            arrays = {k: z[k] for k in z.files}
+        obj = cls(name=d["name"], pos_label=d["pos_label"], neg_label=d["neg_label"])
+        obj.directions = arrays["directions"]
+        obj.steer_directions = arrays.get("steer_directions", obj.directions)
+        obj.layer = int(d["layer"])
+        obj.score_layers, obj.score_aggregate = d.get("score_layers"), d.get("score_aggregate", "mean")
+        obj.identity, obj.estimator, obj.steer_estimator = d.get("identity"), d.get("estimator"), d.get("steer_estimator")
+        obj.steer_sd = d.get("steer_sd")
+        obj.calibrations = [Calibration.from_dict(c) for c in d.get("calibrations", [])]
+        obj.metrics = d.get("metrics") or {}
+        obj.choices = [Choice(**c) for c in d.get("choices", [])]
+        obj.resid_norm, obj.d_by_layer, obj.p_by_layer = (arrays.get(k) for k in ("resid_norm", "d_by_layer", "p_by_layer"))
+        return obj
+
+    @property
+    def num_layers(self) -> int:
+        self._require_trained()
+        return int(np.asarray(self.directions).shape[0])
+
+    def _score_layers(self) -> List[int]:
+        return [int(self.layer)] if not self.score_layers else [int(l) for l in self.score_layers]
+
+    def project(self, reps: Any) -> np.ndarray:
+        """Each row's projection on each layer's reading direction: ``(rows, layers)``, from
+        representations ``(rows, layers, dim)`` (an array, or what :func:`read_texts` returns)."""
+        self._require_trained()
+        R = _as_array(reps)
+        if R.shape[1:] != np.asarray(self.directions).shape:
+            raise ValueError(f"representations of shape {R.shape[1:]} (layers, dim) do not fit the probe's directions "
+                             f"{np.asarray(self.directions).shape}; read every layer")
+        return np.einsum("nld,ld->nl", R.astype(np.float64), np.asarray(self.directions, dtype=np.float64))
+
+    def scores(self, reps: Any, *, per_text: Optional[str] = None) -> np.ndarray:
+        """Each item's raw score: its projection at the probe's score layers (the probe's layer by
+        default), combined as ``score_aggregate``. The offset is arbitrary; see :meth:`z`.
+
+        For representations read token by token (a ``*_tokens`` readout), ``per_text`` summarizes
+        each text's token scores into one (see :func:`summarize_tokens`: ``"mean"``, ``"max"``,
+        ``"min"``, ``"median"``, ``"p90"``, ``"extreme"``); without it, every token gets a score."""
+        layers = self._score_layers()
+        proj = self.project(reps)[:, layers]
+        out = proj.mean(axis=1) if self.score_aggregate == "mean" else proj.sum(axis=1)
+        return self._per_text(out, reps, per_text, 0.0)
+
+    def _per_text(self, values: np.ndarray, reps: Any, per_text: Optional[str], center: float) -> np.ndarray:
+        if per_text is None:
+            return values
+        items = getattr(reps, "items", None)
+        if items is None or getattr(getattr(reps, "readout", None), "agg", None) != "tokens":
+            raise ValueError("per_text summarizes token scores: read the texts with a *_tokens readout")
+        return summarize_tokens(values, items, per_text, center)[0]
+
+    def z(self, reps: Any, context: Optional[Union[ReadContext, Dict[str, Any]]] = None, *, unit: str = "sd",
+          per_text: Optional[str] = None) -> np.ndarray:
+        """Each item's z score, with the calibration of how the items were read (``context``; by
+        default what the representations say, or the only calibration). ``unit="sd"``: 0 is the
+        calibration's zero (the midpoint between the poles, which is not "without the concept"; or
+        the baseline's mean), 1 its within-pole SD. ``unit="poles"``: 0 the same zero, +1 the
+        positive pole's mean (and -1 the negative's, with a midpoint). ``per_text`` summarizes the
+        z of each text's tokens (see :meth:`scores`; single tokens get the calibration's per-item
+        references). Raises when there is no calibration for that reading, or when the items were
+        pooled another way than the calibration's items."""
+        if unit not in Z_UNITS:
+            raise ValueError(f"unit must be one of {Z_UNITS}; got {unit!r}")
+        cal = self._calibration_of(reps, context, tokens=per_text is not None)
+        layers = self._score_layers()
+        z = cal._items_z(self.project(reps)[:, layers], layers, self.score_aggregate, unit=unit)
+        if z is None:
+            raise ValueError(f"the calibration for items read {cal.context} has no usable references "
+                             f"{'in poles units ' if unit == 'poles' else ''}at layers {layers}.")
+        return self._per_text(z, reps, per_text, 0.0)
+
+    def _calibration_of(self, reps: Any, context: Any, tokens: bool = False) -> Calibration:
+        """The calibration for ``reps``: of ``context``, or of the context the reps record; and the
+        check that they were pooled like the calibration's items."""
+        ctx = context if context is not None else getattr(reps, "context", None)
+        cal = self.calibration_for(ctx)
+        if cal is None and context is None and len(self.calibrations) == 1 and ctx is not None:
+            raise ValueError(self._missing_z_reason(ctx))
+        if cal is None:
+            raise ValueError(self._missing_z_reason(ctx))
+        readout = getattr(getattr(reps, "readout", None), "name", None)
+        if readout is not None and not tokens and cal.context.readout and readout != cal.context.readout:
+            raise ValueError(f"these items were read with {readout!r} and the calibration's with "
+                             f"{cal.context.readout!r}: their z would not be comparable; calibrate on items read the "
+                             "same way (probe.calibrate).")
+        return cal
+
+    def classify(self, reps: Any, context: Optional[Union[ReadContext, Dict[str, Any]]] = None
+                 ) -> Tuple[np.ndarray, np.ndarray]:
+        """Whether each item belongs to the positive pole, and the probability, from the calibrated
+        threshold (not from z = 0, which is the midpoint, not the best cut)."""
+        cal = self._calibration_of(reps, context)
+        if not cal.threshold:
+            raise ValueError("That calibration has no threshold; calibrate again to fit one.")
+        t = cal.threshold
+        prob = sigmoid(t["slope"] * self.project(reps)[:, int(t["layer"])] + t["intercept"])
+        return prob >= 0.5, prob
+
+    def accuracy(self, pos: Any, neg: Any, *, cut: str = "threshold",
+                 context: Optional[Union[ReadContext, Dict[str, Any]]] = None, n_bootstrap: int = 1000,
+                 paired: bool = False, seed: int = 0) -> Dict[str, Any]:
+        """The share of items of each pole on the right side of a cut, with a bootstrap 95% interval:
+        ``cut="threshold"`` (the calibrated threshold) or ``"zero"`` (z = 0: the midpoint between
+        the poles of the calibration, or the baseline)."""
+        if cut == "threshold":
+            right = np.r_[self.classify(pos, context)[0], ~self.classify(neg, context)[0]]
+        elif cut == "zero":
+            right = np.r_[self.z(pos, context) > 0, self.z(neg, context) <= 0]
+        else:
+            raise ValueError(f"cut must be 'threshold' or 'zero'; got {cut!r}")
+        n_pos = len(_as_array(pos))
+        a, b = right[:n_pos].astype(float), right[n_pos:].astype(float)
+        share = lambda x, y: float(np.r_[x, y].mean())  # noqa: E731
+        ci = bootstrap_ci(share, a, b, int(n_bootstrap), np.random.default_rng(seed), paired=paired)
+        return {"accuracy": float(right.mean()), "ci95": ci, "cut": cut, "n": int(len(right))}
+
+    # ------------------------------------------------------------------ calibrations
+    def calibration_for(self, context: Optional[Union[ReadContext, Dict[str, Any]]] = None) -> Optional[Calibration]:
+        """The calibration measured on items read like ``context`` (a :class:`ReadContext` or its
+        dict); with no context, the only calibration if there is one."""
+        if context is None:
+            return self.calibrations[0] if len(self.calibrations) == 1 else None
+        target = context if isinstance(context, ReadContext) else ReadContext.from_dict(context)
+        return next((c for c in self.calibrations if c.context.matches(target)), None)
+
+    def _missing_z_reason(self, context: Optional[Union[ReadContext, Dict[str, Any]]]) -> str:
+        have = "; ".join(str(c.context) for c in self.calibrations) or "in no context"
+        if context is None:
+            return (f"the probe has {len(self.calibrations)} calibrations (items read {have}); say which reading "
+                    "context the items come from (context=...).")
+        target = context if isinstance(context, ReadContext) else ReadContext.from_dict(context)
+        return (f"the probe has no calibration for items read {target} (it has one for items read "
+                f"{have}); z scores from another reading context are not comparable. Add one with "
+                "probe.calibrate(pos, neg, ...).")
+
+    def calibrate(
+        self,
+        pos: Any,
+        neg: Any,
+        *,
+        context: Optional[Union[ReadContext, Dict[str, Any]]] = None,
+        role: str = "raw",
+        system: Optional[str] = None,
+        prompt: Union[None, str, Sequence[str]] = None,
+        neutral: Any = None,
+        zero: str = "midpoint",
+        threshold_l2: float = 1e-2,
+        batch_size: int = 16,
+    ) -> Calibration:
+        """Measure a calibration on items of each pole, so items read the same way get z scores and
+        a calibrated threshold. It replaces any calibration for the same reading context.
+
+        ``pos`` / ``neg`` (and ``neutral``, texts without the concept, whose place is recorded) are
+        representations already read, with ``context`` saying how (default: what they record, or raw
+        text); or texts, which the probe reads with its model as :func:`concept_probe.read_texts` does
+        (``role``, ``system``, and ``prompt``: one user turn, or one per text with
+        ``role="assistant"``, which is how generated completions are read as replies to their own
+        prompts).
+        Texts also give single tokens their references. ``zero="baseline"`` sets the zero at ``neg``'s
+        mean instead of the midpoint. Call :meth:`save` to keep it.
+        """
+        self._require_trained()
+        if isinstance(pos, np.ndarray) or hasattr(pos, "data"):
+            ctx = context if context is not None else getattr(pos, "context", None)
+            ctx = ReadContext() if ctx is None else (ctx if isinstance(ctx, ReadContext) else ReadContext.from_dict(ctx))
+            scores = {"pos": self.project(pos), "neg": self.project(neg)}
+            if neutral is not None:
+                scores["neutral"] = self.project(neutral)
+            tokens: Dict[str, Optional[List[np.ndarray]]] = {"pos": None, "neg": None}
+        else:
+            ctx, scores, tokens = self._read_for_calibration(pos, neg, neutral, role, system, prompt,
+                                                             batch_size)
+        cal = Calibration._from_scores(scores["pos"], scores["neg"], ctx, pos_tokens=tokens["pos"],
+                                      neg_tokens=tokens["neg"], zero=zero,
+                                      source="calibrate()")
+        layer = int(self.layer)
+        cal._add_threshold(scores["pos"][:, layer], scores["neg"][:, layer], layer, "the calibration items",
+                          l2=threshold_l2)
+        if "neutral" in scores:
+            cal._add_neutral(scores["neutral"])
+        self.calibrations = [c for c in self.calibrations if not c.context.matches(ctx)] + [cal]
+        return cal
+
+    def _read_for_calibration(self, pos_texts, neg_texts, neutral_texts, role, system, prompt,
+                              batch_size):
+        self._require_model("calibrating on texts")
+        tokenizer, model = self.model_bundle.tokenizer, self.model_bundle.model
+
+        per_text = prompt is not None and not isinstance(prompt, str)
+        if per_text and role != "assistant":
+            raise ValueError("one prompt per text is a user turn before each text: it needs role='assistant'")
+
+        def encode(texts: List[PromptLike], label: str) -> List[Encoded]:
+            turns = list(prompt) if per_text else [prompt] * len(texts)
+            if len(turns) != len(texts):
+                raise ValueError(f"prompt has {len(turns)} turns for {len(texts)} {label} texts.")
+            return [_encode_text(tokenizer, t, system, role=role, prompt=p, warn=_warn,
+                                warn_prefix=f"calibrate.{label}[{i}]") for i, (t, p) in enumerate(zip(texts, turns))]
+
+        if role not in TEXT_ROLES:
+            raise ValueError(f"role must be one of {TEXT_ROLES}; got {role!r}")
+        ctx = (ReadContext.generated("text_mean", system) if per_text else
+               ReadContext(kind="text", role=role, system=None if role == "raw" else system,
+                           prompt=prompt if role == "assistant" else None, readout="text_mean"))
+        scores, tokens = {}, {}
+        for label, texts in (("pos", pos_texts), ("neg", neg_texts), ("neutral", neutral_texts or [])):
+            if not texts:
+                continue
+            reps = _read(model, tokenizer, encode(list(texts), label), [Readout._parse("text_mean")],
+                         batch_size=batch_size, project_on=self.directions, cache=False,
+                         label=f"calibrate.{label}")[0]
+            announce(reps.choices)
+            scores[label] = np.einsum("nld,ld->nl", reps.data, self.directions)
+            tokens[label] = reps.projections
+        return ctx, scores, tokens
+
+    # ------------------------------------------------------------------ with the model
+    def _token_scorer(self, context: Optional[Union[ReadContext, Dict[str, Any]]] = None, *,
+                      vectors: Optional[np.ndarray] = None, reference_layer: Optional[int] = None) -> TokenScorer:
+        """How this probe scores tokens read in ``context``: its directions at its score layers,
+        combined as ``score_aggregate``, with the calibration for that context. ``vectors`` replaces
+        the directions (a random control: then there is no calibration); ``reference_layer`` reads
+        every layer with that one layer's direction (a logit-lens-style read, also without one)."""
+        layers = self._score_layers()
+        V = np.asarray(self.directions if vectors is None else vectors, dtype=np.float32)
+        if reference_layer is not None:
+            ref = resolve_layer_index(reference_layer, V.shape[0], "reference_layer")
+            rows = np.stack([V[ref] for _ in layers])
+        else:
+            rows = V[layers]
+        own = vectors is None and reference_layer is None
+        cal = self.calibration_for(context) if own and context is not None else None
+        return TokenScorer(str(self.name), list(layers), rows, self.score_aggregate, cal)
 
     def score_texts(
         self,
         texts: List[PromptLike],
-        system_prompt: Optional[str] = None,
-        layer_selection: Optional[Dict[str, Any]] = None,
-        output_subdir: str = "scores",
-        save_html: Optional[bool] = None,
-        batch_subdir: Optional[str] = None,
-        random_scoring_vector: bool = False,
-        random_vector_seed: Optional[int] = None,
+        *,
+        role: str = "raw",
+        system: Optional[str] = None,
+        prompt: Optional[str] = None,
         reference_layer: Optional[int] = None,
-    ) -> List[Dict[str, Any]]:
-        self._require_trained()
-        tokenizer = self.model_bundle.tokenizer
-        model = self.model_bundle.model
-        aggregate = self.config["evaluation"]["score_aggregate"]
-        layers = self._layer_selection(layer_selection)
-        sys_prompt = self.config["prompts"]["neutral_system"] if system_prompt is None else system_prompt
-        save_html = self.config["plots"].get("heatmap_html", True) if save_html is None else save_html
-        save_token_scores_npz = self.config["output"].get("save_token_scores_npz", True)
-        base_random_seed = _resolve_random_control_seed(
-            random_vector_seed,
-            self.config.get("random", {}).get("seed", 0),
-        )
-        scoring_seed: Optional[int] = None
-        scoring_vectors = self.concept_vectors
-        if random_scoring_vector:
-            scoring_seed = _mix_random_control_seed(base_random_seed, 101)
-            scoring_vectors = _random_vectors_same_norm(self.concept_vectors, seed=scoring_seed)
-            self._warn(
-                f"score_texts using random scoring vector control (same-norm per layer, seed={scoring_seed})."
-            )
+        batch_size: int = 16,
+        save: Optional[bool] = None,
+        out_dir: Optional[str] = None,
+        html: bool = True,
+    ) -> Scores:
+        """Score every token of each text with the probe, in batches; returns
+        :class:`~concept_probe.scoring.Scores`.
 
-        base_dir = os.path.join(self.run_dir, output_subdir)
-        ensure_dir(base_dir)
-        if batch_subdir is None:
-            batch_subdir = f"batch_{now_tag()}"
-        out_dir = base_dir if batch_subdir == "" else os.path.join(base_dir, batch_subdir)
-        ensure_dir(out_dir)
-        results = []
-        batch_entries = []
-        total_texts = len(texts)
-        progress_every = max(1, total_texts // 5) if total_texts else 1
-        self._status(f"Scoring {total_texts} texts -> {out_dir}")
+        Each text is read as :func:`concept_probe.read_texts` reads it (``role``, ``system``,
+        ``prompt``; by default alone). Each item has raw projections per token and layer, their
+        combination per token and, where the probe has a calibration for texts read this way,
+        single-token z scores (0 the midpoint between the poles, 1 the within-pole SD of single
+        tokens). ``score_mean`` is the text's mean token score and ``score_mean_z`` its z with the
+        per-item references; without such a calibration only raw projections are given, and
+        ``z_missing`` says why. ``reference_layer`` reads every layer with one layer's direction.
+        ``Scores.per_text`` summarizes each text's tokens another way.
 
+        Saved by default (``save``, or the session's setting) to ``out_dir``, or ``scores/<time>``
+        in the probe's folder (or the session's ``output_root``): ``scores.npz``, ``scores.jsonl``,
+        ``heatmaps.html`` (unless ``html=False``) and ``settings.json``.
+        """
+        self._require_model("score_texts")
+        tokenizer, model = self.model_bundle.tokenizer, self.model_bundle.model
+        if role not in TEXT_ROLES:
+            raise ValueError(f"role must be one of {TEXT_ROLES}; got {role!r}")
+        context = ReadContext(kind="text", role=role, system=None if role == "raw" else system,
+                              prompt=prompt if role == "assistant" else None, readout="text_mean")
+        scorer = self._token_scorer(context, reference_layer=reference_layer)
+        z_missing = None
+        if reference_layer is not None:
+            z_missing = "read with one layer's direction"
+        elif scorer.calibration is None:
+            z_missing = self._missing_z_reason(context)
+            _warn(f"score_texts: only raw projections are given: {z_missing}")
+        elif (scorer.calibration.context.readout or "text_mean") != "text_mean":
+            z_missing = (f"the calibration's items were pooled with {scorer.calibration.context.readout!r}, so a "
+                         "text's mean token score has no z (single tokens still do)")
+        inputs = []
         for i, text in enumerate(texts):
-            if _has_chat_template(tokenizer):
-                messages, used_prompt_system = _normalize_messages(
-                    text,
-                    sys_prompt,
-                    warn=self._warn,
-                    warn_prefix=f"score_texts.texts[{i}]",
-                )
-                input_ids = apply_chat(tokenizer, messages, add_generation_prompt=False)
-            else:
-                input_ids = _encode_for_read(
-                    tokenizer,
-                    text,
-                    sys_prompt,
-                    warn=self._warn,
-                    warn_prefix=f"score_texts.texts[{i}]",
-                )
-                used_prompt_system = False
-            hs_layers = forward_hidden_states_all_layers(model, input_ids)
-            scores_per_layer, scores_agg = token_scores_from_hs_layers(
-                hs_layers, scoring_vectors, layers, aggregate=aggregate,
-                reference_layer=reference_layer,
-            )
-            token_ids = input_ids[0].detach().cpu().numpy().astype(np.int32)
-            tokens = _decode_tokens(tokenizer, token_ids)
+            enc = _encode_text(tokenizer, text, system, role=role, prompt=prompt, warn=_warn,
+                              warn_prefix=f"score_texts.texts[{i}]")
+            span = (0, 0) if enc.start is None else (int(enc.start), int(enc.end))
+            info = {"input": text, "role": role, "system": system,
+                    "input_text": tokenizer.decode(enc.input_ids.tolist(), skip_special_tokens=False),
+                    "text_span": None if enc.start is None else [int(enc.start), int(enc.end)]}
+            inputs.append(ScoreInput(enc.input_ids, span, _prompt_to_text(text), i, info))
+        items = score_inputs(model, tokenizer, inputs, [scorer], batch_size=int(batch_size))
+        run_settings = {"role": role, "system": system, "prompt": prompt, "layers": scorer.layers,
+                        "aggregate": scorer.aggregate, "reference_layer": reference_layer, "batch_size": int(batch_size),
+                        "calibration": None if scorer.calibration is None else scorer.calibration.context.to_dict()}
+        result = Scores("texts", [scorer.name], items, run_settings, {scorer.name: z_missing})
+        if settings().save if save is None else save:
+            if out_dir is None:
+                root = self.out_dir or os.path.join(self.output_root or settings().output_root, safe_slug(self.name))
+                out_dir = os.path.join(root, "scores", now_tag())
+            ensure_dir(out_dir)
+            result.save(out_dir, html=html)
+        return result
 
-            slug = _prompt_slug_any(text)
-            base = f"text_{i:03d}_{slug}"
-            if save_token_scores_npz:
-                npz_path = os.path.join(out_dir, f"{base}.npz")
-                np.savez_compressed(
-                    npz_path,
-                    token_ids=token_ids,
-                    scores_per_layer=scores_per_layer,
-                    scores_agg=scores_agg,
-                    layer_indices=np.array(layers, dtype=np.int32),
-                )
-            else:
-                npz_path = None
-
-            if save_html:
-                html_path = os.path.join(out_dir, f"{base}.html")
-                render_token_heatmap(tokens, scores_agg.tolist(), html_path, title=slug)
-                batch_entries.append((f"text {i:03d}: {slug}", tokens, scores_agg.tolist()))
-            else:
-                html_path = None
-
-            rec = {
-                "text": text,
-                "system_prompt": sys_prompt,
-                "system_prompt_overridden": bool(used_prompt_system),
-                "layers": layers,
-                "npz_path": npz_path,
-                "html_path": html_path,
-                "random_scoring_vector": bool(random_scoring_vector),
-                "random_scoring_vector_seed": scoring_seed,
-                "batch_dir": out_dir,
-            }
-            results.append(rec)
-            self.logger.log("score_text", rec)
-            if total_texts and ((i + 1) % progress_every == 0 or (i + 1) == total_texts):
-                self._status(f"Scored text {i + 1}/{total_texts}")
-
-        if save_html and batch_entries:
-            batch_path = os.path.join(out_dir, "batch_texts.html")
-            render_batch_heatmap(batch_entries, batch_path, title="Batch text scores")
-            self.logger.log("score_text_batch", {"html_path": batch_path, "count": len(batch_entries)})
-
-        return results
-
-    def score_prompts(
+    def steering(
         self,
-        prompts: List[PromptLike],
-        system_prompt: Optional[str] = None,
-        max_new_tokens: Optional[int] = None,
-        greedy: Optional[bool] = None,
-        temperature: Optional[float] = None,
-        top_p: Optional[float] = None,
-        layer_selection: Optional[Dict[str, Any]] = None,
-        output_subdir: str = "scores",
-        alphas: Optional[List[float]] = None,
-        alpha_unit: str = "raw",
-        steer_layers: Optional[Union[str, List[int]]] = None,
-        steer_window_radius: Optional[int] = None,
-        steer_distribute: Optional[bool] = None,
-        save_html: Optional[bool] = None,
-        save_segments: Optional[bool] = None,
-        save_generation_logits: Optional[bool] = None,
-        generation_logits_top_k: Optional[int] = None,
-        generation_logits_dtype: Optional[str] = None,
-        batch_subdir: Optional[str] = None,
-        random_scoring_vector: bool = False,
-        random_steering_vector: bool = False,
-        random_vector_seed: Optional[int] = None,
-        seed: Optional[int] = None,
-    ) -> List[Dict[str, Any]]:
-        """Generate (optionally steered) completions and score them with the probe.
+        dose: float,
+        unit: str = "resid_norm",
+        *,
+        layers: Optional[Sequence[int]] = None,
+        window: Optional[int] = None,
+        distribute: bool = False,
+        positions: Any = None,
+        vectors: Optional[np.ndarray] = None,
+    ) -> Add:
+        """The intervention that steers with this probe: an :class:`~concept_probe.interventions.Add`
+        of ``alpha_l * v_l`` at each steered layer ``l``, where ``v_l`` is the probe's steering
+        direction at that layer (``steer_directions``) and ``alpha_l`` is ``dose`` in ``unit``:
 
-        alphas/alpha_unit: with alpha_unit="sigma", alpha is multiplied by
-        proj_std_best_layer — the std of the *sequence-pooled* eval projections at the
-        best layer — and the resulting raw offset is added to the residual stream at
-        every token position of each steered layer (divided across layers when
-        steer_distribute=True, and compounding through subsequent layers). It is a
-        convenient scale knob, not literally "n standard deviations of behavior".
+        - ``"resid_norm"`` (the default, as in :func:`concept_probe.evaluate_steering`): times each
+          layer's mean residual norm on the training texts, so 0.1 adds 10% of a typical token's norm;
+        - ``"sd"``: times ``steer_sd``, the eval items' pooled within-pole SD on the steering
+          direction at the probe's layer (a scale knob, not "n standard deviations of behavior");
+        - ``"raw"``: as is (the directions have unit length).
 
-        seed: seeds python/numpy/torch RNGs before generation for reproducible
-        sampling. Note: GPU kernels are not bit-deterministic across
-        hardware/library versions, so reproducibility is best-effort.
+        It steers at the probe's layer, at ``layers``, or at the layers within ``window`` of it (a
+        window that reaches past the model is clipped, and that is announced). With several layers,
+        each gets the whole dose unless ``distribute=True`` divides it among them. ``positions``
+        restricts it to some tokens (see :mod:`concept_probe.interventions`), ``vectors`` replaces
+        the directions (a random control). Use it with :func:`concept_probe.intervene`,
+        :func:`concept_probe.generate` or :func:`concept_probe.answer_logprobs`.
         """
         self._require_trained()
-        if seed is not None:
-            set_seed(int(seed))
-        tokenizer = self.model_bundle.tokenizer
-        model = self.model_bundle.model
-        aggregate = self.config["evaluation"]["score_aggregate"]
-        layers = self._layer_selection(layer_selection)
-        sys_prompt = self.config["prompts"]["neutral_system"] if system_prompt is None else system_prompt
-        save_html = self.config["plots"].get("heatmap_html", True) if save_html is None else save_html
-        save_segments = False if save_segments is None else save_segments
-        do_steering = bool(self.config["steering"].get("do_steering", True))
-        save_token_scores_npz = self.config["output"].get("save_token_scores_npz", True)
-        if save_generation_logits is None:
-            save_generation_logits = bool(self.config["output"].get("save_generation_logits", False))
-        else:
-            save_generation_logits = bool(save_generation_logits)
-        if generation_logits_top_k is None:
-            generation_logits_top_k = self.config["output"].get("generation_logits_top_k", None)
-        if generation_logits_dtype is None:
-            generation_logits_dtype = self.config["output"].get("generation_logits_dtype", "float16")
-        if save_generation_logits and not save_token_scores_npz:
-            self._warn("save_generation_logits requested but output.save_token_scores_npz=false; logits will not be saved.")
-        save_generation_logits = bool(save_generation_logits and save_token_scores_npz)
-        base_random_seed = _resolve_random_control_seed(
-            random_vector_seed,
-            self.config.get("random", {}).get("seed", 0),
-        )
-        scoring_seed: Optional[int] = None
-        steering_seed: Optional[int] = None
-        scoring_vectors = self.concept_vectors
-        steering_vectors = self.concept_vectors
-        if random_scoring_vector:
-            scoring_seed = _mix_random_control_seed(base_random_seed, 201)
-            scoring_vectors = _random_vectors_same_norm(self.concept_vectors, seed=scoring_seed)
-            self._warn(
-                f"score_prompts using random scoring vector control (same-norm per layer, seed={scoring_seed})."
-            )
-        if random_steering_vector:
-            steering_seed = _mix_random_control_seed(base_random_seed, 202)
-            steering_vectors = _random_vectors_same_norm(self.concept_vectors, seed=steering_seed)
-            self._warn(
-                f"score_prompts using random steering vector control (same-norm per layer, seed={steering_seed})."
-            )
+        if unit not in STEER_UNITS:
+            raise ValueError(f"unit must be one of {STEER_UNITS}; got {unit!r}")
+        steer_layers = self.steer_layer_list(layers, window)
+        if abs(float(dose)) > 1e-12:
+            self._check_unit(unit)
+        value = float(dose)
+        if unit == "sd" and abs(value) > 1e-12:
+            value *= float(self.steer_sd)
+        per = value / len(steer_layers) if distribute else value
+        alphas = {l: float(per * (float(self.resid_norm[l]) if unit == "resid_norm" else 1.0)) for l in steer_layers}
+        V = self.steer_directions if vectors is None else vectors
+        return Add({l: np.asarray(V[l], dtype=np.float32) for l in steer_layers}, alpha=alphas, positions=positions,
+                   label=f"steering with {self.name!r}: dose {float(dose):g} ({unit})")
 
-        max_new_tokens = max_new_tokens if max_new_tokens is not None else self.config["steering"]["steer_max_new_tokens"]
-        greedy = greedy if greedy is not None else (not self.config["steering"]["steer_sampling"])
-        temperature = temperature if temperature is not None else self.config["steering"]["steer_temperature"]
-        top_p = top_p if top_p is not None else self.config["steering"]["steer_top_p"]
+    def steer_layer_list(self, layers: Optional[Sequence[int]] = None, window: Optional[int] = None) -> List[int]:
+        """The layers :meth:`steering` steers: the probe's layer, ``layers``, or the layers within
+        ``window`` of the probe's layer."""
+        self._require_trained()
+        if layers is not None and window is not None:
+            raise ValueError("give layers or window, not both")
+        if window is not None:
+            out, clipped = _window(int(self.layer), window, self.num_layers)
+            if clipped is not None:
+                announce([clipped])
+            return out
+        if layers is None:
+            return [int(self.layer)]
+        return _layer_list(list(layers) if not isinstance(layers, (int, np.integer)) else layers, self.num_layers,
+                           "layers")
 
-        if alphas is None:
-            alphas = [0.0]
-        nonzero_alpha_requested = any(abs(float(a)) > 1e-12 for a in alphas)
-        if nonzero_alpha_requested and not do_steering:
-            self._warn(
-                "Non-zero alphas provided; overriding steering.do_steering=false and enabling steering."
-            )
-            do_steering = True
-        if random_steering_vector and not nonzero_alpha_requested:
-            self._warn("random_steering_vector=true but all alphas are zero; no steering is applied.")
+    def _check_unit(self, unit: str) -> None:
+        """Raise if the probe lacks the reference that ``unit`` scales by."""
+        if unit == "sd" and (self.steer_sd is None or not np.isfinite(self.steer_sd)):
+            raise ValueError("unit='sd' needs the probe's steering unit (steer_sd), which comes from evaluation "
+                             "or calibration items; this probe has none.")
+        if unit == "resid_norm" and self.resid_norm is None:
+            raise ValueError("unit='resid_norm' needs the mean residual norm per layer of the texts the probe was "
+                             "fitted on, which this probe lacks (it was built from directions): set probe.resid_norm, "
+                             "or pass unit='raw' (evaluate_steering measures the norms on its prompts).")
 
-        base_dir = os.path.join(self.run_dir, output_subdir)
-        ensure_dir(base_dir)
-        if batch_subdir is None:
-            batch_subdir = f"batch_{now_tag()}"
-        out_dir = base_dir if batch_subdir == "" else os.path.join(base_dir, batch_subdir)
-        ensure_dir(out_dir)
-        results = []
-        batch_entries = []
-        total_prompts = len(prompts)
-        total_alphas = len(alphas)
-        total_runs = total_prompts * total_alphas
-        self._status(
-            f"Scoring {total_prompts} prompts x {total_alphas} alphas ({total_runs} generations) -> {out_dir}"
-        )
-        show_progress = self.console is not None and self.console.enabled
-        if show_progress and total_runs:
-            _progress_print(0, total_runs, label="Generating", enabled=True)
+    def to_dict(self) -> Dict[str, Any]:
+        """What the probe is, in a dict: its concept, layer, estimators, calibrations and numbers."""
+        self._require_trained()
+        return {"name": self.name, "poles": [self.pos_label, self.neg_label], "layer": int(self.layer),
+                "score_layers": self._score_layers(), "estimator": self.estimator,
+                "steer_estimator": self.steer_estimator, "steer_sd": self.steer_sd, "identity": self.identity,
+                "calibrations": [str(c.context) for c in self.calibrations], "metrics": self.metrics,
+                "out_dir": self.out_dir}
 
-        if steer_layers is None:
-            steer_layers = self.config["steering"]["steer_layers"]
-        if steer_window_radius is None:
-            steer_window_radius = self.config["steering"]["steer_window_radius"]
-        if steer_distribute is None:
-            steer_distribute = self.config["steering"]["steer_distribute"]
+    # ------------------------------------------------------------------ checks
+    def _require_trained(self) -> None:
+        if self.directions is None or self.layer is None:
+            raise ValueError("The probe has no directions yet: fit it, or load one.")
 
-        if steer_layers == "probe":
-            steer_layer_list = [int(self.best_layer)]
-        elif steer_layers == "window":
-            lo = max(0, int(self.best_layer) - int(steer_window_radius))
-            hi = min(self.model_bundle.num_layers - 1, int(self.best_layer) + int(steer_window_radius))
-            steer_layer_list = list(range(lo, hi + 1))
-        elif isinstance(steer_layers, list):
-            steer_layer_list = list(map(int, steer_layers))
-        else:
-            steer_layer_list = list(map(int, steer_layers))
-
-        run_idx = 0
-        progress_every = 1
-        for i, prompt in enumerate(prompts):
-            prompt_slug = _prompt_slug_any(prompt)
-            for j, alpha in enumerate(alphas):
-                alpha_val = float(alpha)
-                if alpha_unit == "sigma":
-                    if self.proj_std_best_layer is None or np.isnan(self.proj_std_best_layer):
-                        raise ValueError("proj_std_best_layer is not available for sigma scaling.")
-                    alpha_val = alpha_val * float(self.proj_std_best_layer)
-
-                messages, used_prompt_system = _normalize_messages(
-                    prompt,
-                    sys_prompt,
-                    warn=self._warn,
-                    warn_prefix=f"score_prompts.prompts[{i}]",
-                )
-                input_ids = apply_chat(tokenizer, messages, add_generation_prompt=True).to(model.device)
-                attn = attention_mask_from_ids(input_ids).to(model.device)
-                prompt_len = int(input_ids.shape[-1])
-
-                should_steer = do_steering and abs(float(alpha_val)) > 1e-12
-                if should_steer:
-                    context = MultiLayerSteererLayerwise(
-                        model, steer_layer_list, steering_vectors, alpha_val, distribute=steer_distribute
-                    )
-                else:
-                    context = None
-
-                if context is not None:
-                    with context:
-                        gen_ids = model.generate(
-                            input_ids=input_ids,
-                            attention_mask=attn,
-                            max_new_tokens=max_new_tokens,
-                            do_sample=not greedy,
-                            temperature=temperature if not greedy else None,
-                            top_p=top_p if not greedy else None,
-                            pad_token_id=tokenizer.eos_token_id,
-                        )[0].detach().cpu()
-                        if save_generation_logits:
-                            # Generation logits must reflect the steered model that produced the text.
-                            _, generation_step_logits = forward_hidden_states_all_layers(
-                                model,
-                                gen_ids.unsqueeze(0),
-                                return_generation_logits=True,
-                                generation_prompt_len=prompt_len,
-                            )
-                        else:
-                            generation_step_logits = None
-                    # Score with the hooks removed: with them active, the injected vector reads
-                    # itself back (score inflation ~ alpha * cos(steer_dir, score_dir) at steered
-                    # layers), contaminating the probe readout of the generated text.
-                    hs_layers = forward_hidden_states_all_layers(model, gen_ids.unsqueeze(0))
-                else:
-                    gen_ids = model.generate(
-                        input_ids=input_ids,
-                        attention_mask=attn,
-                        max_new_tokens=max_new_tokens,
-                        do_sample=not greedy,
-                        temperature=temperature if not greedy else None,
-                        top_p=top_p if not greedy else None,
-                        pad_token_id=tokenizer.eos_token_id,
-                    )[0].detach().cpu()
-                    if save_generation_logits:
-                        hs_layers, generation_step_logits = forward_hidden_states_all_layers(
-                            model,
-                            gen_ids.unsqueeze(0),
-                            return_generation_logits=True,
-                            generation_prompt_len=prompt_len,
-                        )
-                    else:
-                        hs_layers = forward_hidden_states_all_layers(model, gen_ids.unsqueeze(0))
-                        generation_step_logits = None
-                scores_per_layer, scores_agg = token_scores_from_hs_layers(
-                    hs_layers, scoring_vectors, layers, aggregate=aggregate
-                )
-                generation_logits_payload: Dict[str, np.ndarray] = {}
-                if save_generation_logits and generation_step_logits is not None:
-                    generation_logits_payload = _pack_generation_logits_arrays(
-                        generation_step_logits,
-                        logits_top_k=generation_logits_top_k,
-                        logits_dtype_name=generation_logits_dtype,
-                        logits_source="steered_model" if should_steer else "raw_model",
-                    )
-
-                token_ids = gen_ids.numpy().astype(np.int32)
-                tokens = _decode_tokens(tokenizer, token_ids)
-                completion_ids = token_ids[prompt_len:]
-                completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True)
-                completion_scores = scores_agg[prompt_len:]
-                score_mean = float(np.mean(completion_scores)) if completion_scores.size else float("nan")
-
-                alpha_label = _alpha_label(float(alpha), alpha_unit)
-                base = f"prompt_{i:03d}_{prompt_slug}_{alpha_label}"
-                if save_token_scores_npz:
-                    npz_path = os.path.join(out_dir, f"{base}.npz")
-                    npz_payload: Dict[str, Any] = dict(
-                        token_ids=token_ids,
-                        prompt_len=np.array([prompt_len], dtype=np.int32),
-                        scores_per_layer=scores_per_layer,
-                        scores_agg=scores_agg,
-                        layer_indices=np.array(layers, dtype=np.int32),
-                    )
-                    npz_payload.update(generation_logits_payload)
-                    np.savez_compressed(npz_path, **npz_payload)
-                else:
-                    npz_path = None
-
-                if save_html:
-                    html_path = os.path.join(out_dir, f"{base}.html")
-                    title = f"prompt {i:03d} | {prompt_slug} | {alpha_label}"
-                    render_token_heatmap(tokens, scores_agg.tolist(), html_path, title=title)
-                    batch_entries.append((title, tokens, scores_agg.tolist()))
-                else:
-                    html_path = None
-
-                segments_path = None
-                if save_segments:
-                    segments_path = os.path.join(out_dir, f"{base}_segments.json")
-                    segments = segment_token_scores(
-                        tokens,
-                        scores_agg.tolist(),
-                        prompt_len=prompt_len,
-                    )
-                    with open(segments_path, "w", encoding="utf-8") as handle:
-                        json.dump(
-                            {"prompt_len": prompt_len, "segments": segments},
-                            handle,
-                            ensure_ascii=False,
-                            indent=2,
-                        )
-
-                rec = {
-                    "prompt": prompt,
-                    "system_prompt": sys_prompt,
-                    "system_prompt_overridden": bool(used_prompt_system),
-                    "alpha": float(alpha),
-                    "alpha_unit": alpha_unit,
-                    "alpha_value": float(alpha_val),
-                    "sampling_seed": seed,
-                    "steer_layers": steer_layer_list,
-                    "completion": completion_text,
-                    "prompt_len": prompt_len,
-                    "layers": layers,
-                    "npz_path": npz_path,
-                    "html_path": html_path,
-                    "segments_path": segments_path,
-                    "score_mean": score_mean,
-                    "do_steering": bool(should_steer),
-                    "random_scoring_vector": bool(random_scoring_vector),
-                    "random_scoring_vector_seed": scoring_seed,
-                    "random_steering_vector": bool(random_steering_vector),
-                    "random_steering_vector_seed": steering_seed,
-                    "generation_logits_saved": bool(generation_logits_payload),
-                    "generation_logits_top_k": (
-                        int(generation_logits_payload["generation_logits_topk_k"][0])
-                        if "generation_logits_topk_k" in generation_logits_payload
-                        else None
-                    ),
-                    "generation_logits_steps": (
-                        int(generation_logits_payload["generation_logits_steps"][0])
-                        if "generation_logits_steps" in generation_logits_payload
-                        else 0
-                    ),
-                    "generation_logits_source": (
-                        str(generation_logits_payload["generation_logits_source"][0])
-                        if "generation_logits_source" in generation_logits_payload
-                        else None
-                    ),
-                    "batch_dir": out_dir,
-                }
-                results.append(rec)
-                self.logger.log("score_prompt", rec)
-                run_idx += 1
-                if total_runs and (
-                    run_idx % progress_every == 0 or run_idx == total_runs
-                ):
-                    _progress_print(
-                        run_idx,
-                        total_runs,
-                        label="Generating",
-                        enabled=show_progress,
-                        last=run_idx == total_runs,
-                    )
-            # Progress bar handles per-run updates; avoid extra log spam here.
-
-        if save_html and batch_entries:
-            batch_path = os.path.join(out_dir, "batch_prompts.html")
-            render_batch_heatmap(batch_entries, batch_path, title="Batch prompt scores")
-            self.logger.log("score_prompt_batch", {"html_path": batch_path, "count": len(batch_entries)})
-
-        return results
-
-    @classmethod
-    def load(cls, run_dir: str, model_bundle: ModelBundle) -> "ConceptProbe":
-        config_path = os.path.join(run_dir, "config.json")
-        concept_path = os.path.join(run_dir, "concept.json")
-        with open(config_path, "r", encoding="utf-8") as f:
-            cfg = json.loads(f.read())
-        with open(concept_path, "r", encoding="utf-8") as f:
-            c = ConceptSpec.from_config({"concept": json.loads(f.read())})
-
-        logger = JsonlLogger(
-            os.path.join(run_dir, "log.jsonl"),
-            enabled=bool(cfg.get("output", {}).get("log_jsonl", True)),
-        )
-        console = ConsoleLogger(bool(cfg.get("output", {}).get("console", True)))
-        obj = cls(
-            model_bundle=model_bundle,
-            config=cfg,
-            concept=c,
-            run_dir=run_dir,
-            logger=logger,
-            console=console,
-        )
-
-        tensors = np.load(os.path.join(run_dir, "tensors.npz"))
-        obj.concept_vectors = tensors["concept_vectors"]
-        obj.best_layer = int(tensors["best_layer"][0])
-        obj.sweep_d = tensors["sweep_d"]
-        obj.sweep_p = tensors["sweep_p"]
-        metrics_path = os.path.join(run_dir, "metrics.json")
-        if os.path.exists(metrics_path):
-            with open(metrics_path, "r", encoding="utf-8") as f:
-                metrics = json.loads(f.read())
-                obj.proj_std_best_layer = metrics.get("proj_std_best_layer")
-        return obj
+    def _require_model(self, what: str) -> None:
+        self._require_trained()
+        if self.model_bundle is None:
+            raise ValueError(f"{what} needs the model loaded: attach it with probe.attach(model, tokenizer) "
+                             "(the probe's identity says which model it belongs to).")
 
 
-class ProbeWorkspace:
-    def __init__(
-        self,
-        root_dir: Optional[str] = None,
-        config_overrides: Optional[Dict[str, Any]] = None,
-        defaults_path: Optional[str] = None,
-        model_id: Optional[str] = None,
-        project_directory: Optional[str] = None,
-    ) -> None:
-        self.project_directory = project_directory
+# ------------------------------------------------------------------------------------- fit helpers
+def _warn(message: str) -> None:
+    import warnings
 
-        if project_directory:
-            run_dir = os.path.abspath(project_directory)
-            cfg_path = os.path.join(run_dir, "config.json")
-            if not os.path.exists(cfg_path):
-                raise FileNotFoundError(f"project_directory must point to a trained run dir containing config.json: {run_dir}")
-            with open(cfg_path, "r", encoding="utf-8") as f:
-                cfg = json.loads(f.read())
-            if config_overrides:
-                cfg = deep_merge(cfg, config_overrides)
-            if model_id:
-                cfg["model"]["model_id"] = model_id
-            # root_dir isn't used for loading, but keep it consistent for callers.
-            if root_dir:
-                cfg["output"]["root_dir"] = root_dir
+    warnings.warn(message, stacklevel=3)
 
-            self.config = cfg
-            self.root_dir = cfg["output"].get("root_dir", "outputs")
-            self.console = ConsoleLogger(cfg["output"].get("console", False))
-            self.console.info(f"Loading model {cfg['model']['model_id']}...")
-            self.model_bundle = ModelBundle.load(cfg["model"])
-            self.console.info(f"Model loaded ({self.model_bundle.num_layers} layers).")
-            return
 
-        cfg = resolve_config(config_overrides, defaults_path=defaults_path)
-        if model_id:
-            cfg["model"]["model_id"] = model_id
-        if root_dir:
-            cfg["output"]["root_dir"] = root_dir
-        self.config = cfg
-        self.root_dir = cfg["output"]["root_dir"]
-        ensure_dir(self.root_dir)
-        self.console = ConsoleLogger(cfg["output"].get("console", False))
-        self.console.info(f"Loading model {cfg['model']['model_id']}...")
-        self.model_bundle = ModelBundle.load(cfg["model"])
-        self.console.info(f"Model loaded ({self.model_bundle.num_layers} layers).")
+def _token_projections(s: EvalSet, directions: np.ndarray) -> Tuple[Optional[List[np.ndarray]], Optional[List[np.ndarray]]]:
+    """Each item's per-token projections ``(tokens, layers)`` of a set read token by token, per pole."""
+    if s.tokens is None:
+        return None, None
+    out = []
+    for reps in s.tokens:
+        data, items = _as_array(reps), np.asarray(reps.items)
+        proj = np.einsum("nld,ld->nl", data.astype(np.float64), directions.astype(np.float64))
+        out.append([proj[items == i] for i in dict.fromkeys(items.tolist())])
+    return out[0], out[1]
 
-    def get_probe(self, name: Optional[str] = None, project_directory: Optional[str] = None) -> "ConceptProbe":
-        """Load a previously trained probe without retraining.
 
-        If this workspace was created with project_directory=..., that directory is used by default.
-        """
-        run_dir = os.path.abspath(project_directory or self.project_directory or "")
-        if not run_dir:
-            raise ValueError("No project_directory provided. Create ProbeWorkspace(project_directory=...) or pass it to get_probe().")
+def _record_estimator_notes(probe: ConceptProbe, est: Any, flips: List[int], choices: List[Choice]) -> None:
+    """Record what the estimator did on the caller's behalf: directions turned around so the positive
+    pole projects higher, and coordinates an outlier rule left out."""
+    if flips:
+        probe.estimator = dict(probe.estimator, flipped_layers=sorted(flips))
+        choices.append(Choice("direction sign", "as the estimator gave it", "turned around",
+                              f"at layers {sorted(flips)} the positive pole projected lower, so those directions were "
+                              "turned around (a direction points toward the positive pole)"))
+    dropped = list(getattr(est, "dropped", None) or [])
+    if dropped:
+        probe.estimator = dict(probe.estimator, dropped_coordinates=list(dropped))
+        choices.append(Choice("outlier coordinates", "every coordinate", "some left out",
+                              f"the outlier rule left out {sum(dropped)} coordinates over {len(dropped)} layers "
+                              f"(per layer: {list(dropped)})"))
 
-        probe = ConceptProbe.load(run_dir, model_bundle=self.model_bundle)
-        # Use the workspace's config + console so scoring behavior matches workspace.config.
-        if probe.config != self.config:
-            self.console.warn(
-                "Workspace config differs from the saved run config; scoring will use the "
-                "workspace config (settings like layer_selection or score_aggregate may not "
-                "match what was used at training time)."
-            )
-        probe.config = self.config
-        probe.console = self.console
 
-        if name is not None:
-            if safe_slug(str(probe.concept.name)) != safe_slug(str(name)):
-                raise ValueError(
-                    f"Loaded probe concept name '{probe.concept.name}' does not match requested name '{name}'."
-                )
-        return probe
-
-    def train_concept(
-        self,
-        concept: Optional[ConceptSpec] = None,
-        concept_overrides: Optional[Dict[str, Any]] = None,
-        run_name: Optional[str] = None,
-        config_overrides: Optional[Dict[str, Any]] = None,
-    ) -> ConceptProbe:
-        cfg = deep_merge(self.config, config_overrides or {})
-        if concept is None:
-            concept = ConceptSpec.from_config(cfg, concept_overrides)
-        elif concept_overrides:
-            concept = ConceptSpec.from_config({"concept": concept.to_dict()}, concept_overrides)
-
-        run_tag = run_name or now_tag()
-        concept_dir = os.path.join(self.root_dir, safe_slug(concept.name), run_tag)
-        ensure_dir(concept_dir)
-        log_path = os.path.join(concept_dir, "log.jsonl")
-        logger = JsonlLogger(log_path, enabled=bool(cfg.get("output", {}).get("log_jsonl", True)))
-
-        probe = ConceptProbe(
-            model_bundle=self.model_bundle,
-            config=cfg,
-            concept=concept,
-            run_dir=concept_dir,
-            logger=logger,
-            console=self.console,
-        )
-        return probe.train()
+def _metrics(ev: ReadingEvaluation, shuffle: Optional[Dict[str, Any]], neutral: Optional[Dict[str, Any]],
+             n_pos: int, n_neg: int) -> Dict[str, Any]:
+    """The numbers a fitted probe saves: its evaluation's, the label-shuffle control and the neutral texts."""
+    main = ev.main
+    return {
+        "layer": int(ev.layer), "d": main.d, "p": main.p, "d_ci95": main.d_ci95, "auroc": main.auroc,
+        "auroc_ci95": main.auroc_ci95, "null_d95": main.null_d95, "accuracy": main.accuracy,
+        "accuracy_ci95": main.accuracy_ci95, "d_all_eval": None if not np.isfinite(main.d_by_layer[ev.layer])
+        else float(main.d_by_layer[ev.layer]), "n_train": {"pos": int(n_pos), "neg": int(n_neg)},
+        "evaluation": ev.to_dict(), "label_shuffle": shuffle, "neutral": neutral,
+    }

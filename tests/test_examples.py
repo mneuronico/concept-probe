@@ -30,4 +30,5 @@ def test_example_concepts_have_required_sections():
         assert concept.get("eval_neg_texts"), f"missing eval_neg_texts in {path.name}"
         assert prompts.get("train_questions"), f"missing train_questions in {path.name}"
         assert prompts.get("eval_questions"), f"missing eval_questions in {path.name}"
-        assert prompts.get("neutral_system"), f"missing neutral_system in {path.name}"
+        # the examples run with the library default: no system prompt
+        assert prompts.get("neutral_system") is None, f"{path.name} sets prompts.neutral_system"

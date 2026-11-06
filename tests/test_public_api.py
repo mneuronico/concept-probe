@@ -5,69 +5,33 @@ import concept_probe
 
 def test_public_api_surface_is_exposed():
     expected = {
-        "ConceptSpec",
-        "ConceptProbe",
-        "ProbeWorkspace",
-        "EvalRunResult",
-        "ConsoleLogger",
-        "aggregate_eval_batches",
-        "generate_multi_probe_report",
-        "load_defaults",
-        "multi_probe_score_prompts",
-        "rate_batch_coherence",
-        "rate_batch_coherence_safe",
-        "rehydrate_batch_analysis",
-        "resolve_config",
-        "run_multi_scored_eval",
-        "run_scored_eval",
-        "score_text_tokens",
-        "simple_equality_evaluator",
-        "train_concept_from_json",
+        "ModelBundle", "read_texts", "read_encoded", "Readout", "Reps", "fit_directions", "ConceptProbe", "EvalSet",
+        "evaluate_reading", "summarize_tokens", "Add", "Ablate", "Patch", "Rotate", "intervene", "generate",
+        "answer_logprobs", "evaluate_steering", "exact_match", "SteeringEvaluation", "Rubric", "APIJudge",
+        "LocalJudge", "AgentJudge", "rate_saved", "critique_task", "Target", "TargetProbe", "read_target",
+        "target_shape", "audit_dataset", "guide", "configure",
     }
-
     assert expected.issubset(set(concept_probe.__all__))
+    assert all(hasattr(concept_probe, name) for name in concept_probe.__all__)
 
 
-def test_defaults_json_is_packaged():
-    defaults_path = files("concept_probe").joinpath("defaults.json")
-
-    assert defaults_path.is_file()
-
-
-def test_load_defaults_contains_expected_sections():
-    defaults = concept_probe.load_defaults()
-
-    for key in ("model", "training", "evaluation", "steering", "output", "prompts"):
-        assert key in defaults
+def test_what_was_replaced_is_gone():
+    # one way to do each thing: the configuration-driven pipeline and the duplicates are not there
+    gone = {"ConceptSpec", "ProbeWorkspace", "load_defaults", "resolve_config", "train_concept_from_json",
+            "multi_probe_score_prompts", "score_text_tokens", "extract_text_reps", "extract_completion_reps",
+            "concept_direction", "ConsoleLogger"}
+    assert not gone & set(concept_probe.__all__)
+    assert not any(hasattr(concept_probe, name) for name in gone)
+    assert not files("concept_probe").joinpath("defaults.json").is_file()
 
 
-def test_resolve_config_applies_nested_overrides():
-    resolved = concept_probe.resolve_config(
-        {
-            "model": {"model_id": "test/model"},
-            "output": {"root_dir": "tmp-output"},
-        }
-    )
-
-    assert resolved["model"]["model_id"] == "test/model"
-    assert resolved["output"]["root_dir"] == "tmp-output"
-
-
-def test_concept_spec_round_trip():
-    concept = concept_probe.ConceptSpec.from_config(
-        {
-            "concept": {
-                "name": "calm_vs_urgent",
-                "pos_label": "calm",
-                "neg_label": "urgent",
-                "pos_system": "calm system",
-                "neg_system": "urgent system",
-                "eval_pos_texts": ["steady"],
-                "eval_neg_texts": ["rush"],
-            }
-        }
-    )
-
-    assert concept.to_dict()["name"] == "calm_vs_urgent"
-    assert concept.eval_pos_texts == ["steady"]
-    assert concept.eval_neg_texts == ["rush"]
+def test_the_guides_ship_with_the_package():
+    listing = concept_probe.guide()
+    for name in ("workflow", "datasets", "steering", "delegating"):
+        assert f"- {name}:" in listing and concept_probe.guide(name).startswith("# ")
+    try:
+        concept_probe.guide("nope")
+    except ValueError as exc:
+        assert "workflow" in str(exc)
+    else:
+        raise AssertionError("an unknown guide should raise")

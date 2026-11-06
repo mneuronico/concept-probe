@@ -5,8 +5,8 @@ import numpy as np
 import pytest
 import torch
 
-from concept_probe.probe import _get_final_norm_module
-from concept_probe.utils import deep_merge, json_dump, jsonl_append, now_tag
+from concept_probe.reading import _get_final_norm_module
+from concept_probe.utils import json_dump, now_tag
 
 
 def _strict_loads(text):
@@ -26,13 +26,6 @@ def test_json_dump_is_strict_json(tmp_path):
     assert data["i"] == 3
 
 
-def test_jsonl_append_is_strict_json(tmp_path):
-    path = tmp_path / "log.jsonl"
-    jsonl_append(str(path), {"score": float("nan"), "vals": [1.0, float("-inf")]})
-    line = path.read_text(encoding="utf-8").strip()
-    data = _strict_loads(line)
-    assert data["score"] is None
-    assert data["vals"] == [1.0, None]
 
 
 def test_now_tag_unique_and_sortable():
@@ -41,11 +34,6 @@ def test_now_tag_unique_and_sortable():
     assert all(len(t) == len("YYYYmmdd_HHMMSS_uuuuuu") for t in tags)
 
 
-def test_deep_merge_nested():
-    base = {"a": {"b": 1, "c": 2}, "d": 3}
-    merged = deep_merge(base, {"a": {"c": 9}})
-    assert merged == {"a": {"b": 1, "c": 9}, "d": 3}
-    assert base["a"]["c"] == 2  # no mutation
 
 
 def _wrapper_with(path: str) -> torch.nn.Module:

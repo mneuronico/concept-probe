@@ -3,8 +3,8 @@ import numpy as np
 import pytest
 import torch
 
-import concept_probe
-from concept_probe.probe import _encode_text_for_read, concept_direction, normed_np
+from concept_probe.directions import concept_direction, normed_np
+from concept_probe.inputs import _encode_text_for_read
 
 RNG = np.random.default_rng(0)
 POS = RNG.normal(0.5, 1.0, size=(8, 5)).astype(np.float32)
@@ -49,16 +49,8 @@ def test_unknown_normalization_is_rejected():
         concept_direction(POS, NEG, "whiten")
 
 
-def test_exposed_in_public_api():
-    assert "concept_direction" in concept_probe.__all__
-    assert concept_probe.concept_direction is concept_direction
 
 
-def test_defaults_keep_the_historical_behaviour():
-    training = concept_probe.load_defaults()["training"]
-    assert training["direction_normalization"] == "none"
-    assert training["train_text_role"] == "user"
-    assert training["train_text_prompt"] is None
 
 
 class _ChatTok:
@@ -79,17 +71,28 @@ class _ChatTok:
 
 def test_assistant_role_puts_the_text_after_the_assistant_header():
     tok = _ChatTok()
-    ids, plen = _encode_text_for_read(tok, "one two three", "sys", role="assistant", prompt="question?")
+    ids, start, end = _encode_text_for_read(tok, "one two three", "sys", role="assistant", prompt="question?")
     assert tok.messages == [{"role": "system", "content": "sys"}, {"role": "user", "content": "question?"}]
-    assert plen == 5 and ids.shape == (1, 8)
-    assert ids[0, plen:].tolist() == [7, 7, 7]
+    assert (start, end) == (5, 8) and ids.shape == (1, 8)
+    assert ids[0, start:end].tolist() == [7, 7, 7]
 
 
-def test_assistant_role_without_system_or_prompt():
-    tok = _ChatTok()
-    ids, plen = _encode_text_for_read(tok, "one two", "", role="assistant", prompt=None)
-    assert tok.messages == []
-    assert ids[0, plen:].tolist() == [7, 7]
+class _NoEmptyChatTok(_ChatTok):
+    def apply_chat_template(self, messages, add_generation_prompt, tokenize=True, return_tensors=None):
+        if not messages:
+            raise IndexError("list index out of range")  # what real templates do with no message
+        return super().apply_chat_template(messages, add_generation_prompt, tokenize, return_tensors)
+
+
+def test_a_reply_with_no_turn_before_it_is_tried_and_fails_clearly_if_the_template_cannot():
+    # A template that formats a reply alone reads it; one that cannot (real tokenizers raise
+    # IndexError on an empty message list) fails with a clear message instead.
+    ids, start, end = _encode_text_for_read(_ChatTok(), "one two", "", role="assistant", prompt=None)
+    assert ids[0, start:end].tolist() == [7, 7]
+    with pytest.raises(ValueError, match="cannot format a reply with no turn before it.*prompt=.*system="):
+        _encode_text_for_read(_NoEmptyChatTok(), "one two", "", role="assistant", prompt=None)
+    ids, start, end = _encode_text_for_read(_NoEmptyChatTok(), "one two", "", role="assistant", prompt="q")
+    assert ids[0, start:end].tolist() == [7, 7]
 
 
 def test_assistant_role_rejects_message_lists_and_unknown_roles():
