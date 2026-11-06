@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import torch
 
-from concept_probe import Encoded, NonFiniteActivationsError, Patch, extract_text_reps, intervene, read_encoded
+from concept_probe import Encoded, NonFiniteActivationsError, Patch, intervene, read_encoded, read_texts
 from concept_probe.modeling import get_transformer_layers
 from fakes import CharChatTok
 from tiny_model import TinyCausalLM
@@ -47,7 +47,7 @@ def test_reading_texts_stops_at_the_overflow():
     handle = _overflow_from(model, 3)
     try:
         with pytest.raises(NonFiniteActivationsError, match="bfloat16"):
-            extract_text_reps(model, CharChatTok(), ["pp x"])
+            read_texts(model, CharChatTok(), ["pp x"], cache=False)
     finally:
         handle.remove()
 
@@ -61,3 +61,15 @@ def test_a_patch_that_writes_nan_is_caught():
     with intervene(model, Patch(1, [2], torch.zeros(16))):
         hs = _every_token(model)
     np.testing.assert_allclose(hs[2, 1], 0.0)
+
+
+def test_finite_layers_can_still_be_read_when_later_ones_overflow():
+    model = TinyCausalLM()
+    handle = _overflow_from(model, 2)
+    try:
+        early = read_texts(model, CharChatTok(), ["pp x"], layers=[0, 1], cache=False)
+        assert np.isfinite(early.data).all()
+        with pytest.raises(NonFiniteActivationsError, match=r"layers \[2\]"):
+            read_texts(model, CharChatTok(), ["pp x"], layers=[1, 2], cache=False)
+    finally:
+        handle.remove()

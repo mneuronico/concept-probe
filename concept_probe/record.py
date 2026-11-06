@@ -13,7 +13,7 @@ from .settings import settings
 
 @dataclass(frozen=True)
 class Choice:
-    #: the option the choice is about, as it is set (e.g. ``"model.dtype"``)
+    #: the option the choice is about, as it is set (e.g. ``"dtype"``)
     setting: str
     #: what the caller asked for (often ``"auto"`` or a default left untouched)
     requested: Any

@@ -65,27 +65,35 @@ def apply_chat(tokenizer, messages: List[Dict[str, str]], add_generation_prompt:
     return out
 
 
-def apply_tokenizer_overrides(tokenizer, model_cfg: Dict[str, Any]) -> None:
-    """Apply the tokenizer settings of ``model_cfg``.
+def apply_tokenizer_overrides(tokenizer, *, chat_template: Optional[str] = None,
+                              chat_template_date: Optional[str] = DEFAULT_CHAT_TEMPLATE_DATE) -> List[Choice]:
+    """Set the tokenizer's chat template and its date; returns the choices made.
 
-    ``model.chat_template`` (a Jinja string, default null) replaces the tokenizer's own chat
-    template for every use of this bundle: training, eval, scoring, generation. Use it to
-    drop parts a template injects unasked, such as the dated system block of Llama 3.x.
+    ``chat_template`` (a Jinja string) replaces the tokenizer's own chat template for every use:
+    reading, scoring, generation. Use it to drop parts a template injects unasked, such as the
+    dated system block of Llama 3.x.
 
-    ``model.chat_template_date`` (ISO ``YYYY-MM-DD``, default 2024-07-26) is the date written by
-    templates that would otherwise write today's date; null writes the real current date.
+    ``chat_template_date`` (ISO ``YYYY-MM-DD``; default 2024-07-26) is the date written by templates
+    that would otherwise write today's date, so the same text gives the same input any day (that is
+    announced when the template writes a date); None writes the real current date.
     """
-    chat_template = model_cfg.get("chat_template")
+    choices: List[Choice] = []
     if chat_template:
         tokenizer.chat_template = str(chat_template)
         setattr(tokenizer, _CHAT_TEMPLATE_OVERRIDE_ATTR, str(chat_template))
-    date = model_cfg.get("chat_template_date", DEFAULT_CHAT_TEMPLATE_DATE)
-    if date is not None:
+    if chat_template_date is not None:
         try:
-            datetime.date.fromisoformat(str(date))
+            datetime.date.fromisoformat(str(chat_template_date))
         except ValueError as exc:
-            raise ValueError(f"model.chat_template_date must be an ISO date (YYYY-MM-DD) or null; got {date!r}") from exc
-    setattr(tokenizer, _CHAT_TEMPLATE_DATE_ATTR, date)
+            raise ValueError(f"chat_template_date must be an ISO date (YYYY-MM-DD) or None; got "
+                             f"{chat_template_date!r}") from exc
+        template = str(getattr(tokenizer, "chat_template", "") or "")
+        if "date_string" in template or "strftime_now" in template:
+            choices.append(Choice("chat_template_date", "today", str(chat_template_date),
+                                  "the chat template writes today's date; a fixed one keeps the same text the same input "
+                                  "any day (chat_template_date=None writes today's)"))
+    setattr(tokenizer, _CHAT_TEMPLATE_DATE_ATTR, chat_template_date)
+    return choices
 
 
 def _transformers_version() -> tuple:
@@ -170,20 +178,20 @@ def resolve_dtype(requested: Any, model_type: str = "", device_map: Any = "auto"
     The compute capability decides, not ``torch.cuda.is_bf16_supported()``, which also says yes on
     GPUs that only emulate bfloat16 (slowly), such as the Turing T4 and RTX 20xx.
     """
-    if requested is None or str(requested) != "auto":
-        return torch_dtype_from_str(requested if requested is not None else "bfloat16"), None
+    if requested is not None and str(requested) != "auto":
+        return torch_dtype_from_str(requested), None
     gemma3 = str(model_type or "").startswith("gemma3")
     if not torch.cuda.is_available() or _on_cpu(device_map):
-        return torch.float32, Choice("model.dtype", "auto", "float32", "no CUDA GPU in use: float32 on the CPU")
+        return torch.float32, Choice("dtype", "auto", "float32", "no CUDA GPU in use: float32 on the CPU")
     caps = [torch.cuda.get_device_capability(i) for i in range(torch.cuda.device_count())]
     major, minor = min(caps)
     gpu = f"{torch.cuda.get_device_name(0)} (compute capability {major}.{minor})"
     if major >= 8:
-        return torch.bfloat16, Choice("model.dtype", "auto", "bfloat16", f"{gpu} computes in bfloat16")
+        return torch.bfloat16, Choice("dtype", "auto", "bfloat16", f"{gpu} computes in bfloat16")
     if gemma3:
-        return torch.float32, Choice("model.dtype", "auto", "float32",
+        return torch.float32, Choice("dtype", "auto", "float32",
                                      f"{gpu} has no native bfloat16, and Gemma 3 overflows in float16")
-    return torch.float16, Choice("model.dtype", "auto", "float16", f"{gpu} has no native bfloat16")
+    return torch.float16, Choice("dtype", "auto", "float16", f"{gpu} has no native bfloat16")
 
 
 # ------------------------------------------------------------------------------------ quantization
@@ -196,7 +204,7 @@ def _require(package: str, what: str) -> None:
     try:
         __import__(package)
     except Exception as exc:
-        raise ImportError(f"{what} needs {package}; install it, or set model.quantization to null.") from exc
+        raise ImportError(f"{what} needs {package}; install it, or load without quantization.") from exc
 
 
 def _patch_hqq_compute_dtype() -> bool:
@@ -248,29 +256,28 @@ def quantization_identity(config: Any) -> Any:
     return json.loads(json.dumps(keep, sort_keys=True, default=str))
 
 
-def resolve_quantization(model_cfg: Dict[str, Any], dtype: torch.dtype) -> Tuple[Any, List[Choice]]:
-    """The transformers quantization config for ``model.quantization``.
+def resolve_quantization(spec: Any, dtype: torch.dtype) -> Tuple[Any, List[Choice]]:
+    """The transformers quantization config for ``quantization``.
 
-    ``model.quantization`` is null, a level of :data:`QUANTIZATION_LEVELS`, a transformers
-    quantization config object, or a dict with its ``quant_method`` (e.g. bitsandbytes with double
+    ``quantization`` is None, a level of :data:`QUANTIZATION_LEVELS`, a transformers quantization
+    config object, or a dict with its ``quant_method`` (e.g. bitsandbytes with double
     quantization). NF4 computes in the model's ``dtype``. A quantization that cannot load fails
     instead of loading the full-precision model, since the two give different activations.
     """
     choices: List[Choice] = []
-    spec = model_cfg.get("quantization")
     if spec is None:
         return None, choices
     if isinstance(spec, str):
         if spec not in QUANTIZATION_LEVELS:
-            raise ValueError(f"model.quantization must be null, one of {QUANTIZATION_LEVELS}, a dict with "
+            raise ValueError(f"quantization must be None, one of {QUANTIZATION_LEVELS}, a dict with "
                              f"'quant_method', or a transformers quantization config; got {spec!r}")
         if spec in ("nf4", "int8"):
-            _require("bitsandbytes", f"model.quantization={spec!r}")
+            _require("bitsandbytes", f"quantization={spec!r}")
             if spec == "int8":
                 return BitsAndBytesConfig(load_in_8bit=True), choices
             return BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
                                       bnb_4bit_compute_dtype=dtype), choices
-        _require("hqq", f"model.quantization={spec!r}")
+        _require("hqq", f"quantization={spec!r}")
         from transformers import HqqConfig
 
         if _patch_hqq_compute_dtype():
@@ -280,7 +287,7 @@ def resolve_quantization(model_cfg: Dict[str, Any], dtype: torch.dtype) -> Tuple
         return HqqConfig(nbits=nbits, group_size=16 if nbits == 2 else 64), choices
     if isinstance(spec, dict):
         if "quant_method" not in spec:
-            raise ValueError("model.quantization as a dict needs its 'quant_method' (as in transformers' configs).")
+            raise ValueError("quantization as a dict needs its 'quant_method' (as in transformers' configs).")
         from transformers.quantizers.auto import AutoQuantizationConfig
 
         return AutoQuantizationConfig.from_dict(dict(spec)), choices
@@ -370,7 +377,8 @@ def identity_from_config(model_cfg: Dict[str, Any]) -> Dict[str, Any]:
 def identity_mismatches(a: Dict[str, Any], b: Dict[str, Any]) -> List[str]:
     """The identity settings (:data:`IDENTITY_KEYS`) on which ``a`` and ``b`` differ, as text.
     A setting that one side does not give (an identity given as the model id alone) is not
-    compared, nor a dtype one side does not know (an old run saved with ``"auto"``); and a model
+    compared, nor a model id or dtype one side does not know (a model loaded without its name, an
+    old run saved with ``"auto"``); and a model
     given by its snapshot in the Hugging Face cache is the same as the repo it comes from (runs
     saved by earlier versions recorded the path)."""
     out = []
@@ -378,13 +386,22 @@ def identity_mismatches(a: Dict[str, Any], b: Dict[str, Any]) -> List[str]:
         if key not in a or key not in b:
             continue
         va, vb = a.get(key), b.get(key)
-        if key == "dtype" and (va is None or vb is None):
+        if key in ("dtype", "model_id") and (va is None or vb is None):  # not known on one side
             continue
         if key == "model_id" and va is not None and vb is not None:
             va, vb = _repo_id_from_path(va), _repo_id_from_path(vb)
         if va != vb:
             out.append(f"{key}: {va!r} vs {vb!r}")
     return out
+
+
+def _pad_with_eos(tokenizer: Any) -> List[Choice]:
+    """Give a tokenizer without a pad token its end-of-sequence token as one (batches need padding)."""
+    if getattr(tokenizer, "pad_token_id", None) is None and getattr(tokenizer, "eos_token", None) is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+        return [Choice("tokenizer pad token", None, tokenizer.eos_token,
+                       "the tokenizer has no pad token and batches need one; padding is masked out")]
+    return []
 
 
 # ---------------------------------------------------------------------------------------- attention
@@ -440,20 +457,33 @@ class ModelBundle:
     choices: List[Choice] = field(default_factory=list)
 
     @classmethod
-    def load(cls, model_cfg: Dict[str, Any]) -> "ModelBundle":
-        """Load the tokenizer and model of ``model_cfg`` (the config's ``model`` section).
+    def load(
+        cls,
+        model_id: str,
+        *,
+        dtype: Any = "auto",
+        quantization: Any = None,
+        device_map: Any = "auto",
+        chat_template: Optional[str] = None,
+        chat_template_date: Optional[str] = DEFAULT_CHAT_TEMPLATE_DATE,
+        hf_token_env: str = "HF_TOKEN",
+        console: Optional[bool] = None,
+        **from_pretrained: Any,
+    ) -> "ModelBundle":
+        """Load the tokenizer and model of ``model_id`` (a Hugging Face repo id or a local folder).
 
-        ``dtype`` may be ``"auto"`` (see :func:`resolve_dtype`); ``quantization`` is null, a level of
-        :data:`QUANTIZATION_LEVELS`, a dict or a transformers config (see
-        :func:`resolve_quantization`). With ``HF_HUB_OFFLINE`` set, a repo id is loaded from its
-        cached snapshot (see :func:`resolve_model_source`). The choices made on the caller's behalf
-        are in ``choices``; they are not printed here.
+        ``dtype="auto"`` (the default, also for None) picks a safe precision for the GPU and the
+        model (see :func:`resolve_dtype`); ``quantization`` is None, a level of
+        :data:`QUANTIZATION_LEVELS` (``"nf4"``, ``"int8"``, ``"hqq4"``, ...), a dict or a
+        transformers config (see :func:`resolve_quantization`). ``chat_template`` and
+        ``chat_template_date`` set the tokenizer's template (see :func:`apply_tokenizer_overrides`).
+        With ``HF_HUB_OFFLINE`` set, a repo id is loaded from its cached snapshot. Other keyword
+        arguments go to ``from_pretrained`` (``revision``, ``max_memory``, ...). Every choice made on
+        the caller's behalf is announced and kept in ``choices``.
         """
-        model_id = model_cfg["model_id"]
-        hf_token = os.environ.get(model_cfg.get("hf_token_env", "HF_TOKEN"), None)
-        device_map = model_cfg.get("device_map", "auto")
+        hf_token = os.environ.get(hf_token_env, None)
         choices: List[Choice] = []
-        requested_dtype = model_cfg.get("dtype", "auto")
+        requested_dtype = "auto" if dtype is None else dtype
         source = resolve_model_source(model_id, token=hf_token)
         if source != model_id:
             choices.append(Choice("model source", model_id, source, "HF_HUB_OFFLINE is set: the cached snapshot"))
@@ -465,13 +495,13 @@ class ModelBundle:
         dtype, dtype_choice = resolve_dtype(requested_dtype, model_type, device_map)
         if dtype_choice is not None:
             choices.append(dtype_choice)
-        quant, quant_choices = resolve_quantization(model_cfg, dtype)
+        quant, quant_choices = resolve_quantization(quantization, dtype)
         choices.extend(quant_choices)
 
         tokenizer = AutoTokenizer.from_pretrained(source, token=hf_token)
-        if tokenizer.pad_token_id is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        apply_tokenizer_overrides(tokenizer, model_cfg)
+        choices.extend(_pad_with_eos(tokenizer))
+        choices.extend(apply_tokenizer_overrides(tokenizer, chat_template=chat_template,
+                                                 chat_template_date=chat_template_date))
 
         model = AutoModelForCausalLM.from_pretrained(
             source,
@@ -479,6 +509,7 @@ class ModelBundle:
             device_map=device_map,
             quantization_config=quant,
             **_dtype_kwargs(dtype),
+            **from_pretrained,
         )
         model.eval()
         _warn_if_gemma3_float16(model, dtype, model_id)
@@ -492,24 +523,30 @@ class ModelBundle:
         if attention is not None:  # said here, with the other choices of loading, and not again
             choices.append(attention)
             setattr(model, "_concept_probe_attention_announced", True)
+        announce(choices, console=console)
         return cls(model_id=model_id, tokenizer=tokenizer, model=model, identity=identity, choices=choices)
 
     @classmethod
-    def from_loaded(cls, model: Any, tokenizer: Any, model_id: Optional[str] = None,
-                    model_cfg: Optional[Dict[str, Any]] = None) -> "ModelBundle":
-        """Wrap a model and tokenizer that are already loaded (entry 4 of LIBRARY_ISSUES).
-
-        ``model_cfg`` applies its tokenizer settings (``chat_template``, ``chat_template_date``) to
-        ``tokenizer`` in place, as :meth:`load` does. The identity is read from the model itself.
-        """
-        if tokenizer.pad_token_id is None and getattr(tokenizer, "eos_token", None) is not None:
-            tokenizer.pad_token = tokenizer.eos_token
-        if model_cfg is not None:
-            apply_tokenizer_overrides(tokenizer, model_cfg)
-        elif getattr(tokenizer, _CHAT_TEMPLATE_DATE_ATTR, "missing") == "missing":
-            apply_tokenizer_overrides(tokenizer, {})
+    def from_loaded(cls, model: Any, tokenizer: Any, model_id: Optional[str] = None, *,
+                    chat_template: Optional[str] = None,
+                    chat_template_date: Optional[str] = DEFAULT_CHAT_TEMPLATE_DATE,
+                    console: Optional[bool] = None) -> "ModelBundle":
+        """Wrap a model and tokenizer that are already loaded. The tokenizer is set up as :meth:`load`
+        sets it up (a pad token, the template and its date), in place, and that is announced; a
+        tokenizer already set up by the library is left as it is. The identity is read from the
+        model itself (``model_id`` names it when the model does not)."""
+        choices: List[Choice] = []
+        if getattr(tokenizer, _CHAT_TEMPLATE_DATE_ATTR, "missing") == "missing":
+            choices.extend(_pad_with_eos(tokenizer))
+            choices.extend(apply_tokenizer_overrides(tokenizer, chat_template=chat_template,
+                                                     chat_template_date=chat_template_date))
+        elif chat_template is not None:
+            choices.extend(apply_tokenizer_overrides(tokenizer, chat_template=chat_template,
+                                                     chat_template_date=chat_template_date))
+        announce(choices, console=console)
         identity = identity_of(model, tokenizer, model_id)
-        return cls(model_id=identity["model_id"] or "unknown", tokenizer=tokenizer, model=model, identity=identity)
+        return cls(model_id=identity["model_id"] or "unknown", tokenizer=tokenizer, model=model, identity=identity,
+                   choices=choices)
 
     @property
     def num_layers(self) -> int:

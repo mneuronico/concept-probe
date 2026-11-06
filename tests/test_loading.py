@@ -1,6 +1,5 @@
 """Loading (layer 0): the dtype chosen for "auto", quantization settings, the model identity, and
 workspaces built around a model that is already loaded."""
-import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -9,7 +8,7 @@ import torch
 import transformers
 from transformers import BitsAndBytesConfig
 
-from concept_probe import ConceptProbe, ConceptSpec, ModelBundle, ProbeWorkspace, modeling
+from concept_probe import ConceptProbe, ModelBundle, modeling, read_texts
 from concept_probe.modeling import (
     identity_from_config,
     identity_mismatches,
@@ -43,7 +42,7 @@ def test_auto_dtype_follows_the_gpu_and_the_model_family(monkeypatch, capability
     _gpu(monkeypatch, capability)
     dtype, choice = resolve_dtype("auto", model_type, "auto")
     assert dtype is expected
-    assert choice.setting == "model.dtype" and choice.requested == "auto"
+    assert choice.setting == "dtype" and choice.requested == "auto"
     assert f"{capability[0]}.{capability[1]}" in choice.reason
 
 
@@ -75,50 +74,47 @@ def test_load_resolves_auto_from_the_model_config_and_records_it(monkeypatch):
                                dtype=kw.get("dtype"))
 
     monkeypatch.setattr(modeling, "AutoModelForCausalLM", SimpleNamespace(from_pretrained=model_from_pretrained))
-    bundle = ModelBundle.load({"model_id": "google/gemma-3-270m-it", "dtype": "auto"})
+    bundle = ModelBundle.load("google/gemma-3-270m-it", console=False)
     assert loaded["dtype"] is torch.float32
     assert bundle.identity["dtype"] == "float32"
-    assert [c.chosen for c in bundle.choices if c.setting == "model.dtype"] == ["float32"]
+    assert [c.chosen for c in bundle.choices if c.setting == "dtype"] == ["float32"]
 
 
-def test_the_default_dtype_is_auto():
-    assert concept_probe_defaults()["model"]["dtype"] == "auto"
+def test_the_default_dtype_is_auto_and_none_means_auto():
+    import inspect
 
-
-def concept_probe_defaults():
-    from concept_probe import load_defaults
-
-    return load_defaults()
+    assert inspect.signature(ModelBundle.load).parameters["dtype"].default == "auto"
+    assert resolve_dtype(None)[1] is not None and resolve_dtype(None)[1].requested == "auto"
 
 
 # ---------------------------------------------------------------------------------- quantization
 def test_named_levels_build_their_configs():
-    cfg, _ = resolve_quantization({"quantization": "nf4"}, torch.float16)
+    cfg, _ = resolve_quantization("nf4", torch.float16)
     assert cfg.load_in_4bit and cfg.bnb_4bit_quant_type == "nf4" and cfg.bnb_4bit_compute_dtype == torch.float16
-    cfg, _ = resolve_quantization({"quantization": "int8"}, torch.float16)
+    cfg, _ = resolve_quantization("int8", torch.float16)
     assert cfg.load_in_8bit
-    assert resolve_quantization({"quantization": None}, torch.float16) == (None, [])
+    assert resolve_quantization(None, torch.float16) == (None, [])
 
 
 def test_hqq_levels_patch_the_quantizer_once_and_say_so():
     pytest.importorskip("hqq")
     from transformers.quantizers.quantizer_hqq import HqqHfQuantizer
 
-    cfg, choices = resolve_quantization({"quantization": "hqq2"}, torch.float16)
+    cfg, choices = resolve_quantization("hqq2", torch.float16)
     assert quantization_identity(cfg) == "hqq2"
     assert getattr(HqqHfQuantizer, "_concept_probe_dtype_patch", False)
-    _, again = resolve_quantization({"quantization": "hqq4"}, torch.float16)
+    _, again = resolve_quantization("hqq4", torch.float16)
     assert len(choices) <= 1 and again == []
 
 
 def test_a_dict_or_object_config_is_passed_through():
-    cfg, _ = resolve_quantization({"quantization": {"quant_method": "bitsandbytes", "load_in_4bit": True,
+    cfg, _ = resolve_quantization({"quant_method": "bitsandbytes", "load_in_4bit": True,
                                                     "bnb_4bit_quant_type": "nf4",
-                                                    "bnb_4bit_use_double_quant": True}}, torch.float16)
+                                                    "bnb_4bit_use_double_quant": True}, torch.float16)
     assert cfg.bnb_4bit_use_double_quant
     assert isinstance(quantization_identity(cfg), dict)  # no name for double quantization
     own = BitsAndBytesConfig(load_in_8bit=True)
-    assert resolve_quantization({"quantization": own}, torch.float16)[0] is own
+    assert resolve_quantization(own, torch.float16)[0] is own
 
 
 def test_saved_configs_from_earlier_versions_are_read_in_todays_terms():
@@ -131,9 +127,9 @@ def test_saved_configs_from_earlier_versions_are_read_in_todays_terms():
 
 def test_bad_quantization_settings_raise():
     with pytest.raises(ValueError, match="one of"):
-        resolve_quantization({"quantization": "q4"}, torch.float16)
+        resolve_quantization("q4", torch.float16)
     with pytest.raises(ValueError, match="quant_method"):
-        resolve_quantization({"quantization": {"bits": 4}}, torch.float16)
+        resolve_quantization({"bits": 4}, torch.float16)
 
 
 def test_quantization_identities_name_the_levels():
@@ -165,42 +161,28 @@ def test_identity_reads_the_repo_id_out_of_a_cached_snapshot_path():
 
 
 # -------------------------------------------------------------------------------- loaded models
-def _ws(tmp_path, **kw):
-    return ProbeWorkspace(config_overrides={"output": {"root_dir": str(tmp_path), "console": False}}, **kw)
+def test_a_loaded_model_is_wrapped_and_its_tokenizer_set_up_and_announced():
+    tok = CharChatTok()
+    tok.pad_token_id = None
+    tok.eos_token = "|"
+    bundle = ModelBundle.from_loaded(TinyCausalLM(), tok, model_id="tiny-test", console=False)
+    assert bundle.model_id == "tiny-test" and bundle.num_layers == 4 and bundle.identity["dtype"] == "float64"
+    assert "tokenizer pad token" in [c.setting for c in bundle.choices]
 
 
-def test_a_workspace_takes_a_loaded_model_and_its_settings_replace_the_config(tmp_path):
-    ws = _ws(tmp_path, model=TinyCausalLM(), tokenizer=CharChatTok(), model_id="tiny-test")
-    assert ws.model_bundle.model_id == "tiny-test" and ws.model_bundle.num_layers == 4
-    assert ws.config["model"]["model_id"] == "tiny-test" and ws.config["model"]["dtype"] == "float64"
-    replaced = [c for c in ws.model_bundle.choices if c.setting == "model"]
-    assert replaced and replaced[0].chosen == {"dtype": "float64"}  # model_id was passed, so the config had it
-
-
-def test_a_workspace_takes_a_model_bundle(tmp_path):
-    bundle = ModelBundle.from_loaded(TinyCausalLM(), CharChatTok(), model_id="tiny-test")
-    assert _ws(tmp_path, model=bundle).model_bundle is bundle
-    with pytest.raises(ValueError, match="not both"):
-        _ws(tmp_path, model=bundle, tokenizer=CharChatTok())
-    with pytest.raises(ValueError, match="tokenizer"):
-        _ws(tmp_path, model=TinyCausalLM())
-
-
-def test_a_trained_probe_records_its_model_identity_and_refuses_another(tmp_path):
-    ws = _ws(tmp_path, model=TinyCausalLM(), tokenizer=CharChatTok(), model_id="tiny-test")
-    concept = ConceptSpec(name="c", pos_label="p", neg_label="n", pos_system="", neg_system="",
-                          train_pos_texts=["pp x", "p y"], train_neg_texts=["nn x", "n y"],
-                          eval_pos_texts=["pxp", "ppz"], eval_neg_texts=["nxn", "nnz"])
-    probe = ws.train_concept(concept, run_name="r",
-                             config_overrides={"training": {"train_prompt_mode": "texts"},
-                                               "evaluation": {"selection_split": None}})
-    metrics = json.loads(open(f"{probe.run_dir}/metrics.json").read())
-    assert metrics["model_identity"]["model_id"] == "tiny-test" and metrics["model_identity"]["dtype"] == "float64"
-    assert metrics["read_batch_size"] == 16
-    assert ws.get_probe(project_directory=probe.run_dir).identity["model_id"] == "tiny-test"
-    other = _ws(tmp_path, model=TinyCausalLM().float(), tokenizer=CharChatTok(), model_id="tiny-test")
+def test_a_fitted_probe_records_its_model_identity_and_refuses_another(tmp_path):
+    model, tok = TinyCausalLM(), CharChatTok()
+    P, N = read_texts(model, tok, ["pp x", "p y"], cache=False), read_texts(model, tok, ["nn x", "n y"], cache=False)
+    probe = ConceptProbe.fit(P, N, layer=1, save=True, root_dir=str(tmp_path), run_name="r")
+    assert probe.identity["dtype"] == "float64"
+    assert ConceptProbe.load(probe.run_dir).identity == probe.identity
     with pytest.raises(ValueError, match="dtype: 'float64' vs 'float32'"):
-        other.get_probe(project_directory=probe.run_dir)
+        ConceptProbe.load(probe.run_dir, TinyCausalLM().float(), tok)
+    other = read_texts(TinyCausalLM().float(), tok, ["pp x", "p y"], cache=False)
+    with pytest.raises(ValueError, match="another model"):
+        ConceptProbe.fit(other, other, layer=1, model=model, tokenizer=tok, save=False)
+    assert ConceptProbe.fit(other, other, layer=1, model=model, tokenizer=tok, allow_model_mismatch=True,
+                            save=False).identity["dtype"] == "float64"
 
 
 def test_a_probe_given_only_its_model_id_attaches_to_that_model():

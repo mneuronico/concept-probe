@@ -8,12 +8,13 @@ itself. `evaluate_steering` handles the three.
 ## How
 
 ```python
-ev = evaluate_steering(probe, prompts, doses=[-0.25, -0.1, 0.1, 0.25], unit="resid_norm",
-                       n_random=10, measures={"positivity": my_classifier})
+ev = evaluate_steering(probe, prompts, doses=[-0.25, -0.1, 0.1, 0.25], measures={"positivity": my_classifier})
 ev.row(0.25)["effects"]["positivity"]   # change from dose 0, its interval, the controls' p95
 ev.largest_coherent_dose
 ```
 
+- **Doses** are in residual-stream norms of each layer by default (0.25 adds a quarter of a typical
+  token's norm), which means about the same in any model.
 - **Random controls.** At each dose, `n_random` (10) random directions of the same length at each
   layer. An effect counts when it goes beyond the 95th percentile of the controls' effects
   (`beyond_controls`).
@@ -24,7 +25,8 @@ ev.largest_coherent_dose
 - **Measures of effect independent of the probe.** The steering probe's own reading of the steered
   text is informative but not independent of the steering. Add at least one measure that is not
   the probe: a classifier, a judge (`judge.measure(rubric)`), another probe (`probes=`), or whether
-  an answer is right (`items=` and `exact_match()`).
+  an answer is right (`items=` and `exact_match()`). Probes are measured in raw scores and in SDs of
+  their own eval items.
 
 ## Measures added later
 

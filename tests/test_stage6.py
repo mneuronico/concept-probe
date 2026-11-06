@@ -107,9 +107,8 @@ def test_a_confound_check_tells_what_the_probe_reads():
 def test_red_team_reports_accuracy_and_neutral_shift():
     model, tok = TinyCausalLM(), CharChatTok()
     probe = ConceptProbe.fit(read_texts(model, tok, TRAIN_POS, cache=False), read_texts(model, tok, TRAIN_NEG, cache=False),
-                             layer=1, model=model, tokenizer=tok, save=False,
-                             calibrate=(read_texts(model, tok, EVAL_POS, cache=False),
-                                        read_texts(model, tok, EVAL_NEG, cache=False)))
+                             layer=1, model=model, tokenizer=tok, save=False)
+    probe.calibrate(read_texts(model, tok, EVAL_POS, cache=False), read_texts(model, tok, EVAL_NEG, cache=False))
     out = red_team(probe, {"x_heavy": {"pos": ["pxxxx", "xxpxx"], "neg": ["nxxxx", "xxnxx"],
                                        "neutral": [("xxxx", "yyyy"), ("xyxy", "yxyx")]}})
     attack = out["x_heavy"]

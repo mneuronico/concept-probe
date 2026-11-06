@@ -4,7 +4,7 @@ import os
 import random
 import re
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 import numpy as np
 import torch
@@ -57,26 +57,6 @@ def json_dump(path: str, obj: Dict[str, Any]) -> None:
         json.dump(_json_sanitize(obj), f, ensure_ascii=True, indent=2, sort_keys=True, allow_nan=False)
 
 
-def jsonl_append(path: str, obj: Dict[str, Any]) -> None:
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(_json_sanitize(obj), ensure_ascii=True, allow_nan=False) + "\n")
-
-
-def unknown_config_keys(override: Dict[str, Any], reference: Dict[str, Any], prefix: str = "") -> List[str]:
-    """Dotted keys of ``override`` that ``reference`` does not have, recursing into dict sections.
-
-    A misspelled key in a config override would otherwise be merged and then never read.
-    """
-    unknown: List[str] = []
-    for key, value in override.items():
-        path = f"{prefix}{key}"
-        if key not in reference:
-            unknown.append(path)
-        elif isinstance(value, dict) and isinstance(reference[key], dict):
-            unknown.extend(unknown_config_keys(value, reference[key], prefix=f"{path}."))
-    return unknown
-
-
 def resolve_layer_index(value: Any, num_layers: int, what: str = "layer") -> int:
     """One layer index in ``[0, num_layers)``.
 
@@ -102,16 +82,6 @@ def resolve_layer_index(value: Any, num_layers: int, what: str = "layer") -> int
     return resolved
 
 
-def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
-    merged = dict(base)
-    for k, v in override.items():
-        if isinstance(v, dict) and isinstance(merged.get(k), dict):
-            merged[k] = deep_merge(merged[k], v)
-        else:
-            merged[k] = v
-    return merged
-
-
 def safe_slug(name: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9._-]+", "_", name.strip())
     return slug.strip("._-") or "concept"
@@ -122,17 +92,6 @@ def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
-
-def jsonl_to_pretty(jsonl_path: str, out_path: str) -> None:
-    events = []
-    with open(jsonl_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            events.append(json.loads(line))
-    json_dump(out_path, {"events": events})
 
 
 def torch_dtype_from_str(value: str) -> torch.dtype:

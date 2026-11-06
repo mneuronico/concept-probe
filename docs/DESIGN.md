@@ -1,6 +1,7 @@
 # Propuesta de diseño: concept-probe por capas
 
-Estado: **propuesta, sin código; decisiones tomadas el 2026-11-05** (sección 7). Base: rama
+Estado: **etapas 0 a 8 hechas** (2026-11-05 y 2026-11-06; cada etapa dice qué cambió y cómo se
+comprobó). Empezó como propuesta, con las decisiones de la sección 7. Base: rama
 `review-consistency-fixes` (commit `558d06b` más los dos commits de documentación). Responde a
 [`LIBRARY_ISSUES.md`](LIBRARY_ISSUES.md): las entradas 1–31, los criterios de diseño y la tabla de
 funciones que faltan. Los nombres de módulos y funciones son provisionales, salvo los que fija la
@@ -234,6 +235,8 @@ diversidad (10), desde `shared/audit.py` y `shared/redteam.py` del workshop cuan
 - Absorbe: `visuals.py`, el guardado dentro de `train` y `score_*`, `reporting.py`.
 
 ### La API de alto nivel, como composición
+
+*Así se hizo en las etapas 0 a 7; la Etapa 8 la sacó, porque repetía las capas (sección 6).*
 
 `ProbeWorkspace.train_concept` hace lo mismo que hoy, como una secuencia de pasos de las capas:
 
@@ -555,9 +558,116 @@ Cualquier otra diferencia es un bug. Salida: una tabla antes/después por experi
   En Gemma 3 1B (la batería), lo de valencia da igual; el d de B1 sale 2.70 y no 2.73 porque la
   Etapa 1 guardó las representaciones en float16 (redondeadas igual, dan 2.73).
 
+**Etapa 8 — Limpieza para usuarios nuevos.** Pedida el 2026-11-06, después de la Etapa 7: que la
+librería sirva a alguien que llega por primera vez, con una sola forma de hacer cada cosa, lo que el
+workshop tuvo que escribir afuera adentro, y ninguna heurística que decida por el usuario.
+
+*a. Lo que el workshop tuvo que escribir afuera, adentro.*
+- **Elegir qué ítems eligen la capa.** `evaluate_reading` y `ConceptProbe.fit` toman, además de una
+  fracción al azar, la lista de ítems (o pares) que eligen la capa; el resto mide. Hoy, para las
+  mitades fijas del workshop, hay que armar dos sets.
+- **Resumir por texto los puntajes de cada token.** Con representaciones leídas token por token,
+  la probe da el puntaje de cada texto con cualquier agregado (media, máximo, mínimo, percentiles,
+  el más extremo) en una llamada.
+- **Las unidades del puntaje.** Además del z en desvíos, la escala de los polos (0 el punto medio,
+  +1 y −1 la media de cada polo), que es la que usó el workshop en todas sus figuras.
+- **Una medida, una unidad.** En `evaluate_steering`, una probe se mide siempre igual, con la
+  unidad en el nombre (el puntaje crudo, y en desvíos de su propio eval); hoy pasa de crudo a z
+  según tenga calibración, sin avisar.
+- **Acierto con un umbral dado, con su intervalo.** Hoy hay que hacer el bootstrap a mano.
+- **Leer lo que el modelo generó.** `read_texts` toma un pedido por texto (`prompt=` una lista), y
+  `Generations` se lee directo, con o sin el system prompt con que se generó (D2), sin pasar por
+  `extract_completion_reps`.
+
+*b. Lo que se saca, porque hay otra forma de hacer lo mismo.* La API anterior es un recorrido sobre
+una configuración: `ProbeWorkspace`, `ConceptSpec` y `ConceptProbe.train` (unas 850 líneas de
+`probe.py`), `score_prompts`, el flujo por JSON (`train_concept_from_json`, `concept_runner.py`) y
+las secciones de `defaults.json` que sólo lo sirven. Todo lo que hace ya está en las capas
+(generar, leer, ajustar, evaluar, el control de etiquetas mezcladas, los gráficos, el guardado); lo
+único propio es hacerlo en una llamada, incluido generar los textos de cada polo bajo un system
+prompt, que con las capas son unas líneas y va como receta en la guía. Se sacan también:
+- `extract_text_reps` y `extract_completion_reps` (los reemplaza `read_texts`, con varias lecturas y
+  un pedido por texto);
+- `score_text_tokens` (`read_texts` token por token y la probe);
+- `multi_probe_score_prompts` y `multi_probe.py` (`evaluate_steering(probes=...)`, o `generate` con
+  `watch=`);
+- `concept_direction` como nombre público (`fit_directions`), y `ConsoleLogger`, que es interno.
+
+`ModelBundle.load` pasa de un diccionario de configuración a argumentos (`ModelBundle.load(model_id,
+dtype="auto", quantization=None, ...)`). `ConceptProbe` queda como el objeto probe: se arma con
+`fit` o `from_directions`, se calibra, lee (`project`, `scores`, `z`, `classify`, `score_texts`),
+empuja (`steering`), se guarda y se carga, también desde las corridas guardadas por versiones
+anteriores.
+
+*c. Nombres heredados.* Las lecturas `assistant_*` leen el texto aunque no tenga rol de asistente:
+pasan a `text_*` (`text_mean`, `text_last`, `text_first`, `text_max`, `text_last_k`,
+`text_tokens`), y `sequence_all_mean` a `sequence_mean`. Lo que se guarda de una probe deja los
+nombres de la corrida vieja (`best_d`, `sigma_best_layer`, `concept_vectors`).
+
+*d. Defaults según lo que el workshop recomienda.* Al sacar el recorrido viejo, desaparece su default
+de entrenar con respuestas bajo un system prompt por polo (M3: se mezcla con el prompt y generaliza
+peor a textos escritos) y el empuje sin controles de `score_prompts` (el único camino, `evaluate_steering`,
+corre diez). La dosis de `evaluate_steering` pasa a estar por defecto en normas del residuo de cada
+capa (0.25 es un cuarto del largo típico de una activación), comparable entre modelos.
+
+*e. Heurísticas que no deciden solas.* Regla: una heurística avisa, mide o marca, pero no cambia lo
+que el usuario pidió ni le impide hacer algo sin una opción explícita para hacerlo igual; toda
+elección automática se anuncia. Una revisión de la librería entera con esa regla (2026-11-06)
+encontró, fuera de lo que se saca en (b):
+- *Errores silenciosos, a arreglar:* `TargetProbe` busca su capa por la posición de la fila, así
+  que con representaciones leídas en algunas capas puede leer otra (pasa a buscarla por el nombre
+  de la capa, o falla); `z` y `classify` aplican una calibración sin mirar con qué lectura se hizo
+  (pasa a fallar si no coincide); el z de cada texto puntuado queda vacío sin motivo cuando la
+  calibración no promedió (pasa a decir por qué).
+- *Elecciones sin anunciar, a anunciar o a dejar en manos del usuario:* al muestrear, valen los
+  `top_k`, `temperature` y `top_p` del modelo sin que se diga (se registran los usados y se
+  anuncian); con `greedy=True` se descartan una temperatura o una semilla pasadas (aviso); leer
+  textos no avisa cuando se ignora el system prompt, no hay template o falta el BOS (avisa, como al
+  entrenar); `TargetProbe` elige la capa y mide con los mismos ítems sin decirlo (aviso, como
+  `evaluate_reading`); el umbral de clasificar usa una regularización fija (parámetro); envolver un
+  modelo ya cargado le pone fecha al template y token de relleno al tokenizer del usuario (se
+  anuncia); `dtype=None` es bfloat16 también en CPU (pasa a ser `"auto"`); un set de evaluación con
+  un polo vacío se deja afuera, ítems que no se pueden guardar quedan como null, y un juez propio
+  guardado se reemplaza por el de defecto al cargar (avisos).
+- *Cambios a lo pedido, a sacar o anunciar:* repartir la dosis entre las capas, también las que el
+  usuario listó (sólo cuando lo pide); una ventana de capas recortada en los bordes del modelo, y la
+  dosis 0 agregada como base (se anuncian); `from_directions` normaliza las direcciones dadas y
+  empuja con ellas (se empuja con lo que se dio, y se anuncia); el signo de una dirección dada
+  vuelta para que el polo positivo quede arriba (se registra en qué capas).
+- *Bloqueos sin salida, a abrir:* activaciones no finitas en cualquier capa frenan la lectura
+  aunque las capas pedidas estén bien (sólo se miran las pedidas); leer un texto como respuesta sin
+  un turno antes falla aunque el template lo permita (se intenta); `fit(model=...)` con otro modelo
+  no tiene `allow_model_mismatch`; una respuesta ilegible de un juez por API tira abajo toda la
+  llamada (queda ese ítem sin puntaje, y se informa).
+- *Ya cumplen:* la regla de coherencia, los controles (`beyond_controls`), `reads_confound`, las
+  notas de la auditoría y el cero del ataque sólo marcan; `dtype="auto"`, el caché, la dirección de
+  empuje y el núcleo de atención se anuncian. `drop_outliers` pasa a decir cuántas coordenadas
+  sacó, y las 200 mezclas del control de forma de `TargetProbe.fit` pasan a ser un parámetro.
+
+*f. Documentación.* El README empieza por el camino por capas (cargar, leer, ajustar, evaluar con
+controles, empujar con controles) y deja las notas de versión en `CHANGELOG.md`; los nombres
+públicos se reducen a los que un usuario usa; las guías se actualizan.
+
+*g. Comprobación.* Los tests de referencia pasan a fijar los mismos números por el camino nuevo;
+los scripts de la Etapa 7 que usan lo que se saca se pasan a lo nuevo y se vuelven a correr, con los
+mismos números.
+
+- *Hecha el 2026-11-06.* Todo lo de (a) a (f). Los tests de referencia calculan las salidas guardadas
+  de la API vieja (entrenar en los cinco modos, puntuar textos, empujar con controles, varias probes,
+  leer) por las capas, y dan lo mismo. Los diez scripts de la Etapa 7 (probes-workshop,
+  `experiments/etapa7_libreria/`) pasaron a la forma nueva y dan los mismos números, salvo los
+  tiempos: M0 por `read_texts` y `fit` (capa, d, p, intervalos y los siete z iguales), M3 con
+  `generate`, `read_encoded` y `fit` en lugar de los modos de la configuración (mismas capas, mismos
+  d y las mismas generaciones), M8 con `calibrate` y `z(unit="poles")` (la cuenta a mano de M8, +0.54),
+  M9 con los defaults nuevos de `evaluate_steering` (la misma tabla; cada probe medida en crudo y en
+  desvíos de su eval, con nombre), y el acierto con `probe.accuracy`. Al pasarlos apareció lo que
+  faltaba para un d de dos grupos de puntajes cualesquiera, que el workshop sacaba de una función
+  interna: `cohen_d` es público. Los análisis viejos del workshop que se habían roto por funciones
+  que se movieron vuelven a correr, con los mismos resultados.
+
 Por qué este orden: las etapas 1-3 son la lectura, que es lo que más usó el workshop y de lo que
 dependen todas las demás; la 4 y la 5 son la generación y el empuje; la 6 necesita todo lo anterior
-estable; la 7 prueba el conjunto.
+estable; la 7 prueba el conjunto; la 8 la deja lista para quien llega.
 
 ## 7. Decisiones (tomadas el 2026-11-05)
 

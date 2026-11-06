@@ -2,6 +2,7 @@
 one layer and returns a unit direction in the raw activation space, oriented so that the first
 group projects higher. A new estimator is added by registering it, without touching anything else.
 """
+import importlib
 from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 
 import numpy as np
@@ -29,7 +30,7 @@ def concept_direction(pos_reps: np.ndarray, neg_reps: np.ndarray, normalization:
     direction. ``"none"`` is computed in the input dtype, as training always did.
 
     In a trained probe this is the :class:`MeanDiff` estimator. It sets the direction to read with;
-    steering uses the raw difference of means unless asked otherwise (``steering.steer_direction``),
+    steering uses the raw difference of means unless asked otherwise (``ConceptProbe.fit(steer=...)``),
     since ``"var"`` tends to read better and steer less (see the README).
     """
     if normalization not in DIRECTION_NORMALIZATIONS:
@@ -47,7 +48,8 @@ def concept_direction(pos_reps: np.ndarray, neg_reps: np.ndarray, normalization:
 
 
 # ------------------------------------------------------------------------------------- estimators
-def _drop_outliers_direction(pos: np.ndarray, neg: np.ndarray, sd_ratio: float, t_max: float) -> np.ndarray:
+def _drop_outliers_direction(pos: np.ndarray, neg: np.ndarray, sd_ratio: float, t_max: float,
+                             dropped: Optional[List[int]] = None) -> np.ndarray:
     """The raw difference of means with the "massive" coordinates that the concept does not move
     set to zero: a coordinate is dropped when its pooled within-pole SD is more than ``sd_ratio``
     times the layer's median SD and the poles' means do not differ measurably on it (|t| below
@@ -58,7 +60,10 @@ def _drop_outliers_direction(pos: np.ndarray, neg: np.ndarray, sd_ratio: float, 
     var = 0.5 * (pos.var(axis=0) + neg.var(axis=0))
     sd = np.sqrt(var)
     t = np.abs(gap) / np.sqrt(var / len(pos) + var / len(neg) + 1e-24)
-    gap[(sd > sd_ratio * np.median(sd)) & (t < t_max)] = 0.0
+    drop = (sd > sd_ratio * np.median(sd)) & (t < t_max)
+    gap[drop] = 0.0
+    if dropped is not None:
+        dropped.append(int(drop.sum()))
     return normed_np(gap).astype(np.float32)
 
 
@@ -75,10 +80,12 @@ class MeanDiff:
         if normalization not in self.NORMALIZATIONS:
             raise ValueError(f"mean_diff normalization must be one of {self.NORMALIZATIONS}; got {normalization!r}")
         self.normalization, self.sd_ratio, self.t_max = normalization, float(sd_ratio), float(t_max)
+        #: with ``"drop_outliers"``, how many coordinates each fit left out (one entry per layer fitted)
+        self.dropped: List[int] = []
 
     def fit(self, pos: np.ndarray, neg: np.ndarray) -> np.ndarray:
         if self.normalization == "drop_outliers":
-            return _drop_outliers_direction(pos, neg, self.sd_ratio, self.t_max)
+            return _drop_outliers_direction(pos, neg, self.sd_ratio, self.t_max, self.dropped)
         return concept_direction(pos, neg, self.normalization)
 
     def spec(self) -> Dict[str, Any]:
@@ -90,7 +97,7 @@ class MeanDiff:
 
 def _sklearn(what: str) -> None:
     try:
-        import sklearn  # noqa: F401
+        importlib.import_module("sklearn")
     except Exception as exc:
         raise ImportError(f"The {what} estimator needs scikit-learn: pip install concept-probe[stats].") from exc
 
@@ -142,7 +149,7 @@ class LDA:
 
 
 ESTIMATORS: Dict[str, Callable[..., Any]] = {"mean_diff": MeanDiff, "logistic": Logistic, "lda": LDA}
-#: Shorthand names, as the config takes them.
+#: Shorthand names of the estimators.
 SHORTHANDS: Dict[str, Dict[str, Any]] = {
     "mean_diff": {"kind": "mean_diff"},
     "mean_diff_var": {"kind": "mean_diff", "normalization": "var"},
@@ -185,7 +192,7 @@ def estimator_spec(estimator: Any) -> Dict[str, Any]:
 
 def fit_directions(
     estimator: Any, pos: np.ndarray, neg: np.ndarray, layers: Optional[Sequence[int]] = None,
-    erase: Optional["Eraser"] = None,
+    erase: Optional["Eraser"] = None, flips: Optional[List[int]] = None,
 ) -> np.ndarray:
     """One unit direction per layer, ``(layers, dim)`` float32, from reps ``(n, layers, dim)``.
 
@@ -196,8 +203,10 @@ def fit_directions(
     (:meth:`Eraser.read_directions`): projections then do not depend on the confound.
     """
     est = make_estimator(estimator)
-    pos = np.asarray(pos)
-    neg = np.asarray(neg)
+    if hasattr(est, "dropped"):
+        est.dropped = []
+    pos = np.asarray(getattr(pos, "data", pos))
+    neg = np.asarray(getattr(neg, "data", neg))
     if erase is not None:
         pos, neg = erase.apply(pos), erase.apply(neg)
     out = np.full(pos.shape[1:], np.nan, dtype=np.float32)
@@ -207,6 +216,8 @@ def fit_directions(
         gap = pos[:, l, :].astype(np.float64).mean(axis=0) - neg[:, l, :].astype(np.float64).mean(axis=0)
         if float(gap @ v.astype(np.float64)) < 0:
             v = -v
+            if flips is not None:
+                flips.append(int(l))
         out[l] = v
     if erase is not None:
         out = erase.read_directions(out)

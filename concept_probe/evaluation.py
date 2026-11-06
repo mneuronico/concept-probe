@@ -28,7 +28,7 @@ from .stats import (
     accuracy,
     auroc,
     bootstrap_ci,
-    cohen_d_np,
+    cohen_d,
     random_directions_null,
 )
 
@@ -36,19 +36,26 @@ from .stats import (
 @dataclass
 class EvalSet:
     """Evaluation items: the representations ``(items, layers, dim)`` of the positive and negative
-    ones, how they were read (``context``), and whether they come in ``paired`` rows (row i of both
-    is one pair: the two poles' answers to one question, or a minimal pair of texts). Pairs keep
-    together when the items are split and resampled, and get paired tests."""
+    ones (arrays, or what :func:`concept_probe.read_texts` returns), how they were read
+    (``context``; by default what the representations say), and whether they come in ``paired``
+    rows (row i of both is one pair: the two poles' answers to one question, or a minimal pair of
+    texts). Pairs keep together when the items are split and resampled, and get paired tests.
+    ``tokens``, optionally, the same items read token by token (a ``*_tokens`` readout of each pole):
+    a probe fitted with this set then gets the references that give single tokens a z score."""
 
     name: str
-    pos: np.ndarray
-    neg: np.ndarray
+    pos: Any
+    neg: Any
     context: Optional[ReadContext] = None
     paired: bool = False
     description: str = ""
+    tokens: Optional[Tuple[Any, Any]] = None
 
     def __post_init__(self):
-        self.pos, self.neg = np.asarray(self.pos), np.asarray(self.neg)
+        if self.context is None:
+            self.context = getattr(self.pos, "context", None)
+        self.pos = np.asarray(getattr(self.pos, "data", self.pos))
+        self.neg = np.asarray(getattr(self.neg, "data", self.neg))
         if self.paired and len(self.pos) != len(self.neg):
             raise ValueError(f"eval set {self.name!r} is paired but has {len(self.pos)} positive and "
                              f"{len(self.neg)} negative items.")
@@ -134,6 +141,22 @@ class ReadingEvaluation:
                 "sets": {name: r.to_metrics() for name, r in self.sets.items()}}
 
 
+def _given_split(selection: Any, n_pos: int, n_neg: int, paired: bool
+                 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """``(pos selection, pos rest, neg selection, neg rest)`` from the indices the caller gave."""
+    if isinstance(selection, tuple) and len(selection) == 2 and not np.isscalar(selection[0]):
+        pos_sel, neg_sel = (np.asarray(sorted(set(int(i) for i in part)), dtype=np.int64) for part in selection)
+        if paired and not np.array_equal(pos_sel, neg_sel):
+            raise ValueError("for a paired set, the selection is the same pairs for both poles")
+    else:
+        pos_sel = neg_sel = np.asarray(sorted(set(int(i) for i in selection)), dtype=np.int64)
+    for sel, n, pole in ((pos_sel, n_pos, "positive"), (neg_sel, n_neg, "negative")):
+        if len(sel) and (sel.min() < 0 or sel.max() >= n):
+            raise ValueError(f"selection_split has an index outside the {n} {pole} items")
+    rest = lambda sel, n: np.setdiff1d(np.arange(n), sel)  # noqa: E731
+    return pos_sel, rest(pos_sel, n_pos), neg_sel, rest(neg_sel, n_neg)
+
+
 def _project(reps: np.ndarray, directions: np.ndarray) -> np.ndarray:
     return np.einsum("nld,ld->nl", np.asarray(reps, dtype=np.float64), np.asarray(directions, dtype=np.float64))
 
@@ -144,12 +167,13 @@ def evaluate_reading(
     *,
     primary: Optional[str] = None,
     layer: Optional[int] = None,
-    selection_split: Optional[float] = 0.5,
+    selection_split: Any = 0.5,
     search_layers: Optional[Sequence[int]] = None,
     sweep_select: str = "effect_size",
     n_random: int = 50,
     n_bootstrap: int = 1000,
     n_permutations: int = 1000,
+    threshold_l2: float = 1e-2,
     seed: int = 0,
 ) -> ReadingEvaluation:
     """Choose the probe's layer on the ``primary`` set (the first by default) and measure every set
@@ -159,6 +183,9 @@ def evaluate_reading(
     among layers with d > 0, ``sweep_select="p_value"``) within ``search_layers`` is chosen on a
     ``selection_split`` part of the primary items, and its numbers come from the rest; a
     permutation p for the largest d corrects for having searched over the layers.
+    ``selection_split`` is a fraction (drawn at random, pairs kept together), or the items that
+    choose the layer: a list of indices (the same for both poles; for paired sets, the pairs), or a
+    pair of lists ``(pos indices, neg indices)``. ``None`` chooses and measures on every item.
     """
     if not sets:
         raise ValueError("evaluate_reading needs at least one eval set.")
@@ -187,12 +214,15 @@ def evaluate_reading(
         selection, best = "fixed_layer", int(layer)
     else:
         selection = "all_eval"
-        if selection_split is not None:
+        if selection_split is not None and not isinstance(selection_split, (int, float)):
+            ps, pe, ns, ne = _given_split(selection_split, nP, nN, main.paired)
+        if selection_split is not None and isinstance(selection_split, (int, float)):
             split_rng = np.random.default_rng([seed, 1])
             ps, pe = _split_indices(nP, selection_split, split_rng)
             # Both items of a pair go to the same side: split independently, a pair could help choose
             # the layer through one pole and then be measured through the other.
             ns, ne = (ps, pe) if main.paired else _split_indices(nN, selection_split, split_rng)
+        if selection_split is not None:
             if min(len(ps), len(pe), len(ns), len(ne)) < 2:
                 warnings.append("selection_split needs at least 2 items per pole on each side of the split; the layer "
                                 "is chosen and measured on all eval items.")
@@ -218,7 +248,7 @@ def evaluate_reading(
     threshold = None
     if len(P) and len(N):
         tp, tn = (P[pos_sel, best], N[neg_sel, best]) if selection == "split" else (P[:, best], N[:, best])
-        threshold = dict(fit_threshold(tp, tn), layer=int(best),
+        threshold = dict(fit_threshold(tp, tn, l2=threshold_l2), layer=int(best), l2=float(threshold_l2),
                          fit_on="the selection part of the primary set" if selection == "split" else "all its items")
     results: Dict[str, SetResult] = {}
     p_best = _welch_p_columns(ep[:, [best]], en[:, [best]], paired=main.paired)[0]
@@ -228,7 +258,7 @@ def evaluate_reading(
         paired=main.paired, n_pos=nP, n_neg=nN, pos_scores=P, neg_scores=N, d_curve=sweep_d, p_curve=sweep_p,
         null_d95_curve=report_null if report_null is not None else np.full(num_layers, np.nan),
         measured_on="the held-out part" if selection == "split" else "all items",
-        d=_opt(cohen_d_np(ep[:, best], en[:, best])), p=_opt(p_best),
+        d=_opt(cohen_d(ep[:, best], en[:, best])), p=_opt(p_best),
         d_ci95=_bootstrap_d_ci(ep[:, best], en[:, best], n_bootstrap, np.random.default_rng([seed, 3]), paired=main.paired),
         auroc=_opt(auroc(ep[:, best], en[:, best])),
         auroc_ci95=bootstrap_ci(auroc, ep[:, best], en[:, best], n_bootstrap, np.random.default_rng([seed, 5]),
@@ -244,6 +274,8 @@ def evaluate_reading(
     for k, s in enumerate([s for s in sets if s.name != primary]):
         TP, TN = _project(s.pos, directions), _project(s.neg, directions)
         if len(TP) == 0 or len(TN) == 0:
+            warnings.append(f"the eval set {s.name!r} has no {'positive' if len(TP) == 0 else 'negative'} items, so "
+                            "it is left out.")
             continue
         null = random_directions_null(s.pos, s.neg, n_random, seed=seed) if n_random else np.full(num_layers, np.nan)
         d_curve, p_curve = _cohen_d_columns(TP, TN), _welch_p_columns(TP, TN, paired=s.paired)
@@ -290,7 +322,7 @@ def label_shuffle_control(
         v = fit_directions(estimator, train[order[:n_pos]], train[order[n_pos:]])[0]
         a = np.asarray(eval_pos)[:, layer].astype(np.float64) @ v.astype(np.float64)
         b = np.asarray(eval_neg)[:, layer].astype(np.float64) @ v.astype(np.float64)
-        ds.append(abs(cohen_d_np(a, b)))
+        ds.append(abs(cohen_d(a, b)))
     ds = np.asarray(ds)
     return {"n_shuffles": int(n_shuffles), "layer": int(layer), "abs_d_mean": _opt(float(ds.mean())) if len(ds) else None,
             "abs_d_p95": _opt(float(np.percentile(ds, 95))) if len(ds) else None, "abs_d": ds.tolist()}
@@ -307,17 +339,17 @@ def cross_reading(
     layer, and the cosine between the probes' directions. Probes are read on each other's training
     or eval sets to see whether one also encodes the other's concept.
 
-    ``probes`` have ``directions``, ``layer`` and ``concept.name``; ``sets`` map a name to the
+    ``probes`` have ``directions``, ``layer`` and ``name``; ``sets`` map a name to the
     representations ``(pos, neg)``, each ``(items, layers, dim)``.
     """
-    names = [str(p.concept.name) for p in probes]
+    names = [str(p.name) for p in probes]
     table: Dict[str, Dict[str, Dict[str, Optional[float]]]] = {}
     for probe, name in zip(probes, names):
         v = np.asarray(probe.directions)[probe.layer].astype(np.float64)
         row = {}
         for set_name, (pos, neg) in sets.items():
             pos, neg = np.asarray(pos), np.asarray(neg)
-            d = cohen_d_np(pos[:, probe.layer].astype(np.float64) @ v, neg[:, probe.layer].astype(np.float64) @ v)
+            d = cohen_d(pos[:, probe.layer].astype(np.float64) @ v, neg[:, probe.layer].astype(np.float64) @ v)
             null = random_directions_null(pos[:, [probe.layer]], neg[:, [probe.layer]], n_random, seed=seed)[0]
             row[set_name] = {"d": _opt(d), "null_d95": _opt(null)}
         table[name] = row
@@ -446,7 +478,7 @@ def confound_check(
     out: Dict[str, Dict[str, Any]] = {}
     for name, (a, b) in confounds.items():
         A, B = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
-        probe_d = cohen_d_np(A[:, layer] @ V[layer], B[:, layer] @ V[layer])
+        probe_d = cohen_d(A[:, layer] @ V[layer], B[:, layer] @ V[layer])
         null = random_directions_null(A[:, [layer]], B[:, [layer]], n_random, seed=seed)[0]
         conf = fit_directions("mean_diff", A, B).astype(np.float64)
         cos = np.einsum("ld,ld->l", conf, V) / (np.linalg.norm(conf, axis=1) * np.linalg.norm(V, axis=1) + 1e-12)
@@ -455,7 +487,7 @@ def confound_check(
         held = None
         if min(len(sa), len(sb), len(ra), len(rb)) >= 2:
             c = fit_directions("mean_diff", A[sa][:, [layer]], B[sb][:, [layer]])[0].astype(np.float64)
-            held = _opt(cohen_d_np(A[ra, layer] @ c, B[rb, layer] @ c))
+            held = _opt(cohen_d(A[ra, layer] @ c, B[rb, layer] @ c))
         out[str(name)] = {"n_with": len(A), "n_without": len(B), "probe_d": _opt(probe_d), "null_d95": _opt(null),
                           "reads_confound": bool(abs(probe_d) > null) if np.isfinite(null) else None,
                           "confound_direction_d": held, "cosine": cos.tolist(), "cosine_at_layer": float(cos[layer])}
@@ -486,8 +518,8 @@ def red_team(probe: Any, attacks: Mapping[str, Mapping[str, Any]], *, role: str 
         raise ValueError(probe._missing_z_reason(ctx))
 
     def read(texts: Sequence[Any]) -> Any:
-        return read_texts(model, tok, list(texts), role=role, system=system, prompt=prompt, batch_size=batch_size,
-                          cache=False, console=False)
+        return read_texts(model, tok, list(texts), cal.context.readout or "text_mean", role=role, system=system,
+                          prompt=prompt, batch_size=batch_size, cache=False, console=False)
 
     out: Dict[str, Any] = {}
     for name, attack in attacks.items():

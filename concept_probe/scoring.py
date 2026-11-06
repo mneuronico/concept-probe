@@ -9,8 +9,7 @@ generation) and saves it as three files in one folder:
 - ``heatmaps.html``: the heatmaps of all items, with a menu to pick the probe;
 
 plus ``settings.json`` with what the call used. :meth:`Scores.load` reads them back.
-``ConceptProbe.score_texts``, ``ConceptProbe.score_prompts`` and ``multi_probe_score_prompts`` are
-built on these pieces.
+``ConceptProbe.score_texts`` and :func:`concept_probe.evaluate_steering` are built on these pieces.
 """
 import json
 import os
@@ -91,6 +90,23 @@ class Scores:
     settings: Dict[str, Any] = field(default_factory=dict)
     z_missing: Dict[str, Optional[str]] = field(default_factory=dict)
     dir: Optional[str] = None
+
+    def per_text(self, how: str = "mean", probe: Optional[str] = None, *, z: bool = False) -> np.ndarray:
+        """One number per item from its own tokens' scores (the text, or the completion): their
+        ``"mean"``, ``"max"``, ``"min"``, ``"median"``, a percentile ``"p<k>"``, or the most
+        ``"extreme"`` token (farthest from 0, with its sign). ``z=True`` uses the single-token z
+        scores (where the probe has them) instead of the raw ones."""
+        from .stats import summarize_tokens
+
+        name = _single(self.probes, probe)
+        out = []
+        for it in self.items:
+            values = it.token_z[name] if z else it.token_scores[name]
+            if values is None:
+                raise ValueError(f"no z scores for {name!r}: {self.z_missing.get(name)}")
+            own = np.asarray(values, dtype=np.float64)[it.span[0]:it.span[1]]
+            out.append(summarize_tokens(own, np.zeros(len(own), dtype=int), how)[0][0] if len(own) else np.nan)
+        return np.asarray(out, dtype=np.float64)
 
     def __len__(self) -> int:
         return len(self.items)
@@ -251,7 +267,7 @@ def item_z(scorer: TokenScorer, span_per_layer: np.ndarray) -> Optional[float]:
     than the mean (its zero would not apply to a mean)."""
     cal = scorer.calibration
     span = np.asarray(span_per_layer, dtype=np.float64)
-    if cal is None or (cal.context.readout or "assistant_all_mean") != "assistant_all_mean" or span.shape[0] == 0:
+    if cal is None or (cal.context.readout or "text_mean") != "text_mean" or span.shape[0] == 0:
         return None
     z = cal.items_z(span.mean(axis=0)[None, :], scorer.layers, scorer.aggregate)
     return None if z is None else float(z[0])

@@ -32,6 +32,7 @@ import torch
 
 from .generation import _continuation_logprobs, _pad_id
 from .interventions import Add, Intervention
+from .record import Choice, announce
 from .scoring import Condition, Scores, generate_and_score
 from .settings import settings
 from .utils import ensure_dir, json_dump, now_tag
@@ -197,8 +198,10 @@ def _table(items: List[Any], doses: List[float], n_random: int, names: List[str]
                          "coherent": [bool(rule(c, zero)) for c in control_stats]}}, "effects": {}}
         for name in names:
             delta = changes(steered, name)
-            control_means = [float(np.nanmean(changes(c, name))) for c in controls]
-            p95 = float(np.percentile(np.abs(control_means), 95)) if control_means else None
+            control_deltas = [changes(c, name) for c in controls]
+            control_means = [float(np.nanmean(x)) if np.isfinite(x).any() else float("nan") for x in control_deltas]
+            finite = [abs(m) for m in control_means if np.isfinite(m)]
+            p95 = float(np.percentile(finite, 95)) if finite else None
             mean_change = float(np.nanmean(delta)) if np.isfinite(delta).any() else float("nan")
             row["effects"][name] = {
                 "mean": stats[name], "change": mean_change,
@@ -337,6 +340,10 @@ class SteeringEvaluation:
         try:
             json.dumps(items)
         except TypeError:
+            import warnings
+
+            warnings.warn("the items cannot be written as JSON, so steering.json saves them as null; the measures "
+                          "that took them were computed and saved", stacklevel=2)
             items = None
         json_dump(os.path.join(out_dir, "steering.json"), {
             "doses": self.doses, "measures": self.measures, "largest_coherent_dose": self.largest_coherent_dose,
@@ -352,8 +359,15 @@ class SteeringEvaluation:
         data = json.loads(open(os.path.join(path, "steering.json"), encoding="utf-8").read())
         saved = data["settings"].get("coherence_rule")
         if rule is None:
-            rule = (CoherenceRule(tuple(saved["perplexity_ratio"]), saved["repetition_increase"])
-                    if isinstance(saved, dict) and "perplexity_ratio" in saved else CoherenceRule())
+            if isinstance(saved, dict) and "perplexity_ratio" in saved:
+                rule = CoherenceRule(tuple(saved["perplexity_ratio"]), saved["repetition_increase"])
+            else:
+                import warnings
+
+                warnings.warn(f"the evaluation was judged with its own coherence rule ({saved}), which cannot be "
+                              "loaded; measures added now use the default CoherenceRule unless rule= is given",
+                              stacklevel=2)
+                rule = CoherenceRule()
         ev = cls(Scores.load(path), [float(d) for d in data["doses"]], dict(data["measures"]), data["table"],
                  data["largest_coherent_dose"], data["settings"], data.get("items"), path, rule)
         return ev
@@ -365,19 +379,50 @@ class SteeringEvaluation:
 
 
 # ----------------------------------------------------------------------------------------- the sweep
-def _resolve_steer(steer: Any, unit: str, layers: Any, distribute: Optional[bool], positions: Any
-                   ) -> Tuple[Callable[[float], Intervention], Optional[Any], str]:
-    """``dose -> intervention``, the steering probe (or None), and a label."""
-    if hasattr(steer, "steering") and hasattr(steer, "concept"):
-        steer._require_model("evaluate_steering")
-        steer_layers = steer.steer_layer_list(layers)
-        steer._check_alpha_unit(unit)
-        return (lambda d: steer.steering(d, unit, layers=steer_layers, distribute=distribute, positions=positions),
-                steer, f"{steer.concept.name} ({unit})")
+def _is_probe(obj: Any) -> bool:
+    from .probe import ConceptProbe
+
+    return isinstance(obj, ConceptProbe)
+
+
+def _eval_sd(probe: Any) -> Optional[float]:
+    """The SD of a probe's score on its own eval items (its first calibration), or None."""
+    if not getattr(probe, "calibrations", None):
+        return None
+    cal = probe.calibrations[0]
+    layers = probe._score_layers()
+    sd = float(np.mean(np.asarray(cal.scale)[layers]))
+    return sd if np.isfinite(sd) and sd > 0 else None
+
+
+def _prompt_norms(model, tokenizer, prompts: Sequence[Any], system: Optional[str], batch_size: int) -> np.ndarray:
+    """The mean residual norm per layer of the prompts' tokens, read as generation feeds them."""
+    from .reading import read_texts
+
+    reps = read_texts(model, tokenizer, list(prompts), "text_mean", system=system, generation=True, norms=True,
+                      batch_size=batch_size, cache=False, console=False)
+    return np.asarray(reps.norms, dtype=np.float64).mean(axis=0)
+
+
+def _resolve_steer(steer: Any, unit: str, layers: Any, window: Optional[int], distribute: bool, positions: Any,
+                   norms: Optional[np.ndarray]) -> Tuple[Callable[[float], Intervention], str]:
+    """``dose -> intervention``, and a label."""
+    if _is_probe(steer):
+        steer_layers = steer.steer_layer_list(layers, window)
+        if norms is None:
+            steer._check_alpha_unit(unit)
+            return (lambda d: steer.steering(d, unit, layers=steer_layers, distribute=distribute, positions=positions),
+                    f"{steer.name} ({unit})")
+        share = 1.0 / len(steer_layers) if distribute else 1.0
+        vectors = {l: np.asarray(steer.steer_directions[l], dtype=np.float32) for l in steer_layers}
+        return (lambda d: Add(vectors, alpha={l: float(d) * share * float(norms[l]) for l in steer_layers},
+                              positions=positions,
+                              label=f"steering with {steer.name!r}: alpha {float(d):g} (resid_norm of the prompts)"),
+                f"{steer.name} (resid_norm of the prompts)")
     if isinstance(steer, Add):
-        return steer.scaled, None, steer.label or "an addition"
+        return steer.scaled, steer.label or "an addition"
     if callable(steer):
-        return steer, None, getattr(steer, "__name__", "a function of the dose")
+        return steer, getattr(steer, "__name__", "a function of the dose")
     raise TypeError("steer must be a ConceptProbe, an Add (at dose 1) or a function dose -> intervention")
 
 
@@ -388,9 +433,10 @@ def evaluate_steering(
     doses: Sequence[float],
     *,
     items: Optional[Sequence[Any]] = None,
-    unit: str = "raw",
+    unit: str = "resid_norm",
     layers: Any = None,
-    distribute: Optional[bool] = None,
+    window: Optional[int] = None,
+    distribute: bool = False,
     positions: Any = None,
     model: Any = None,
     tokenizer: Any = None,
@@ -412,20 +458,24 @@ def evaluate_steering(
     out_dir: Optional[str] = None,
     html: bool = True,
     console: Optional[bool] = None,
+    allow_model_mismatch: bool = False,
 ) -> SteeringEvaluation:
     """Sweep the doses of a steering intervention, with random controls, and measure every completion.
 
     ``steer`` is a probe (its :meth:`~concept_probe.ConceptProbe.steering` at each dose, in ``unit``,
-    at ``layers``, with ``distribute`` and ``positions``), an ``Add`` (scaled by each dose: give it at
-    dose 1) or a function ``dose -> Add``. Dose 0 is the baseline every change is measured from, and
-    is added when missing. ``prompts`` are user turns after ``system``, generated ``batch_size`` at a
+    at ``layers`` or within ``window`` of its layer, with ``distribute`` and ``positions``), an
+    ``Add`` (scaled by each dose: give it at dose 1) or a function ``dose -> Add``. A probe's dose is
+    by default in residual-stream norms of each layer (0.25 adds a quarter of a typical token's
+    norm), which means the same in any model; a probe without the norms of its training texts gets
+    them measured on the prompts (announced). Dose 0 is the baseline every change is measured from,
+    and is added (and announced) when missing. ``prompts`` are user turns after ``system``, generated ``batch_size`` at a
     time, greedily by default; ``items`` (one per prompt, any objects, e.g. dicts with an expected
     answer) go to the measures that take them; ``model`` and ``tokenizer`` are the probe's unless
     given.
 
     Measures of effect: each probe in ``probes`` (and the steering probe), read without the
-    intervention, in z where it has a calibration for generated completions and as its raw score
-    otherwise; and each ``measures[name]``: ``texts -> numbers`` (a classifier, a judge's
+    intervention, as its raw score (``name``) and, when it has a calibration, in SDs of its own eval
+    items (``name (eval SD)``); and each ``measures[name]``: ``texts -> numbers`` (a classifier, a judge's
     ``measure(rubric)``) or ``(texts, items) -> numbers`` (:func:`exact_match`). Measures of
     coherence: perplexity under the model without the intervention, repetition and length, judged by
     ``coherence`` (:class:`CoherenceRule` by default).
@@ -435,25 +485,49 @@ def evaluate_steering(
     (see :class:`SteeringEvaluation`) is saved by default to ``out_dir``, or to ``steering/<time>``
     under the probe's run folder or the session's ``output_root``.
     """
-    make, steer_probe, label = _resolve_steer(steer, unit, layers, distribute, positions)
+    steer_probe = steer if _is_probe(steer) else None
     if steer_probe is not None:
+        steer_probe._require_model("evaluate_steering")
         model = model or steer_probe.model_bundle.model
         tokenizer = tokenizer or steer_probe.model_bundle.tokenizer
+    run_choices: List[Choice] = []
+    norms = None
+    if steer_probe is not None and unit == "resid_norm" and steer_probe.resid_norm is None:
+        norms = _prompt_norms(model, tokenizer, prompts, system, read_batch_size)
+        run_choices.append(Choice("resid_norm", "the norms of the probe's training texts", "measured on the prompts",
+                                  "the probe was fitted without them (read its texts with norms=True to keep them)"))
+    make, label = _resolve_steer(steer, unit, layers, window, distribute, positions, norms)
     if model is None or tokenizer is None:
         raise ValueError("evaluate_steering needs the model and its tokenizer (or a probe that has them).")
     if items is not None and len(items) != len(prompts):
         raise ValueError(f"{len(items)} items for {len(prompts)} prompts")
     show = settings().console if console is None else bool(console)
     status = (lambda message: print(f"[concept-probe] {message}", flush=True)) if show else (lambda message: None)
+    if 0.0 not in {float(d) for d in doses}:
+        run_choices.append(Choice("doses", sorted({float(d) for d in doses}), "dose 0 added",
+                                  "every change is measured from the completions without steering"))
     doses = sorted({float(d) for d in doses} | {0.0})
     if len(doses) < 2:
         raise ValueError("doses needs at least one non-zero dose")
+    announce(run_choices, console=console)
     readers = list(probes)
     if steer_probe is not None and all(steer_probe is not p for p in readers):
         readers.insert(0, steer_probe)
-    scorers = [p._token_scorer(generated=True) for p in readers]
+    if not allow_model_mismatch:
+        from .modeling import identity_of, identity_mismatches
+
+        bundle = getattr(steer_probe, "model_bundle", None) if steer_probe is not None else None
+        here = bundle.identity if bundle is not None and model is bundle.model else identity_of(model, tokenizer)
+        for p in readers:
+            mismatched = identity_mismatches(p.identity or {}, here) if p.identity else []
+            if mismatched:
+                raise ValueError(f"the probe {p.name!r} belongs to another model than the one generating ("
+                                 + "; ".join(mismatched) + "); its scores of these completions would mean nothing. Pass "
+                                 "allow_model_mismatch=True to read them anyway.")
+    scorers = [p._token_scorer() for p in readers]
+    eval_sd = {p.name: _eval_sd(p) for p in readers}
     measures = dict(measures or {})
-    names = {s.name for s in scorers}
+    names = {s.name for s in scorers} | {f"{n} (eval SD)" for n, sd in eval_sd.items() if sd}
     clash = (names & set(measures)) | ((names | set(measures)) & set(BUILT_IN))
     if clash:
         raise ValueError(f"measure names must differ from the probes' and from the built-in ones; clash: {sorted(clash)}")
@@ -485,14 +559,19 @@ def evaluate_steering(
         it.info["n_tokens"] = int(it.span[1] - it.span[0])
     kinds: Dict[str, str] = {}
     for s in scorers:
-        use_z = s.calibration is not None
-        kinds[s.name] = "probe z" if use_z else "probe raw score"
+        kinds[s.name] = "probe raw score"
+        sd = eval_sd[s.name]
+        if sd:
+            kinds[f"{s.name} (eval SD)"] = "probe score, in SDs of the probe's own eval items"
         for it in completions:
-            v = it.score_mean_z[s.name] if use_z else it.score_mean[s.name]
+            v = it.score_mean[s.name]
             it.info[s.name] = float("nan") if v is None else float(v)
+            if sd:
+                it.info[f"{s.name} (eval SD)"] = it.info[s.name] / sd
 
     run_settings = {
         "steer": label, "unit": unit if steer_probe is not None else None, "doses": doses, "n_random": int(n_random),
+        "choices": [c.to_dict() for c in run_choices],
         "random_seed": int(random_seed), "n_bootstrap": int(n_bootstrap), "n_prompts": len(prompts), "system": system,
         "generation": {"greedy": bool(greedy), "max_new_tokens": int(max_new_tokens),
                        "temperature": None if greedy else temperature, "top_p": None if greedy else top_p,
@@ -502,8 +581,7 @@ def evaluate_steering(
         "intervention_at_dose_1": make(1.0).describe(),
     }
     scores = Scores("generations", [s.name for s in scorers], completions, run_settings,
-                    {s.name: None if s.calibration is not None else "no calibration for generated completions: "
-                     "the effect is in raw scores" for s in scorers})
+                    {s.name: "probes are measured in raw scores and in SDs of their eval items" for s in scorers})
     result = SteeringEvaluation(scores, doses, kinds, [], {}, run_settings, None if items is None else list(items),
                                 None, coherence)
     result._refresh()

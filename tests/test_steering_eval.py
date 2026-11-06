@@ -56,7 +56,7 @@ def test_an_addition_or_a_function_of_the_dose_can_be_evaluated(probe):
     v = np.asarray(probe.steer_directions[1])
     by_add = evaluate_steering(Add({1: v}), QUESTIONS[:3], [3.0], model=model, tokenizer=tok, n_random=2,
                                max_new_tokens=6, probes=[probe])
-    by_probe = evaluate_steering(probe, QUESTIONS[:3], [3.0], n_random=2, max_new_tokens=6)
+    by_probe = evaluate_steering(probe, QUESTIONS[:3], [3.0], unit="raw", n_random=2, max_new_tokens=6)
     assert [it.text for it in by_add.scores] == [it.text for it in by_probe.scores]
     by_function = evaluate_steering(lambda d: Add({1: v}, d), QUESTIONS[:3], [3.0], model=model, tokenizer=tok,
                                     n_random=0, max_new_tokens=6, probes=[probe])

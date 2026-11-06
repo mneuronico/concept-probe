@@ -10,7 +10,10 @@ except Exception:
     ttest_ind = ttest_rel = None
 
 
-def cohen_d_np(x: np.ndarray, y: np.ndarray) -> float:
+def cohen_d(x: np.ndarray, y: np.ndarray) -> float:
+    """Cohen's d of scores ``x`` against ``y``: the difference of means over the pooled SD (``ddof=1``);
+    NaN with fewer than two items on a side."""
+    x, y = np.asarray(x).ravel(), np.asarray(y).ravel()
     nx, ny = x.size, y.size
     if nx < 2 or ny < 2:
         return float("nan")
@@ -103,9 +106,9 @@ def _bootstrap_d_ci(
     for _ in range(int(n_bootstrap)):
         if paired:
             idx = rng.integers(0, pos.size, pos.size)
-            ds.append(cohen_d_np(pos[idx], neg[idx]))
+            ds.append(cohen_d(pos[idx], neg[idx]))
         else:
-            ds.append(cohen_d_np(rng.choice(pos, pos.size), rng.choice(neg, neg.size)))
+            ds.append(cohen_d(rng.choice(pos, pos.size), rng.choice(neg, neg.size)))
     lo, hi = np.nanpercentile(ds, [2.5, 97.5])
     return [float(lo), float(hi)]
 
@@ -237,3 +240,39 @@ def random_directions_null(pos: np.ndarray, neg: np.ndarray, n_random: int = 50,
         b = neg[:, l, :].astype(np.float64) @ w
         out[l] = float(np.percentile(np.abs(_cohen_d_columns(a, b)), quantile))
     return out
+
+
+# ----------------------------------------------------------------------------------- token scores
+#: How the scores of a text's tokens are summarized into one per text (see :func:`summarize_tokens`);
+#: also ``"p<k>"`` for the k-th percentile.
+TOKEN_SUMMARIES = ("mean", "max", "min", "median", "extreme")
+
+
+def summarize_tokens(values: np.ndarray, items: np.ndarray, how: str = "mean", center: float = 0.0
+                     ) -> Tuple[np.ndarray, List[int]]:
+    """One value per item from per-token ``values`` (rows, or ``(rows, k)``) and the item of each row:
+    ``"mean"``, ``"max"``, ``"min"``, ``"median"``, ``"p<k>"`` (the k-th percentile) or
+    ``"extreme"`` (the token farthest from ``center``, with its sign). Returns the values, in the
+    order the items first appear, and those items."""
+    values = np.asarray(values, dtype=np.float64)
+    items = np.asarray(items)
+    order = [int(i) for i in dict.fromkeys(items.tolist())]
+    out = []
+    for i in order:
+        v = values[items == i]
+        if how == "mean":
+            out.append(v.mean(axis=0))
+        elif how == "max":
+            out.append(v.max(axis=0))
+        elif how == "min":
+            out.append(v.min(axis=0))
+        elif how == "median":
+            out.append(np.median(v, axis=0))
+        elif how == "extreme":
+            idx = np.abs(v - center).argmax(axis=0)
+            out.append(np.take_along_axis(v, np.asarray(idx)[None, ...], axis=0)[0] if v.ndim > 1 else v[idx])
+        elif how.startswith("p") and how[1:].replace(".", "", 1).isdigit():
+            out.append(np.percentile(v, float(how[1:]), axis=0))
+        else:
+            raise ValueError(f"unknown summary {how!r}; expected one of {TOKEN_SUMMARIES} or 'p<k>'")
+    return np.asarray(out), order

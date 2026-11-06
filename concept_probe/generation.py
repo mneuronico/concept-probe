@@ -20,10 +20,11 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Un
 import numpy as np
 import torch
 
-from .inputs import Encoded, PromptLike, _decode_tokens, _normalize_messages
+from .inputs import Encoded, PromptLike, ReadContext, _decode_tokens, _normalize_messages
 from .interventions import Intervention, intervene
 from .modeling import apply_chat, get_transformer_layers, safe_attention
 from .reading import _forward_batch, check_finite_hidden_states
+from .record import Choice, announce
 from .settings import settings
 from .utils import ensure_dir, json_dump, now_tag, set_seed
 
@@ -179,10 +180,43 @@ class Generations(list):
     and the folder it was saved to (``dir``, None when not saved)."""
 
     def __init__(self, items: Sequence[Generation] = (), settings: Optional[Dict[str, Any]] = None,
-                 dir: Optional[str] = None):
+                 dir: Optional[str] = None, tokenizer: Any = None):
         super().__init__(items)
+        self.tokenizer = tokenizer
         self.settings = dict(settings or {})
         self.dir = dir
+
+    def encodings(self, system: Any = "as generated") -> List[Encoded]:
+        """Each completion to read with :func:`concept_probe.read_encoded` (its readouts pool over the
+        completion's own tokens): as generated (its prompt, after the system prompt it was generated
+        with), or, with ``system=None`` or another system prompt, the same completion tokens after
+        the prompt alone or after that one (decision D2: to read completions generated under a
+        pole's system prompt without it). The completion is not tokenized again."""
+        out = []
+        for g in self:
+            completion = torch.as_tensor(g.token_ids[g.prompt_len:g.completion_end])
+            if isinstance(system, str) and system == "as generated":
+                out.append(Encoded(torch.as_tensor(g.token_ids[:g.completion_end]), int(g.prompt_len),
+                                   int(g.completion_end)))
+                continue
+            if self.tokenizer is None:
+                raise ValueError("reading the completions after another prompt needs the tokenizer they were generated "
+                                 "with (generate keeps it)")
+            messages, _ = _normalize_messages(g.prompt, system)
+            prompt_ids = apply_chat(self.tokenizer, messages, add_generation_prompt=True)[0]
+            ids = torch.cat([prompt_ids, completion.to(prompt_ids.dtype)])
+            out.append(Encoded(ids, int(prompt_ids.shape[-1]), int(ids.shape[-1])))
+        return out
+
+    @property
+    def texts(self) -> List[str]:
+        """The completions' texts."""
+        return [g.text for g in self]
+
+    @property
+    def prompts(self) -> List[Any]:
+        """The prompts, in order."""
+        return [g.prompt for g in self]
 
     def save(self, out_dir: str) -> str:
         """``generations.jsonl`` (one readable line each) and ``generations.npz`` (token ids, and
@@ -332,6 +366,32 @@ class _Nothing:
         return None
 
 
+def sampling_settings(model: Any, greedy: bool, temperature: Optional[float], top_p: Optional[float],
+                      top_k: Optional[int], seed: Optional[int]) -> Tuple[Dict[str, Any], List[Choice]]:
+    """The decoding arguments for ``model.generate``, and the choices made: under greedy decoding,
+    sampling settings passed are dropped (with a warning); when sampling, the ones left as None take
+    the model's generation config, and that is announced."""
+    if greedy:
+        given = [name for name, v in (("temperature", temperature), ("top_p", top_p), ("top_k", top_k),
+                                      ("seed", seed)) if v is not None]
+        if given:
+            import warnings
+
+            warnings.warn(f"greedy decoding does not sample, so {', '.join(given)} do not apply; pass greedy=False to "
+                          "sample", stacklevel=3)
+        return {"do_sample": False, "temperature": None, "top_p": None, "top_k": None}, []
+    config = getattr(model, "generation_config", None)
+    out: Dict[str, Any] = {"do_sample": True}
+    choices: List[Choice] = []
+    for name, value in (("temperature", temperature), ("top_p", top_p), ("top_k", top_k)):
+        if value is None:
+            value = getattr(config, name, None)
+            choices.append(Choice(f"sampling {name}", None, value, "left unset, so the model's own generation config "
+                                                                  "applies"))
+        out[name] = value
+    return out, choices
+
+
 @torch.no_grad()
 def generate(
     model,
@@ -343,6 +403,7 @@ def generate(
     greedy: bool = True,
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
+    top_k: Optional[int] = None,
     seed: Optional[int] = None,
     batch_size: int = 16,
     intervention: Optional[Intervention] = None,
@@ -361,7 +422,9 @@ def generate(
     exact input. Prompts in a batch are padded on the left, with an attention mask; padding is
     removed from what is returned. In half precision a batched greedy completion can differ in its
     last tokens from the one generated alone (D8): use ``batch_size=1`` when that matters. Sampling
-    (``greedy=False``) seeds the generators with ``seed`` first when it is given.
+    (``greedy=False``) seeds the generators with ``seed`` first when it is given; a ``temperature``,
+    ``top_p`` or ``top_k`` left as None takes the model's own (its generation config), and the values
+    used are announced and saved. Under greedy decoding they do not apply, and passing them warns.
 
     ``intervention`` (see :mod:`concept_probe.interventions`) is applied while generating, with
     positions counted from each prompt's start. ``on_token(step)`` is called at every step with a
@@ -375,9 +438,11 @@ def generate(
         return Generations([], {})
     if watch and on_token is None:
         raise ValueError("watch= needs on_token=, the function that gets the scores at each step")
+    sampling, sampling_choices = sampling_settings(model, greedy, temperature, top_p, top_k, seed)
+    announce(sampling_choices)
     if not greedy and seed is not None:
         set_seed(int(seed))
-    scorers = [p._token_scorer(generated=True) if hasattr(p, "_token_scorer") else p for p in watch]
+    scorers = [p._token_scorer(ReadContext.generated()) if hasattr(p, "_token_scorer") else p for p in watch]
     encoded = _encode_prompts(tokenizer, prompts, system, warn, label)
     eos_ids = eos_token_ids(model, tokenizer)
     pad = _pad_id(tokenizer)
@@ -398,7 +463,6 @@ def generate(
         applied = _Nothing() if intervention is None else intervene(model, intervention, prompt_lens=plens, items=rows)
         watcher = _Nothing() if on_token is None else _Watcher(model, scorers, on_token, rows, eos_ids)
         keeper = _Nothing() if keep_logits is None else _LogitKeeper(model, keep_logits)
-        sampling = {"do_sample": False, "temperature": None, "top_p": None, "top_k": None} if greedy else             {"do_sample": True, "temperature": temperature, "top_p": top_p}
         with applied, watcher, keeper, safe_attention(model):
             out = model.generate(input_ids=input_ids.to(model.device), attention_mask=attn.to(model.device),
                                  max_new_tokens=int(max_new_tokens), pad_token_id=pad, **sampling)
@@ -416,10 +480,11 @@ def generate(
                 own_system=bool(own[j]),
             ))
     run_settings = {"system": system, "max_new_tokens": int(max_new_tokens), "greedy": bool(greedy),
-                    "temperature": None if greedy else temperature, "top_p": None if greedy else top_p,
-                    "seed": None if greedy else seed, "batch_size": step, "intervention": described,
-                    "keep_logits": keep_logits}
-    gens = Generations(results, run_settings)
+                    "temperature": sampling.get("temperature"), "top_p": sampling.get("top_p"),
+                    "top_k": sampling.get("top_k"), "seed": None if greedy else seed, "batch_size": step,
+                    "intervention": described, "keep_logits": keep_logits,
+                    "choices": [c.to_dict() for c in sampling_choices]}
+    gens = Generations(results, run_settings, tokenizer=tokenizer)
     if _should_save(save):
         gens.save(_new_dir("generations", out_dir))
     return gens

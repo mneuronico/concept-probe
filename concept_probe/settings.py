@@ -7,9 +7,7 @@ function takes ``save=`` / ``console=`` arguments; when they are None, these def
 
     import concept_probe
     concept_probe.configure(save=False)            # nothing is written unless asked
-    concept_probe.configure(output_root="runs")    # where results without a run directory go
-
-The high-level API (``ProbeWorkspace``) follows its own config (``output.*``) instead.
+    concept_probe.configure(output_root="runs")    # where results go
 """
 import os
 from dataclasses import asdict, dataclass, replace

@@ -80,9 +80,9 @@ def test_max_first_and_tokens_readouts():
     model, tok = TinyCausalLM(), CharChatTok()
     enc, hs = _hidden(model, tok, "pp xn")
     own = hs[:, enc.start:enc.end]
-    np.testing.assert_allclose(read_texts(model, tok, ["pp xn"], "assistant_max", cache=False).data[0], own.max(axis=1), rtol=1e-6)
-    np.testing.assert_allclose(read_texts(model, tok, ["pp xn"], "assistant_first", cache=False).data[0], own[:, 0], rtol=1e-6)
-    tokens = read_texts(model, tok, ["pp xn", "z"], "assistant_tokens", cache=False)
+    np.testing.assert_allclose(read_texts(model, tok, ["pp xn"], "text_max", cache=False).data[0], own.max(axis=1), rtol=1e-6)
+    np.testing.assert_allclose(read_texts(model, tok, ["pp xn"], "text_first", cache=False).data[0], own[:, 0], rtol=1e-6)
+    tokens = read_texts(model, tok, ["pp xn", "z"], "text_tokens", cache=False)
     assert tokens.data.shape == (5 + 1, 4, 16)
     assert tokens.items.tolist() == [0] * 5 + [1]
     assert tokens.positions.tolist() == [1, 2, 3, 4, 5, 1]  # after the BOS
@@ -92,12 +92,12 @@ def test_max_first_and_tokens_readouts():
 def test_several_readouts_come_from_one_read():
     model, tok = TinyCausalLM(), CharChatTok()
     texts = ["pp xn", "z", "nn px"]
-    both = read_texts(model, tok, texts, ["assistant_all_mean", Readout("text", "last")], cache=False)
-    assert list(both) == ["assistant_all_mean", "assistant_last"]
+    both = read_texts(model, tok, texts, ["text_mean", Readout("text", "last")], cache=False)
+    assert list(both) == ["text_mean", "text_last"]
     for name, reps in both.items():
         np.testing.assert_allclose(reps.data, read_texts(model, tok, texts, name, cache=False).data, rtol=1e-6)
     with pytest.raises(ValueError, match="distinct"):
-        read_texts(model, tok, texts, ["assistant_last", Readout("text", "last")], cache=False)
+        read_texts(model, tok, texts, ["text_last", Readout("text", "last")], cache=False)
 
 
 def test_a_prompt_is_read_as_generation_feeds_it():
@@ -168,8 +168,10 @@ def test_readout_names_round_trip_and_bad_combinations_raise():
         Readout(last_k=2, position=1)
     with pytest.raises(ValueError, match="span='text'"):
         Readout(span="sequence", substring="x")
-    with pytest.raises(ValueError, match="Unknown readout mode"):
-        Readout.parse("assistant_median")
+    with pytest.raises(ValueError, match="Unknown readout"):
+        Readout.parse("text_median")
+    with pytest.raises(ValueError, match="now called 'text_mean'"):  # an earlier version's name
+        Readout.parse("assistant_all_mean")
 
 
 # ----------------------------------------------------------------------------------------- cache
@@ -200,7 +202,7 @@ def test_the_cache_returns_what_a_fresh_read_returns(tmp_path):
 def test_cache_entries_are_per_model_identity_and_readout(tmp_path):
     tok = CharChatTok()
     read_texts(_named(), tok, TEXTS, cache=str(tmp_path))
-    assert read_texts(_named(), tok, TEXTS, "assistant_last", cache=str(tmp_path)).from_cache == 0
+    assert read_texts(_named(), tok, TEXTS, "text_last", cache=str(tmp_path)).from_cache == 0
     other = read_texts(_named(seed=1, name="tiny-other"), tok, TEXTS, cache=str(tmp_path))
     assert other.from_cache == 0 and other.cache_dir != read_texts(_named(), tok, TEXTS, cache=str(tmp_path)).cache_dir
     assert read_texts(_named(), tok, TEXTS, role="user", cache=str(tmp_path)).from_cache == 0  # other token ids
@@ -243,4 +245,4 @@ def test_read_encoded_reads_generated_ids_without_retokenizing():
     ids = torch.tensor([ord(c) for c in "^<u>hi|<a>ppx$"])
     reps = read_encoded(model, tok, [Encoded(ids, 11, 14)], cache=False)
     hs = forward_hidden_states_alone(model, ids.unsqueeze(0))
-    np.testing.assert_allclose(reps.data[0], reps_from_hs_layers(hs, 11, "assistant_all_mean", 12, 14), rtol=1e-6)
+    np.testing.assert_allclose(reps.data[0], reps_from_hs_layers(hs, 11, "text_mean", 12, 14), rtol=1e-6)

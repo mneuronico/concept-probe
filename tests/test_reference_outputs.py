@@ -1,13 +1,16 @@
-"""Reference outputs of the existing API, on a tiny deterministic model (tests/tiny_model.py).
+"""Reference outputs, on a tiny deterministic model (tests/tiny_model.py).
 
-These tests pin what ``ProbeWorkspace.train_concept``, ``ConceptProbe.score_texts``,
-``ConceptProbe.score_prompts``, ``multi_probe_score_prompts``, ``extract_text_reps``,
-``extract_completion_reps`` and ``score_text_tokens`` return and write today, so every stage of the
-redesign (docs/DESIGN.md) can show that the existing API still gives the same results. Numbers are
-compared up to rounding (decision D8); texts, layer indices and file names exactly.
+``reference/reference_outputs.json`` holds what the library returned before its redesign
+(docs/DESIGN.md): the training of a probe in texts mode, with a user role, with variance-normalized
+directions, and on completions generated under a system prompt per pole (shared and opposed
+questions); scoring texts token by token; steering and scoring the completions; reading texts and
+completions. These tests compute the same things with today's layers (``read_texts``,
+``generate``, ``ConceptProbe.fit`` with eval sets, ``evaluate_steering``) and check that the numbers
+are the same, up to rounding (decision D8). What was meant to change (decisions D1 and D2) changed
+before this reference was taken.
 
-When a change is meant to alter these outputs (decisions D1 and D2, for example), regenerate the
-reference and commit it together with a note of what changed and why:
+When a change is meant to alter these outputs, regenerate the reference and commit it together with
+a note of what changed and why:
 
     CP_UPDATE_REFERENCE=1 python -m pytest tests/test_reference_outputs.py
 """
@@ -19,10 +22,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from concept_probe import extract_completion_reps, extract_text_reps, multi_probe_score_prompts, score_text_tokens
-from concept_probe.config import ConceptSpec
-from concept_probe.probe import ProbeWorkspace
-from concept_probe.utils import deep_merge
+from concept_probe import (ConceptProbe, EvalSet, ReadContext, Readout, evaluate_steering, generate, read_encoded,
+                           read_texts)
 from fakes import CharChatTok
 from tiny_model import TinyCausalLM
 
@@ -46,6 +47,9 @@ EVAL_QUESTIONS = ["go on", "why z", "pick x", "more y", "and then", "ok zz", "ye
                   "say x", "tell z", "only y", "then what", "no", "x y", "why not", "go"]
 TEXTS_TO_SCORE = ["pp px", "nn xn", "xyz", [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "pz"},
                                            {"role": "user", "content": "np"}]]
+POS_SYSTEM, NEG_SYSTEM = "pp pp pp", "nn nn nn"
+MODEL, TOK = TinyCausalLM(), CharChatTok()
+FIT = dict(n_permutations=200, n_bootstrap=200, seed=0, identity="tiny-test", save=False)
 
 
 # --------------------------------------------------------------------------- helpers
@@ -83,194 +87,217 @@ def _assert_close(actual, expected, path="$"):
         assert actual == expected, f"{path}: {actual!r} != {expected!r}"
 
 
+def _stored(name):
+    assert REFERENCE.exists(), "No reference; run with CP_UPDATE_REFERENCE=1 to create it."
+    stored = json.loads(REFERENCE.read_text(encoding="utf-8"))
+    assert name in stored, f"No reference for {name!r}; run with CP_UPDATE_REFERENCE=1 to create it."
+    return stored[name]
+
+
 def _check(name, value):
+    """Compare ``value`` with the stored reference's entries of the same keys."""
     value = json.loads(json.dumps(_jsonable(value)))
-    stored = json.loads(REFERENCE.read_text(encoding="utf-8")) if REFERENCE.exists() else {}
     if UPDATE:
-        stored[name] = value
+        stored = json.loads(REFERENCE.read_text(encoding="utf-8")) if REFERENCE.exists() else {}
+        stored[name] = {**stored.get(name, {}), **value} if isinstance(value, dict) else value
         REFERENCE.parent.mkdir(exist_ok=True)
         REFERENCE.write_text(json.dumps(stored, indent=1, sort_keys=True) + "\n", encoding="utf-8")
         return
-    assert name in stored, f"No reference for {name!r}; run with CP_UPDATE_REFERENCE=1 to create it."
-    _assert_close(value, stored[name], name)
+    expected = _stored(name)
+    if isinstance(value, dict):
+        expected = {k: expected[k] for k in value}
+    _assert_close(value, expected, name)
 
 
-def _files(root):
-    root = Path(root)
-    return sorted(p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file())
+def _text_set(name, pos, neg, **read):
+    """Eval texts read like the training texts, pooled and token by token."""
+    p = read_texts(MODEL, TOK, pos, ["text_mean", "text_tokens"], cache=False, **read)
+    n = read_texts(MODEL, TOK, neg, ["text_mean", "text_tokens"], cache=False, **read)
+    return EvalSet(name, p["text_mean"], n["text_mean"], tokens=(p["text_tokens"], n["text_tokens"]))
 
 
-def _workspace(root, overrides=None):
-    # The model is passed in already loaded (entry 4 of LIBRARY_ISSUES).
-    return ProbeWorkspace(config_overrides=deep_merge({
-        "output": {"root_dir": str(root), "console": False},
-        "plots": {"enabled": False},
-        "prompts": {"train_questions": QUESTIONS, "eval_questions": EVAL_QUESTIONS},
-        "training": {"train_max_new_tokens": 10, "gen_batch_size": 4},
-        "evaluation": {"eval_max_new_tokens": 10, "n_permutations": 200, "n_bootstrap": 200},
-        "steering": {"steer_max_new_tokens": 10},
-    }, overrides or {}), model=TinyCausalLM(), tokenizer=CharChatTok(), model_id="tiny-test")
+def _train_on_texts(name, estimator="mean_diff", **read):
+    P = read_texts(MODEL, TOK, TRAIN_POS, norms=True, cache=False, **read)
+    N = read_texts(MODEL, TOK, TRAIN_NEG, norms=True, cache=False, **read)
+    return ConceptProbe.fit(P, N, eval=_text_set("eval", EVAL_POS, EVAL_NEG, **read), estimator=estimator,
+                            name=name, **FIT), (P, N), None
 
 
-def _concept(name, **kwargs):
-    fields = dict(name=name, pos_label="pos", neg_label="neg", pos_system="pp pp pp", neg_system="nn nn nn",
-                  eval_pos_texts=EVAL_POS, eval_neg_texts=EVAL_NEG)
-    fields.update(kwargs)
-    return ConceptSpec(**fields)
+def _generated_set(name, gens_pos, gens_neg, system):
+    """Completions as an eval set paired by question: read after their question alone (``system=None``)
+    or after the system prompt they were generated with; a question with an empty completion on
+    either pole is left out."""
+    reads = []
+    for gens in (gens_pos, gens_neg):
+        encodings = gens.encodings() if system == "as generated" else gens.encodings(system=None)
+        reads.append(read_encoded(MODEL, TOK, encodings, ["text_mean", "text_tokens"], skip_empty=True, cache=False))
+    both = sorted(set(reads[0]["text_mean"].read_items) & set(reads[1]["text_mean"].read_items))
+    sides, tokens = [], []
+    for r in reads:
+        kept = r["text_mean"].read_items
+        sides.append(r["text_mean"].data[[kept.index(q) for q in both]])
+        tok = r["text_tokens"]
+        rows = np.isin(tok.items, both)
+        tokens.append(type(tok)(data=tok.data[rows], layers=tok.layers, readout=tok.readout, items=tok.items[rows]))
+    return EvalSet(name, sides[0], sides[1], context=ReadContext.generated(), paired=True,
+                   tokens=(tokens[0], tokens[1])), both
+
+
+def _train_on_generations(name, questions_pos, questions_neg):
+    gen = dict(max_new_tokens=10, batch_size=4, save=False)
+    P = read_encoded(MODEL, TOK, generate(MODEL, TOK, questions_pos, system=POS_SYSTEM, **gen).encodings(),
+                     norms=True, cache=False)
+    N = read_encoded(MODEL, TOK, generate(MODEL, TOK, questions_neg, system=NEG_SYSTEM, **gen).encodings(),
+                     norms=True, cache=False)
+    gp = generate(MODEL, TOK, EVAL_QUESTIONS, system=POS_SYSTEM, **gen)
+    gn = generate(MODEL, TOK, EVAL_QUESTIONS, system=NEG_SYSTEM, **gen)
+    main, both = _generated_set("eval", gp, gn, None)
+    with_system, _ = _generated_set("eval_with_system_prompt", gp, gn, "as generated")
+    texts = _text_set("texts", EVAL_POS, EVAL_NEG)
+    probe = ConceptProbe.fit(P, N, eval=[main, with_system, texts], name=name, **FIT)
+    return probe, (P, N), both
 
 
 TRAININGS = {
-    "texts": ({"training": {"train_prompt_mode": "texts"}},
-              dict(pos_system="", neg_system="", train_pos_texts=TRAIN_POS, train_neg_texts=TRAIN_NEG)),
-    "texts_var": ({"training": {"train_prompt_mode": "texts", "estimator": "mean_diff_var"}},
-                  dict(pos_system="", neg_system="", train_pos_texts=TRAIN_POS, train_neg_texts=TRAIN_NEG)),
-    "texts_user": ({"training": {"train_prompt_mode": "texts", "train_text_role": "user",
-                                 "train_text_system": "x y z"}},
-                   dict(pos_system="", neg_system="", train_pos_texts=TRAIN_POS, train_neg_texts=TRAIN_NEG)),
-    "shared": ({"training": {"train_prompt_mode": "shared"}}, {}),
-    "opposed": ({"training": {"train_prompt_mode": "opposed"},
-                 "prompts": {"train_questions": [], "train_questions_pos": QUESTIONS[:4],
-                             "train_questions_neg": QUESTIONS[2:]}}, {}),
+    "texts": lambda: _train_on_texts("texts"),
+    "texts_var": lambda: _train_on_texts("texts_var", estimator="mean_diff_var"),
+    "texts_user": lambda: _train_on_texts("texts_user", role="user", system="x y z"),
+    "shared": lambda: _train_on_generations("shared", QUESTIONS, QUESTIONS),
+    "opposed": lambda: _train_on_generations("opposed", QUESTIONS[:4], QUESTIONS[2:]),
 }
 
 
 @pytest.fixture(scope="module")
-def probes(tmp_path_factory):
-    root = tmp_path_factory.mktemp("reference")
+def probes():
     out = {}
-    for key, (overrides, concept_fields) in TRAININGS.items():
-        ws = _workspace(root / "out", overrides)
-        out[key] = ws.train_concept(_concept(key, **concept_fields), run_name="ref")
-    out["root"] = root
+    for key, train in TRAININGS.items():
+        probe, train_reps, eval_questions = train()
+        probe.attach(MODEL, TOK)
+        out[key] = (probe, train_reps, eval_questions)
     return out
 
 
-def _run_summary(probe):
-    run = Path(probe.run_dir)
-    metrics = json.loads((run / "metrics.json").read_text(encoding="utf-8"))
-    tensors = np.load(run / "tensors.npz")
-    out = {k: metrics.get(k) for k in (
-        "best_layer", "best_d", "best_p", "best_d_ci95", "selection", "best_d_selection", "best_d_all_eval",
-        "n_eval_selection", "sweep_max_d", "sweep_max_d_perm_p", "sigma_best_layer", "n_train_pos", "n_train_neg",
-        "n_eval_pos", "n_eval_neg", "eval_mode_used", "eval_paired", "reference_context", "eval_readout",
-        "dropped_items", "train_text_role",
-    )}
-    # the normalization of the difference of means, as the reference recorded it before the estimator
-    # had its own setting
-    out["direction_normalization"] = metrics["estimator"].get("normalization")
-    # The eval texts of a concept trained on generated completions, measured at the probe's layer: once
-    # metrics' "transfer_eval", now the eval set "texts".
-    texts = ((metrics.get("evaluation") or {}).get("sets") or {}).get("texts")
-    out["transfer_eval"] = None if texts is None else {
-        "n_pos": texts["n_pos"], "n_neg": texts["n_neg"], "d_at_best_layer": texts["d"],
-        "p_at_best_layer": texts["p"], "d_ci95_at_best_layer": texts["d_ci95"],
+def _summary(probe, train_reps, eval_questions):
+    ev = probe.evaluation
+    main = ev.main
+    cal = probe.calibrations[0]
+    out = {
+        "best_layer": probe.layer, "best_d": main.d, "best_p": main.p, "best_d_ci95": main.d_ci95,
+        "selection": ev.selection, "best_d_selection": ev.d_selection, "best_d_all_eval": float(main.d_curve[probe.layer]),
+        "n_eval_selection": {"pos": len(ev.selection_idx[0]), "neg": len(ev.selection_idx[1])},
+        "sweep_max_d": ev.sweep_max_d, "sweep_max_d_perm_p": ev.sweep_max_d_perm_p,
+        "sigma_best_layer": float(cal.scale[probe.layer]), "n_train_pos": len(train_reps[0].data),
+        "n_train_neg": len(train_reps[1].data), "n_eval_pos": main.n_pos, "n_eval_neg": main.n_neg,
+        "eval_paired": main.paired, "score_center": cal.center, "score_scale": cal.scale,
+        "token_center": cal.token_center, "token_scale": cal.token_scale, "concept_vectors": probe.directions,
+        "sweep_d": probe.sweep_d, "sweep_p": probe.sweep_p, "resid_norm": probe.resid_norm,
+        "train_pos_reps": train_reps[0].data, "train_neg_reps": train_reps[1].data,
+        "eval_pos_scores_mat": main.pos_scores, "eval_neg_scores_mat": main.neg_scores,
     }
-    n_layers = tensors["concept_vectors"].shape[0]
-    nan = np.full(n_layers, np.nan)
-    cals = json.loads(str(tensors["calibrations"][0]))
-    main = next((c for c in cals if c["source"] == "evaluation"), None)
-    for key, field in (("score_center", "center"), ("score_scale", "scale"), ("token_center", "token_center"),
-                       ("token_scale", "token_scale")):
-        out[key] = nan if main is None else np.asarray(main[field])
-    for key in ("concept_vectors", "sweep_d", "sweep_p", "resid_norm", "eval_question_idx", "train_pos_reps",
-                "train_neg_reps"):
-        out[key] = tensors[key]
-    for key in ("eval_pos_scores_mat", "eval_neg_scores_mat"):
-        out[key] = tensors[key] if key in tensors.files else np.zeros((0, n_layers))
-    out["transfer_sweep_d"] = tensors["set_texts_d"] if "set_texts_d" in tensors.files else nan
-    out["files"] = _files(run)
+    texts = ev.sets.get("texts")
+    out["transfer_eval"] = None if texts is None else {
+        "n_pos": texts.n_pos, "n_neg": texts.n_neg, "d_at_best_layer": texts.d, "p_at_best_layer": texts.p,
+        "d_ci95_at_best_layer": texts.d_ci95}
+    out["transfer_sweep_d"] = np.full(probe.num_layers, np.nan) if texts is None else texts.d_curve
+    if eval_questions is not None:
+        out["eval_question_idx"] = eval_questions
     return out
 
 
 # --------------------------------------------------------------------------- tests
 @pytest.mark.parametrize("key", list(TRAININGS))
-def test_train_concept(probes, key):
-    _check(f"train_{key}", _run_summary(probes[key]))
-
-
-def _item_z(it, name):
-    return {} if it.token_z[name] is None else {"scores_agg_z": it.token_z[name]}
+def test_fitting_a_probe(probes, key):
+    _check(f"train_{key}", _summary(*probes[key]))
 
 
 def test_score_texts(probes):
     out = {}
-    for key, kwargs in (("texts", {}), ("texts_user", {"role": "user", "system_prompt": "x y z"}),
+    for key, kwargs in (("texts", {}), ("texts_user", {"role": "user", "system": "x y z"}),
                         ("texts", {"reference_layer": 0})):
         texts = TEXTS_TO_SCORE if kwargs.get("role") == "user" else TEXTS_TO_SCORE[:3]
-        name = f"{key}_" + "_".join(sorted(kwargs)) if kwargs else key
-        scores = probes[key].score_texts(texts, batch_subdir=name, save=True, **kwargs)
+        name = f"{key}_" + "_".join(sorted(k if k != "system" else "system_prompt" for k in kwargs)) if kwargs else key
+        scores = probes[key][0].score_texts(texts, save=False, **kwargs)
         n = scores.probes[0]
         out[name] = [
             dict(input_text=it.info["input_text"], text_span=it.info["text_span"], layers=it.layers[n],
                  score_mean=it.score_mean[n], score_mean_z=it.score_mean_z[n],
-                 scores_standardized=it.token_z[n] is not None,
-                 system_prompt=it.info["system_prompt"], scores_per_layer=it.scores[n], scores_agg=it.token_scores[n],
-                 **_item_z(it, n))
+                 scores_standardized=it.token_z[n] is not None, scores_per_layer=it.scores[n],
+                 scores_agg=it.token_scores[n], **({} if it.token_z[n] is None else {"scores_agg_z": it.token_z[n]}))
             for it in scores
         ]
-        out[name + "_files"] = _files(scores.dir)
-    _check("score_texts", out)
+    stored = _stored("score_texts")
+    for name, items in out.items():
+        expected = [{k: e[k] for k in a} for a, e in zip(items, stored[name])]
+        _assert_close(json.loads(json.dumps(_jsonable(items))), expected, name)
 
 
-def _prompt_record(scores, it, tok):
-    n, i = scores.probes[0], it.info
-    return dict(
-        prompt_text=tok.decode(it.token_ids[:i["prompt_len"]].tolist()), completion=it.text, prompt_len=i["prompt_len"],
-        completion_end=i["completion_end"], alpha=i["alpha"], alpha_unit=i["alpha_unit"], alpha_value=i["alpha_value"],
-        steer_layers=scores.settings["steer_layers"], steer_layer_scales=i["steer_layer_scales"],
-        steer_alpha_per_layer=i["steer_alpha_per_layer"], layers=it.layers[n], score_mean=it.score_mean[n],
-        score_mean_z=it.score_mean_z[n], do_steering=bool(i["steer_alpha_per_layer"]),
-        control=i["control"], control_seed=(i["intervention"] or {}).get("control_seed"),
-        sampling_seed=scores.settings["generation"]["seed"], scores_per_layer=it.scores[n],
-        scores_agg=it.token_scores[n], **_item_z(it, n))
+def _by_condition(ev):
+    """The completions of an evaluation by (dose, control, prompt)."""
+    return {(float(it.info["dose"]), it.info["control"], int(it.index)): it for it in ev.scores}
 
 
-def test_score_prompts(probes):
+def _prompt_index(record):
+    return next(i for i, q in enumerate(QUESTIONS[:3]) if q in record["prompt_text"])
+
+
+def test_steering_and_scoring_the_completions(probes):
+    shared, texts_probe = probes["shared"][0], probes["texts"][0]
+    run = dict(n_bootstrap=50, max_new_tokens=10, save=False)
     calls = {
-        "raw": dict(alphas=[0.0, 4.0, -4.0]),
-        "sigma_window": dict(alphas=[0.0, 2.0], alpha_unit="sigma", steer_layers="window", steer_window_radius=1),
-        "resid_norm_list": dict(alphas=[0.3], alpha_unit="resid_norm", steer_layers=[1, 2], steer_distribute=False),
-        "random_controls": dict(alphas=[0.0, 4.0], n_random=2),
-        "sampled": dict(alphas=[0.0, 0.0], greedy=False, seed=3, temperature=0.8),
-        "texts_probe": dict(alphas=[0.0]),
+        "raw": (shared, dict(doses=[4.0, -4.0], unit="raw", n_random=0)),
+        "sigma_window": (shared, dict(doses=[2.0], unit="sigma", window=1, distribute=True, n_random=0)),
+        "resid_norm_list": (shared, dict(doses=[0.3], unit="resid_norm", layers=[1, 2], n_random=0)),
+        "random_controls": (shared, dict(doses=[4.0], unit="raw", n_random=2)),
     }
-    out = {}
-    for name, kwargs in calls.items():
-        probe = probes["texts" if name == "texts_probe" else "shared"]
-        scores = probe.score_prompts(QUESTIONS[:3], batch_subdir=name, save=True, **kwargs)
-        out[name] = [_prompt_record(scores, it, probe.model_bundle.tokenizer) for it in scores]
-        out[name + "_files"] = _files(scores.dir)
-    _check("score_prompts", out)
+    stored = _stored("score_prompts")
+    for name, (probe, kwargs) in calls.items():
+        got = _by_condition(evaluate_steering(probe, QUESTIONS[:3], **kwargs, **run))
+        for rec in stored[name]:
+            it = got[(float(rec["alpha"]), rec["control"], _prompt_index(rec))]
+            assert it.text == rec["completion"], (name, rec["alpha"], rec["control"])
+            _assert_close(float(it.score_mean[probe.name]), rec["score_mean"], f"{name}.score_mean")
+    # a probe trained on texts scores the completions it did not steer
+    got = _by_condition(evaluate_steering(texts_probe, QUESTIONS[:3], [4.0], unit="raw", n_random=0, **run))
+    for rec in stored["texts_probe"]:
+        it = got[(0.0, None, _prompt_index(rec))]
+        assert it.text == rec["completion"]
+        _assert_close(float(it.score_mean[texts_probe.name]), rec["score_mean"], "texts_probe.score_mean")
 
 
-def test_multi_probe_score_prompts(probes):
-    scores = multi_probe_score_prompts(
-        [probes["shared"], probes["opposed"], probes["texts_var"]], QUESTIONS[:3], alphas=[0.0, 4.0],
-        steer_probe="shared", output_root=str(probes["root"] / "multi"), run_name="ref", batch_subdir="b", save=True,
-    )
-    nan = lambda it: np.full(len(it.token_ids), np.nan, np.float32)  # noqa: E731
-    out = {"records": [
-        dict(completion=it.text, prompt_len=it.info["prompt_len"], completion_end=it.info["completion_end"],
-             alpha_value=it.info["alpha_value"], steer_alpha_per_layer=it.info["steer_alpha_per_layer"],
-             steer_layers=scores.settings["steer_layers"], score_mean_by_probe=it.score_mean,
-             score_mean_z_by_probe=it.score_mean_z, probe_names=scores.probes,
-             scores_agg=np.stack([it.token_scores[n] for n in scores.probes]),
-             scores_agg_z=np.stack([nan(it) if it.token_z[n] is None else it.token_z[n] for n in scores.probes]))
-        for it in scores
-    ], "files": _files(scores.settings["run_dir"])}
-    _check("multi_probe_score_prompts", out)
+def test_several_probes_read_the_same_completions(probes):
+    shared, opposed, texts_var = (probes[k][0] for k in ("shared", "opposed", "texts_var"))
+    ev = evaluate_steering(shared, QUESTIONS[:3], [4.0], unit="raw", probes=[shared, opposed, texts_var], n_random=0,
+                           n_bootstrap=50, max_new_tokens=10, save=False)
+    got = _by_condition(ev)
+    for j, rec in enumerate(_stored("multi_probe_score_prompts")["records"]):  # by prompt, then by dose
+        it = got[(float(rec["alpha_value"]), None, j // 2)]
+        assert it.text == rec["completion"]
+        for name, value in rec["score_mean_by_probe"].items():
+            _assert_close(float(it.score_mean[name]), value, f"multi[{j}].{name}")
 
 
-def test_extract_reps_and_token_scores(probes):
-    bundle = probes["texts"].model_bundle
-    model, tok = bundle.model, bundle.tokenizer
+def test_reading_texts_and_completions():
     out = {
-        "text_reps": extract_text_reps(model, tok, EVAL_POS[:3], pool=["assistant_all_mean", "assistant_last",
-                                                                       "sequence_last_k_mean"], last_k=2),
-        "text_reps_user": extract_text_reps(model, tok, EVAL_NEG[:2], role="user", system="x y z"),
-        "text_reps_assistant": extract_text_reps(model, tok, EVAL_NEG[:2], role="assistant", prompt="say"),
-        "completion_reps": extract_completion_reps(model, tok, [("tell me", "pp x"), ("why z", "nn y")], system="z"),
-        "token_scores": score_text_tokens(model, tok, probes["texts"].directions, "pp nx", layer_indices=[1, 3]),
+        "text_reps": {k: v.data for k, v in read_texts(MODEL, TOK, EVAL_POS[:3], ["text_mean", "text_last",
+                                                                                 "sequence_last_k"], last_k=2,
+                                                       cache=False).items()},
+        "text_reps_user": read_texts(MODEL, TOK, EVAL_NEG[:2], role="user", system="x y z", cache=False).data,
+        "text_reps_assistant": read_texts(MODEL, TOK, EVAL_NEG[:2], role="assistant", prompt="say", cache=False).data,
+        "completion_reps": read_texts(MODEL, TOK, ["pp x", "nn y"], role="assistant", prompt=["tell me", "why z"],
+                                      system="z", cache=False).data,
     }
-    out["token_scores"].pop("offset_mapping")  # character offsets of the fake tokenizer, not the library's
-    _check("extract_reps_and_token_scores", out)
+    stored = _stored("extract_reps_and_token_scores")
+    old_names = {"text_mean": "assistant_all_mean", "text_last": "assistant_last",
+                 "sequence_last_k": "sequence_last_k_mean"}
+    expected = {k: v for k, v in stored.items() if k != "token_scores"}
+    expected["text_reps"] = {new: stored["text_reps"][old] for new, old in old_names.items()}
+    _assert_close(json.loads(json.dumps(_jsonable(out))), expected, "reading")
+
+
+def test_scoring_every_token_of_a_text(probes):
+    probe = probes["texts"][0]
+    every = read_texts(MODEL, TOK, ["pp nx"], Readout("input", "tokens"), cache=False)
+    scores = probe.project(every)[:, [1, 3]]
+    stored = _stored("extract_reps_and_token_scores")["token_scores"]
+    assert every.positions.tolist() == list(range(len(stored["token_ids"])))
+    _assert_close(json.loads(json.dumps(_jsonable(scores))), stored["scores_per_layer"], "token_scores")

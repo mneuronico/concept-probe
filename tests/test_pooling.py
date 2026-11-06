@@ -4,7 +4,7 @@ import torch
 import pytest
 
 from concept_probe.generation import TokenScorer
-from concept_probe.probe import EmptySpanError, reps_from_hs_layers
+from concept_probe.reading import EmptySpanError, reps_from_hs_layers
 
 # 2 layers, 4 tokens, dim 2; token t has value (t+1) in both dims, layer 1 doubled.
 HS = [
@@ -17,24 +17,24 @@ def test_sequence_modes():
     reps = reps_from_hs_layers(HS, prompt_len=None, mode="sequence_last", last_k=2)
     np.testing.assert_allclose(reps, [[4, 4], [8, 8]])
 
-    reps = reps_from_hs_layers(HS, prompt_len=None, mode="sequence_all_mean", last_k=2)
+    reps = reps_from_hs_layers(HS, prompt_len=None, mode="sequence_mean", last_k=2)
     np.testing.assert_allclose(reps, [[2.5, 2.5], [5, 5]])
 
-    reps = reps_from_hs_layers(HS, prompt_len=None, mode="sequence_last_k_mean", last_k=2)
+    reps = reps_from_hs_layers(HS, prompt_len=None, mode="sequence_last_k", last_k=2)
     np.testing.assert_allclose(reps, [[3.5, 3.5], [7, 7]])
 
 
 def test_assistant_modes_use_completion_span():
-    reps = reps_from_hs_layers(HS, prompt_len=2, mode="assistant_all_mean", last_k=2)
+    reps = reps_from_hs_layers(HS, prompt_len=2, mode="text_mean", last_k=2)
     np.testing.assert_allclose(reps, [[3.5, 3.5], [7, 7]])  # mean of tokens 2,3
 
-    reps = reps_from_hs_layers(HS, prompt_len=2, mode="assistant_last_k_mean", last_k=1)
+    reps = reps_from_hs_layers(HS, prompt_len=2, mode="text_last_k", last_k=1)
     np.testing.assert_allclose(reps, [[4, 4], [8, 8]])
 
 
 def test_an_empty_span_raises_instead_of_pooling_the_prompt():
     # pooling the whole sequence instead would put the prompt (and its system prompt) in its place
-    for mode in ("assistant_all_mean", "assistant_last", "assistant_last_k_mean"):
+    for mode in ("text_mean", "text_last", "text_last_k"):
         with pytest.raises(EmptySpanError):
             reps_from_hs_layers(HS, prompt_len=4, mode=mode, last_k=2)
 

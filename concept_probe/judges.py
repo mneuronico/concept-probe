@@ -87,7 +87,8 @@ class Judge:
 
     def score(self, texts: Sequence[str], rubric: Rubric) -> np.ndarray:
         """Each text's answer as its number."""
-        return np.array([rubric.answers[a] for a in self.rate(texts, rubric)], dtype=np.float64)
+        return np.array([np.nan if a is None else rubric.answers[a] for a in self.rate(texts, rubric)],
+                        dtype=np.float64)
 
     def measure(self, rubric: Rubric) -> Callable[[List[str]], np.ndarray]:
         """A measure for :func:`concept_probe.evaluate_steering`: ``texts -> numbers``."""
@@ -236,24 +237,36 @@ class APIJudge(Judge):
                 "list with one object per text, each exactly {\"id\": <the text's id>, \"answer\": <an allowed "
                 "answer>}, with no other text and no code fences.")
 
-    def rate(self, texts: Sequence[str], rubric: Rubric) -> List[str]:
+    def rate(self, texts: Sequence[str], rubric: Rubric) -> List[Optional[str]]:
+        """Each text's answer. A text the judge answered with something not allowed, or not at all,
+        gets None (and a NaN score); how many and why is warned, and the rest are kept."""
         texts = [str(t) for t in texts]
         out: Dict[int, str] = {}
+        problems: List[str] = []
         system = self._system(rubric)
         for start in range(0, len(texts), self.texts_per_request):
             chunk = [{"id": i, "text": texts[i]} for i in range(start, min(len(texts), start + self.texts_per_request))]
-            for item in _parse_json_list(self.complete(system, json.dumps(chunk, ensure_ascii=False))):
+            try:
+                answered = _parse_json_list(self.complete(system, json.dumps(chunk, ensure_ascii=False)))
+            except (ValueError, json.JSONDecodeError) as exc:
+                problems.append(f"texts {chunk[0]['id']}-{chunk[-1]['id']}: {exc}")
+                continue
+            for item in answered:
                 if not isinstance(item, dict) or "id" not in item:
-                    raise ValueError(f"the judge answered {item!r} instead of {{'id': ..., 'answer': ...}}")
+                    problems.append(f"an answer {item!r} instead of {{'id': ..., 'answer': ...}}")
+                    continue
                 answer = rubric.match(item.get("answer"))
                 if answer is None:
-                    raise ValueError(f"the judge answered {item.get('answer')!r} for text {item['id']}; allowed: "
-                                     f"{list(rubric.answers)}")
+                    problems.append(f"text {item['id']}: {item.get('answer')!r}, not one of {list(rubric.answers)}")
+                    continue
                 out[int(item["id"])] = answer
         missing = [i for i in range(len(texts)) if i not in out]
         if missing:
-            raise RuntimeError(f"the judge gave no answer for {len(missing)} texts (the first is text {missing[0]})")
-        return [out[i] for i in range(len(texts))]
+            import warnings
+
+            warnings.warn(f"the judge gave no usable answer for {len(missing)} of {len(texts)} texts (they score NaN); "
+                          + "; ".join(problems[:5]), stacklevel=2)
+        return [out.get(i) for i in range(len(texts))]
 
 
 # ----------------------------------------------------------------------------------- local judges
@@ -416,7 +429,7 @@ def rate_saved(batch_dir: str, judge: Judge, rubric: Rubric = COHERENCE) -> List
     texts = [json.loads(l)["text"] for l in lines_path.read_text(encoding="utf-8").splitlines() if l.strip()]
     answers = judge.rate(texts, rubric)
     rated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    out = [{"index": i, "rating": a, "value": rubric.answers[a], "judge": judge.describe(), "rated_at": rated_at}
+    out = [{"index": i, "rating": a, "value": None if a is None else rubric.answers[a], "judge": judge.describe(), "rated_at": rated_at}
            for i, a in enumerate(answers)]
     (path / f"{rubric.name}_rating.json").write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
     return out

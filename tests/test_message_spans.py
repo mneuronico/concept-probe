@@ -2,7 +2,8 @@
 text's tokens, which readouts at a word use."""
 import pytest
 
-from concept_probe import encode_text, message_spans, preview_input
+from concept_probe import encode_text, preview_input
+from concept_probe.inputs import message_spans
 from concept_probe.record import Choice, announce
 from concept_probe import configure
 from fakes import CharChatTok
@@ -68,11 +69,11 @@ def test_choices_print_once_and_always_reach_the_log(capsys):
         def log(self, event, payload):
             logged.append((event, payload))
 
-    choice = Choice("model.dtype", "auto", "float16", "a test GPU without bfloat16")
+    choice = Choice("dtype", "auto", "float16", "a test GPU without bfloat16")
     announce([choice], console=True, logger=Log())
     announce([choice], console=True, logger=Log())
     printed = capsys.readouterr().out
-    assert printed.count("model.dtype: 'auto' -> 'float16'") == 1
+    assert printed.count("dtype: 'auto' -> 'float16'") == 1
     assert [e for e, _ in logged] == ["choice", "choice"] and logged[0][1]["chosen"] == "float16"
 
 

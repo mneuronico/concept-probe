@@ -12,19 +12,18 @@ import io
 import json
 import os
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
 
 from .inputs import (
+    RENAMED_READOUTS,
     Encoded,
     PromptLike,
-    _completion_input_ids,
-    _normalize_messages,
+    ReadContext,
     encode_text,
-    token_char_offsets,
 )
 from .interventions import active_interventions, edited_outputs
 from .modeling import _resolve_attr_path, get_transformer_layers, identity_of, safe_attention
@@ -77,14 +76,18 @@ def _model_dtype(model) -> Optional[torch.dtype]:
         return None
 
 
-def check_finite_hidden_states(hs_layers: Sequence[torch.Tensor], model) -> None:
-    """Raise :class:`NonFiniteActivationsError` if any layer holds NaN or inf.
+def check_finite_hidden_states(hs_layers: Sequence[torch.Tensor], model,
+                               labels: Optional[Sequence[Any]] = None) -> None:
+    """Raise :class:`NonFiniteActivationsError` if any of the layers read holds NaN or inf
+    (``labels`` names them; by default 0, 1, ...).
 
     Nothing downstream can tell such a layer from a real one: its directions, scores and d come
-    out NaN and the layer sweep would skip it in silence. The message names the model's dtype,
-    since the usual cause is half precision overflowing (Gemma 3 in float16, for one).
+    out NaN and the layer sweep would skip it in silence. Only the layers read are checked, so
+    finite layers can be read from a model whose later layers overflow. The message names the
+    model's dtype, since the usual cause is half precision overflowing (Gemma 3 in float16).
     """
-    bad = [l for l, h in enumerate(hs_layers) if not bool(torch.isfinite(h).all())]
+    names = list(range(len(hs_layers))) if labels is None else list(labels)
+    bad = [names[l] for l, h in enumerate(hs_layers) if not bool(torch.isfinite(h).all())]
     if not bad:
         return
     where = f"layers {bad}" if len(bad) <= 8 else f"{len(bad)} layers ({bad[0]} to {bad[-1]})"
@@ -98,20 +101,20 @@ def check_finite_hidden_states(hs_layers: Sequence[torch.Tensor], model) -> None
 
 
 # --------------------------------------------------------------------------------------- readouts
-#: Readout names, as the config takes them. ``assistant_*`` pool over the item's own tokens (a text
-#: or a generated completion); ``sequence_*`` from the start of the input to the end of the item.
-#: ``*_tokens`` keeps every token as a row instead of pooling.
+#: Readout names. ``text_*`` pool over the item's own tokens (a text, or a generated completion);
+#: ``sequence_*`` over the input from its start to the end of the item (template tokens included).
+#: ``*_last_k`` is the mean of the last ``last_k``; ``*_tokens`` keeps every token as a row.
 READ_MODES = (
+    "text_mean",
+    "text_last",
+    "text_last_k",
+    "text_first",
+    "text_max",
+    "text_tokens",
+    "sequence_mean",
     "sequence_last",
-    "sequence_last_k_mean",
-    "sequence_all_mean",
+    "sequence_last_k",
     "sequence_max",
-    "assistant_last",
-    "assistant_last_k_mean",
-    "assistant_all_mean",
-    "assistant_max",
-    "assistant_first",
-    "assistant_tokens",
     "sequence_tokens",
 )
 SPANS = ("text", "sequence", "input")
@@ -162,29 +165,26 @@ class Readout:
 
     @classmethod
     def parse(cls, mode: Union[str, "Readout"], last_k: int = 12) -> "Readout":
-        """A readout from a name of :data:`READ_MODES` (``last_k`` applies to ``*_last_k_mean``)."""
+        """A readout from a name of :data:`READ_MODES` (``last_k`` applies to ``*_last_k``)."""
         if isinstance(mode, Readout):
             return mode
+        if mode in RENAMED_READOUTS:
+            raise ValueError(f"The readout {mode!r} is now called {RENAMED_READOUTS[mode]!r}.")
         if mode not in READ_MODES:
-            raise ValueError(f"Unknown readout mode {mode!r}; expected one of {READ_MODES} or a Readout.")
+            raise ValueError(f"Unknown readout {mode!r}; expected one of {READ_MODES} or a Readout.")
         span, rest = mode.split("_", 1)
-        span = "text" if span == "assistant" else "sequence"
-        if rest == "last_k_mean":
+        if rest == "last_k":
             return cls(span, "mean", last_k=int(last_k))
-        return cls(span, {"all_mean": "mean", "last": "last", "first": "first", "max": "max",
-                          "tokens": "tokens"}[rest])
+        return cls(span, rest)
 
     @property
     def name(self) -> str:
         """The :data:`READ_MODES` name of this readout, or a description of it."""
-        prefix = "assistant" if self.span == "text" else "sequence"
         if self.span != "input" and self.position is None and self.substring is None:
             if self.last_k is not None and self.agg == "mean":
-                return f"{prefix}_last_k_mean"
-            if self.last_k is None:
-                legacy = f"{prefix}_{'all_mean' if self.agg == 'mean' else self.agg}"
-                if legacy in READ_MODES:
-                    return legacy
+                return f"{self.span}_last_k"
+            if self.last_k is None and f"{self.span}_{self.agg}" in READ_MODES:
+                return f"{self.span}_{self.agg}"
         parts = [self.span]
         if self.last_k is not None:
             parts.append(f"last_{self.last_k}")
@@ -272,7 +272,7 @@ def reps_from_hs_layers(
     """Pool each layer's hidden states ``(seq_len, dim)`` into one rep per layer, with readout
     ``mode`` (see :class:`Readout`); the item's own tokens are ``[prompt_len, span_end)``.
 
-    ``assistant_*`` readouts pool over that span, ``sequence_*`` readouts from the start of the
+    ``text_*`` readouts pool over that span, ``sequence_*`` readouts from the start of the
     input to ``span_end`` (template tokens included). An empty span raises
     :class:`EmptySpanError` rather than pooling something else (the prompt and system prompt
     would stand in for the missing text).
@@ -473,7 +473,9 @@ class Reps:
     be read (an empty span, a missing substring) have no rows and are listed in ``skipped`` with
     the reason. ``norms`` (items, layers) and ``projections`` (per item, tokens x layers) are
     there when asked for, for the items that were read. ``identity`` is the model they were read
-    with (see :func:`concept_probe.modeling.identity_of`): a probe trained on them takes it."""
+    with (see :func:`concept_probe.modeling.identity_of`): a probe trained on them takes it.
+    ``context`` says how the items were read (see :class:`concept_probe.ReadContext`), when the
+    reader knows: probes calibrate on it and check it when they score."""
 
     data: np.ndarray
     layers: List[Union[int, str]]
@@ -488,6 +490,7 @@ class Reps:
     identity: Optional[Dict[str, Any]] = None
     from_cache: int = 0
     choices: List[Choice] = field(default_factory=list)
+    context: Optional[ReadContext] = None
 
     @property
     def read_items(self) -> List[int]:
@@ -566,7 +569,7 @@ def _read(
         for j, i in enumerate(batch):
             enc = encodings[i]
             stacked = torch.stack([h[j, : lens[j]].to(home) for h in hs]).float()  # (blocks + 1, seq, dim)
-            check_finite_hidden_states(list(stacked[1:]), model)
+            check_finite_hidden_states([stacked[r] for r in rows], model, labels)
             total = int(stacked.shape[1])
             lo, hi = _span_bounds(total, enc.start, enc.end)
             item_norms = stacked[1:, lo:hi].norm(dim=-1).mean(dim=1).double().cpu().numpy()
@@ -613,7 +616,8 @@ def _read(
             items, positions = np.asarray(kept, dtype=np.int64), None
         out.append(Reps(
             data=data, layers=labels, readout=r, items=items, positions=positions,
-            norms=np.stack([found[k][i]["norms"] for i in kept]) if (norms and kept) else None,
+            norms=(np.stack([found[k][i]["norms"] for i in kept])[:, [r - 1 for r in rows if r > 0]]
+                   if (norms and kept) else None),
             projections=[extra[i]["projections"] for i in kept] if vectors is not None else None,
             skipped=dict(errors[k]), batch_size=step, cache_dir=None if store is None else store.dir,
             identity=dict(identity) if identity else identity_of(model, tokenizer),
@@ -626,21 +630,27 @@ def read_encoded(
     model,
     tokenizer,
     encodings: Sequence[Encoded],
-    readout: Union[str, Readout, Sequence[Union[str, Readout]]] = "assistant_all_mean",
+    readout: Union[str, Readout, Sequence[Union[str, Readout]]] = "text_mean",
     *,
+    context: Optional[ReadContext] = None,
     last_k: int = 12,
     layers: Optional[Sequence[Union[int, str]]] = None,
     batch_size: int = 16,
+    norms: bool = False,
     cache: Any = None,
     cache_dtype: str = "float32",
     skip_empty: bool = False,
     console: Optional[bool] = None,
 ) -> Union[Reps, Dict[str, Reps]]:
     """Read already-encoded inputs (see :class:`concept_probe.inputs.Encoded`), such as generated
-    completions given by their token ids, with one ``readout`` or several. See :func:`read_texts`."""
+    completions given by their token ids (:meth:`concept_probe.Generations.encodings`), with one
+    ``readout`` or several; ``context`` says how they were encoded, if it matters (see
+    :func:`read_texts`)."""
     names, readouts = _readouts(readout, last_k)
-    out = _read(model, tokenizer, encodings, readouts, layers=layers, batch_size=batch_size, cache=cache,
-                cache_dtype=cache_dtype, skip_empty=skip_empty)
+    out = _read(model, tokenizer, encodings, readouts, layers=layers, batch_size=batch_size, norms=norms,
+                cache=cache, cache_dtype=cache_dtype, skip_empty=skip_empty)
+    for r in out:
+        r.context = None if context is None else replace(context, readout=r.readout.name)
     return _one_or_many(names, out, console)
 
 
@@ -648,15 +658,16 @@ def read_texts(
     model,
     tokenizer,
     texts: Sequence[PromptLike],
-    readout: Union[str, Readout, Sequence[Union[str, Readout]]] = "assistant_all_mean",
+    readout: Union[str, Readout, Sequence[Union[str, Readout]]] = "text_mean",
     *,
     role: str = "raw",
     system: Optional[str] = None,
-    prompt: Optional[str] = None,
+    prompt: Union[None, str, Sequence[str]] = None,
     generation: bool = False,
     last_k: int = 12,
     layers: Optional[Sequence[Union[int, str]]] = None,
     batch_size: int = 16,
+    norms: bool = False,
     cache: Any = None,
     cache_dtype: str = "float32",
     skip_empty: bool = False,
@@ -664,17 +675,25 @@ def read_texts(
 ) -> Union[Reps, Dict[str, Reps]]:
     """Read texts with ``model`` and return their representations (layer 1 of docs/DESIGN.md).
 
-    Each text is encoded as training encodes texts (``role``, ``system``, ``prompt``; see
-    :func:`concept_probe.inputs.encode_text` and :func:`preview_input`), or, with
-    ``generation=True``, as a prompt to generate from, exactly as :func:`concept_probe.generate` and
-    :func:`concept_probe.answer_logprobs` feed it (a user turn and the assistant header; the
-    ``Readout("input", ...)`` reaches the token that predicts the reply). The inputs go through the
-    model ``batch_size`` at a time, and ``readout`` (a :data:`READ_MODES` name or a
-    :class:`Readout`) reduces each text's tokens at every layer in ``layers`` (default: every block;
-    add ``"embeddings"`` for the embedding output). A list of readouts reads them all from the same
-    forward passes and returns ``{name: Reps}`` (the names as given, or each :class:`Readout`'s
-    ``name``). Batching changes the order of floating-point operations, so in half precision the
-    results can differ from ``batch_size=1`` in the last digits.
+    Each text is encoded as a text to read (``role``, ``system``, ``prompt``; see
+    :func:`concept_probe.inputs.encode_text` and :func:`preview_input`): by default alone (the BOS
+    and the text); ``role="user"`` as a user turn; ``role="assistant"`` as the model's reply, after
+    ``system`` and a user turn ``prompt``, which may be one per text (to read generated completions
+    as replies to their own prompts). With ``generation=True`` a text is a prompt to generate from,
+    exactly as :func:`concept_probe.generate` and :func:`concept_probe.answer_logprobs` feed it (a
+    user turn and the assistant header; ``Readout("input", ...)`` reaches the token that predicts
+    the reply). Whatever ``role`` would leave out (a system prompt with ``role="raw"``, a template
+    the tokenizer lacks, a BOS it does not have) is warned about.
+
+    The inputs go through the model ``batch_size`` at a time, and ``readout`` (a :data:`READ_MODES`
+    name or a :class:`Readout`) reduces each text's tokens at every layer in ``layers`` (default:
+    every block; add ``"embeddings"`` for the embedding output). A list of readouts reads them all
+    from the same forward passes and returns ``{name: Reps}`` (the names as given, or each
+    :class:`Readout`'s ``name``). ``norms=True`` adds each text's mean residual norm per layer
+    (``Reps.norms``), which a probe fitted on them uses as the unit of ``unit="resid_norm"``.
+    The result's ``context`` records how the texts were read. Batching changes the order of
+    floating-point operations, so in half precision the results can differ from ``batch_size=1`` in
+    the last digits.
 
     Reading saves what it reads by default (decision D4): ``cache=None`` uses the session's cache
     (``<output_root>/rep_cache``, on while the session saves), a path uses that directory, and
@@ -682,12 +701,32 @@ def read_texts(
     readout. Automatic choices (where the cache is, a float16 fallback) are announced and listed in
     the result's ``choices``.
     """
-    encodings = [encode_text(tokenizer, t, system, role=role, prompt=prompt, generation=generation,
-                             warn_prefix=f"texts[{i}]") for i, t in enumerate(texts)]
+    texts = list(texts)
+    per_text = prompt is not None and not isinstance(prompt, str)
+    prompts = list(prompt) if per_text else [prompt] * len(texts)
+    if len(prompts) != len(texts):
+        raise ValueError(f"prompt has {len(prompts)} turns for {len(texts)} texts")
+    encodings = [encode_text(tokenizer, t, system, role=role, prompt=p, generation=generation, warn=_warn,
+                             warn_prefix=f"texts[{i}]") for i, (t, p) in enumerate(zip(texts, prompts))]
     names, readouts = _readouts(readout, last_k)
-    out = _read(model, tokenizer, encodings, readouts, layers=layers, batch_size=batch_size, cache=cache,
-                cache_dtype=cache_dtype, skip_empty=skip_empty, label="texts")
+    out = _read(model, tokenizer, encodings, readouts, layers=layers, batch_size=batch_size, norms=norms,
+                cache=cache, cache_dtype=cache_dtype, skip_empty=skip_empty, label="texts")
+    for r in out:
+        if per_text:
+            if role != "assistant":
+                raise ValueError("one prompt per text is a user turn before each text: it needs role='assistant'")
+            r.context = ReadContext.generated(r.readout.name, system)
+        else:
+            r.context = ReadContext(kind="text", role="user" if generation else role,
+                                    system=None if role == "raw" and not generation else system,
+                                    prompt=prompt if role == "assistant" else None, readout=r.readout.name)
     return _one_or_many(names, out, console)
+
+
+def _warn(message: str) -> None:
+    import warnings
+
+    warnings.warn(message, stacklevel=3)
 
 
 def _readouts(readout: Any, last_k: int) -> Tuple[Optional[List[str]], List[Readout]]:
@@ -706,78 +745,3 @@ def _readouts(readout: Any, last_k: int) -> Tuple[Optional[List[str]], List[Read
 def _one_or_many(names: Optional[List[str]], out: List[Reps], console: Optional[bool]) -> Union[Reps, Dict[str, Reps]]:
     announce(out[0].choices, console=console)  # one read: the same choices for every readout
     return out[0] if names is None else dict(zip(names, out))
-
-
-@torch.no_grad()
-def extract_completion_reps(
-    model,
-    tokenizer,
-    pairs: List[Tuple[PromptLike, str]],
-    *,
-    pool: str = "assistant_all_mean",
-    last_k: int = 12,
-    system: Optional[str] = None,
-    batch_size: int = 16,
-    cache: Any = None,
-) -> np.ndarray:
-    """Per-layer reps pooled over the completion tokens, for ``(prompt, completion)`` pairs.
-
-    Reconstructs the readout used during training: each prompt is chat-formatted with an
-    assistant generation prompt, the completion tokens are appended, and the hidden states are
-    pooled over the completion span per layer (``pool='assistant_all_mean'`` by default). Returns
-    an array of shape ``(len(pairs), num_layers, hidden_dim)``.
-
-    Use it to score externally-provided text -- e.g. another model's generations -- against
-    trained concept vectors, or to compare how different models represent the same text.
-    Prompts follow the rules of every other path: a string is a user turn, a message list is used
-    as given, and ``system`` (default None: no system message) is added unless the list has its own.
-    The completion is tokenized from its text, so its tokens can differ slightly from the ids a
-    generation produced. Reading goes ``batch_size`` pairs at a time and uses the cache as
-    :func:`read_texts` does.
-    """
-    encodings = []
-    for prompt, completion in pairs:
-        messages, _ = _normalize_messages(prompt, system)
-        full_ids, plen = _completion_input_ids(tokenizer, messages, completion)
-        encodings.append(Encoded(full_ids[0], plen, int(full_ids.shape[-1]), str(completion),
-                                 token_char_offsets(tokenizer, str(completion))))
-    reps = _read(model, tokenizer, encodings, [Readout.parse(pool, last_k)], batch_size=batch_size,
-                 cache=cache, label="pairs")[0]
-    announce(reps.choices)
-    return reps.data
-
-
-@torch.no_grad()
-def extract_text_reps(
-    model,
-    tokenizer,
-    texts: List[str],
-    *,
-    role: str = "raw",
-    prompt: Optional[str] = None,
-    system: Optional[str] = None,
-    pool: Union[str, Sequence[str]] = "assistant_all_mean",
-    last_k: int = 12,
-    batch_size: int = 16,
-    cache: Any = None,
-) -> Union[np.ndarray, Dict[str, np.ndarray]]:
-    """Per-layer reps of texts, encoded exactly as texts-mode training encodes them.
-
-    ``role``, ``prompt`` and ``system`` mean what ``training.train_text_role``,
-    ``training.train_text_prompt`` and the training system prompt mean, and the defaults are the
-    training defaults: the raw text with no template or system prompt, pooled over its own
-    tokens. ``pool`` is one readout mode, returning ``(len(texts), num_layers, hidden_dim)``, or
-    several, returning a dict of such arrays from a single forward pass per batch. Use
-    :func:`preview_input` to see the exact input, and :func:`read_texts` for the readouts that are
-    not a mode name (a position, a substring) and for the layer of embeddings.
-    """
-    pools = [pool] if isinstance(pool, str) else list(pool)
-    encodings = [encode_text(tokenizer, t, system, role=role, prompt=prompt, warn_prefix=f"texts[{i}]")
-                 for i, t in enumerate(texts)]
-    readouts = [Readout.parse(p, last_k) for p in pools]
-    if any(r.agg == "tokens" for r in readouts):
-        raise ValueError("extract_text_reps returns one row per text; use read_texts for a tokens readout.")
-    results = _read(model, tokenizer, encodings, readouts, batch_size=batch_size, cache=cache, label="texts")
-    announce(results[0].choices)
-    arrays = {p: r.data for p, r in zip(pools, results)}
-    return arrays[pool] if isinstance(pool, str) else arrays

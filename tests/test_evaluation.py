@@ -7,15 +7,15 @@ import os
 import numpy as np
 import pytest
 
-from concept_probe import ConceptProbe, ConceptSpec, ProbeWorkspace
+from concept_probe import ConceptProbe, read_texts
 from concept_probe.evaluation import EvalSet, cross_reading, evaluate_reading, label_shuffle_control
 from concept_probe.stats import auroc, compare_scorers, random_directions_null
-from concept_probe.utils import deep_merge
 from concept_probe.visuals import plot_sweep
 from fakes import CharChatTok
 from tiny_model import TinyCausalLM
 
-from test_reference_outputs import (EVAL_NEG, EVAL_POS, EVAL_QUESTIONS, QUESTIONS, TRAIN_NEG, TRAIN_POS)
+from test_reference_outputs import (EVAL_NEG, EVAL_POS, QUESTIONS, TRAIN_NEG, TRAIN_POS, _generated_set,
+                                    _text_set, _train_on_generations)
 
 
 def _blobs(n=40, layers=4, dim=400, gap=1.0, seed=0, paired=False):
@@ -96,8 +96,7 @@ def test_probes_read_on_each_others_sets():
 
     class P:
         def __init__(self, name, directions, layer):
-            self.concept = type("C", (), {"name": name})()
-            self.directions, self.layer = directions, layer
+            self.name, self.directions, self.layer = name, directions, layer
 
     first = P("a", _directions(), 2)
     second_dirs = np.zeros((4, 400))
@@ -116,50 +115,70 @@ def test_the_sweep_plot_draws_the_reported_curve_and_the_null(tmp_path):
     assert (tmp_path / "s.png").stat().st_size > 0
 
 
-# --------------------------------------------------------------------------------- in training
-def _train(tmp_path, overrides=None, **concept):
-    ws = ProbeWorkspace(config_overrides=deep_merge({
-        "output": {"root_dir": str(tmp_path), "console": False}, "plots": {"enabled": False},
-        "prompts": {"train_questions": QUESTIONS, "eval_questions": EVAL_QUESTIONS},
-        "training": {"train_max_new_tokens": 10, "gen_batch_size": 4},
-        "evaluation": {"eval_max_new_tokens": 10, "n_permutations": 200, "n_bootstrap": 200},
-    }, overrides or {}), model=TinyCausalLM(), tokenizer=CharChatTok(), model_id="tiny-test")
-    fields = dict(name="c", pos_label="p", neg_label="n", pos_system="pp pp pp", neg_system="nn nn nn",
-                  eval_pos_texts=EVAL_POS, eval_neg_texts=EVAL_NEG)
-    fields.update(concept)
-    probe = ws.train_concept(ConceptSpec(**fields), run_name="r")
-    return probe, json.loads(open(os.path.join(probe.run_dir, "metrics.json"), encoding="utf-8").read())
+# ----------------------------------------------------------------------------- fitting a probe
+def test_generated_completions_are_judged_without_the_pole_system_prompt():
+    probe, _, _ = _train_on_generations("c", QUESTIONS, QUESTIONS)
+    sets = probe.evaluation.sets
+    assert probe.evaluation.primary == "eval" and set(sets) == {"eval", "eval_with_system_prompt", "texts"}
+    assert sets["eval"].d < sets["eval_with_system_prompt"].d  # the system prompt inflated it
+    assert probe.calibrations[0].context.kind == "generated"
 
 
-def test_generated_completions_are_judged_without_the_pole_system_prompt(tmp_path):
-    probe, metrics = _train(tmp_path)
-    sets = metrics["evaluation"]["sets"]
-    assert metrics["evaluation"]["primary"] == "eval" and set(sets) == {"eval", "eval_with_system_prompt", "texts"}
-    assert sets["eval"]["d"] < sets["eval_with_system_prompt"]["d"]  # the system prompt inflated it
-    assert metrics["reference_context"]["kind"] == "generated"
+def test_the_old_judgement_is_the_primary_set_away_and_gives_the_old_number():
+    from concept_probe import generate, read_encoded
+    from test_reference_outputs import EVAL_QUESTIONS, MODEL, NEG_SYSTEM, POS_SYSTEM, TOK
+
+    gen = dict(max_new_tokens=10, batch_size=4, save=False)
+    P = read_encoded(MODEL, TOK, generate(MODEL, TOK, QUESTIONS, system=POS_SYSTEM, **gen).encodings(), cache=False)
+    N = read_encoded(MODEL, TOK, generate(MODEL, TOK, QUESTIONS, system=NEG_SYSTEM, **gen).encodings(), cache=False)
+    gp = generate(MODEL, TOK, EVAL_QUESTIONS, system=POS_SYSTEM, **gen)
+    gn = generate(MODEL, TOK, EVAL_QUESTIONS, system=NEG_SYSTEM, **gen)
+    with_system, _ = _generated_set("eval_with_system_prompt", gp, gn, "as generated")
+    probe = ConceptProbe.fit(P, N, eval=with_system, n_permutations=200, n_bootstrap=200, identity="tiny", save=False)
+    assert probe.metrics["d"] == pytest.approx(20.403938831070754, rel=1e-4)  # the number before decision D2
 
 
-def test_the_old_judgement_is_one_setting_away_and_gives_the_old_number(tmp_path):
-    _, metrics = _train(tmp_path, {"evaluation": {"primary_set": "eval_with_system_prompt"}})
-    assert metrics["best_d"] == pytest.approx(20.403938831070754, rel=1e-4)  # the number before decision D2
+def _texts_probe(eval_sets, **kw):
+    model, tok = TinyCausalLM(), CharChatTok()
+    P, N = read_texts(model, tok, TRAIN_POS, cache=False), read_texts(model, tok, TRAIN_NEG, cache=False)
+    return ConceptProbe.fit(P, N, eval=eval_sets, n_permutations=200, n_bootstrap=200, **{"save": False, **kw})
 
 
-def test_minimal_pairs_of_eval_texts_are_split_and_tested_by_pair(tmp_path):
-    texts = dict(pos_system="", neg_system="", train_pos_texts=TRAIN_POS, train_neg_texts=TRAIN_NEG)
-    _, paired = _train(tmp_path / "p", {"training": {"train_prompt_mode": "texts"}, "evaluation": {"eval_pairs": True}},
-                       **texts)
-    assert paired["eval_paired"] is True and paired["evaluation"]["sets"]["eval"]["paired"] is True
-    t = np.load(os.path.join(str(tmp_path / "p"), "c", "r", "tensors.npz"))
-    np.testing.assert_array_equal(t["eval_selection_pos_idx"], t["eval_selection_neg_idx"])
+def test_minimal_pairs_of_eval_texts_are_split_and_tested_by_pair():
+    s = _text_set("eval", EVAL_POS, EVAL_NEG)
+    s.paired = True
+    probe = _texts_probe(s)
+    pos_sel, neg_sel = probe.evaluation.selection_idx
+    np.testing.assert_array_equal(pos_sel, neg_sel)
+    assert probe.evaluation.main.paired
+
+
+def test_the_items_that_choose_the_layer_can_be_given():
+    s = _text_set("eval", EVAL_POS, EVAL_NEG)
+    probe = _texts_probe(s, selection_split=list(range(0, 16, 2)))  # the even items choose, the odd ones measure
+    pos_sel, neg_sel = probe.evaluation.selection_idx
+    assert pos_sel.tolist() == list(range(0, 16, 2)) and neg_sel.tolist() == list(range(0, 16, 2))
+    assert probe.evaluation.report_idx[0].tolist() == list(range(1, 16, 2))
+    with pytest.raises(ValueError, match="outside"):
+        _texts_probe(s, selection_split=[0, 99])
 
 
 def test_named_eval_sets_controls_and_new_numbers_are_reported(tmp_path):
-    texts = dict(pos_system="", neg_system="", train_pos_texts=TRAIN_POS, train_neg_texts=TRAIN_NEG,
-                 eval_sets={"short": {"pos": ["pp", "px", "zp"], "neg": ["nn", "nx", "zn"]}})
-    _, metrics = _train(tmp_path, {"training": {"train_prompt_mode": "texts"}}, **texts)
-    short = metrics["evaluation"]["sets"]["short"]
-    assert short["n_pos"] == 3 and short["d"] is not None and short["null_d95"] is not None
-    assert metrics["null_d95_at_best_layer"] < metrics["best_d"]
-    assert metrics["best_auroc"] is not None and metrics["best_accuracy"] is not None
-    assert metrics["label_shuffle"]["n_shuffles"] == 10
-    assert "evaluation.n_label_shuffles" in [c["setting"] for c in metrics["choices"]]
+    short = _text_set("short", ["pp", "px", "zp"], ["nn", "nx", "zn"])
+    import concept_probe
+
+    previous = concept_probe.configure(save=True, output_root=str(tmp_path))
+    try:
+        probe = _texts_probe([_text_set("eval", EVAL_POS, EVAL_NEG), short], save=None)
+    finally:
+        concept_probe.configure(save=previous.save, output_root=previous.output_root)
+    m = probe.metrics
+    assert m["evaluation"]["sets"]["short"]["n_pos"] == 3 and m["evaluation"]["sets"]["short"]["null_d95"] is not None
+    assert m["null_d95"] < m["d"] and m["auroc"] is not None and m["accuracy"] is not None
+    assert m["label_shuffle"]["n_shuffles"] == 10
+    assert "n_label_shuffles" in [c.setting for c in probe.choices]
+    assert {"sweep.png", "score_hist.png", "sweep_short.png"} <= set(os.listdir(os.path.join(probe.run_dir, "plots")))
+    loaded = ConceptProbe.load(probe.run_dir)
+    assert loaded.metrics == json.loads(json.dumps(m, default=float)) or loaded.metrics["d"] == pytest.approx(m["d"])
+    np.testing.assert_allclose(loaded.directions, probe.directions)
+    assert loaded.calibrations[0].context.matches(probe.calibrations[0].context)

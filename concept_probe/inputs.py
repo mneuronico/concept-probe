@@ -3,7 +3,7 @@ docs/DESIGN.md, the part before the forward pass).
 
 A text is read in a role (raw, as a user turn, or as the model's own reply), with an optional
 system prompt and, for a reply, the user turn before it. Encoding returns the ids and the span of
-the text's own tokens, which the ``assistant_*`` readouts pool over; :func:`preview_input` shows
+the text's own tokens, which the ``text_*`` readouts pool over; :func:`preview_input` shows
 the exact input before anything runs.
 """
 from dataclasses import dataclass
@@ -260,7 +260,7 @@ class Encoded:
     """One input to read: its token ids and where the item's own tokens are.
 
     ``input_ids[start:end]`` are the item's own tokens (a text, or a generated completion), the
-    span the ``assistant_*`` readouts pool over; ``start`` is None when the span is unknown.
+    span the ``text_*`` readouts pool over; ``start`` is None when the span is unknown.
     ``text`` is what that span holds as the model saw it (a chat template may strip whitespace),
     and ``offsets`` the character span in ``text`` of each token of the span, which readouts at a
     word use; both are None when unknown.
@@ -284,8 +284,8 @@ def encode_text(
     warn: Optional[Callable[[str], None]] = None,
     warn_prefix: str = "read",
 ) -> Encoded:
-    """Encode a text to read (no generation), as texts-mode training, eval texts, ``score_texts``
-    and ``extract_text_reps`` do.
+    """Encode a text to read, as :func:`concept_probe.read_texts` and ``ConceptProbe.score_texts`` do
+    (``generation=True``: as a prompt to generate from).
 
     - ``role="raw"`` (default): the text alone, with no chat template and no system prompt: the
       BOS token (if the tokenizer has one) and the text. ``system`` and ``prompt`` are ignored.
@@ -303,7 +303,7 @@ def encode_text(
     text's own tokens; the last token of the input is the one that predicts the reply's first.
     """
     if role not in TEXT_ROLES:
-        raise ValueError(f"training.train_text_role must be one of {TEXT_ROLES}; got {role!r}")
+        raise ValueError(f"role must be one of {TEXT_ROLES}; got {role!r}")
     if generation:
         if role == "assistant" or prompt is not None:
             raise ValueError(f"{warn_prefix}: generation=True reads the text as a prompt to generate from (a user "
@@ -312,6 +312,9 @@ def encode_text(
         ids = apply_chat(tokenizer, messages, add_generation_prompt=True)
     if role == "user" or generation:
         if not generation:
+            if prompt is not None and warn is not None:
+                warn(f"{warn_prefix}: role='user' reads the text as the user turn; prompt (a user turn before a reply) "
+                     "is ignored.")
             ids = _encode_for_read(tokenizer, text, system, warn=warn, warn_prefix=warn_prefix)
         loc = _user_text_location(tokenizer, text, system, ids, generation=generation)
         if loc is None:
@@ -346,15 +349,31 @@ def encode_text(
         messages.append({"role": "system", "content": str(system)})
     if prompt is not None:
         messages.append({"role": "user", "content": str(prompt)})
-    if not messages:
+    try:
+        ids, plen = _completion_input_ids(tokenizer, messages, text)
+    except Exception as exc:
+        if messages:
+            raise
         raise ValueError(
-            f"{warn_prefix}: reading a text as the assistant's reply needs a turn before it, since chat "
-            "templates cannot format a conversation that starts with the reply: pass prompt= (a user turn) "
-            "or system= (in training: training.train_text_prompt, or training.train_text_system / "
-            "prompts.neutral_system)."
-        )
-    ids, plen = _completion_input_ids(tokenizer, messages, text)
+            f"{warn_prefix}: this chat template cannot format a reply with no turn before it ({exc}): pass "
+            "prompt= (a user turn) or system="
+        ) from exc
     return Encoded(ids[0], plen, int(ids.shape[-1]), text, token_char_offsets(tokenizer, text))
+
+
+
+#: Readout names of earlier versions, and today's. Saved runs and probes are translated when they
+#: load; code that passes an old name gets an error that names the new one.
+RENAMED_READOUTS = {
+    "assistant_all_mean": "text_mean", "assistant_last": "text_last", "assistant_last_k_mean": "text_last_k",
+    "assistant_first": "text_first", "assistant_max": "text_max", "assistant_tokens": "text_tokens",
+    "sequence_all_mean": "sequence_mean", "sequence_last_k_mean": "sequence_last_k",
+}
+
+
+def upgrade_readout_name(name: Any) -> Any:
+    """A readout name of an earlier version, in today's names (others come back unchanged)."""
+    return RENAMED_READOUTS.get(name, name) if isinstance(name, str) else name
 
 
 @dataclass(frozen=True)
@@ -362,56 +381,60 @@ class ReadContext:
     """How items were read: what a calibration (the zero and unit of z scores) applies to.
 
     ``kind`` is ``"text"`` (texts read with ``role``, ``system`` and, for a reply, ``prompt``; see
-    :func:`encode_text`) or ``"generated"`` (completions the model generated, read after their
-    prompt). ``readout`` is how their tokens were pooled. Two contexts match when they read items
-    the same way: generated completions always match each other, texts match on role, system
-    prompt and prompt. The readout is recorded but not compared; item z scores need the mean
-    pooling they were measured with, which the scorers check.
+    :func:`encode_text`) or ``"generated"`` (replies read after their own prompts: completions the
+    model generated, after ``system`` if they were read with one). ``readout`` is how their tokens
+    were pooled. Two contexts match when they read items the same way: texts on role, system prompt
+    and prompt, replies to their own prompts on the system prompt. The readout is not part of the
+    match (a probe's z checks it separately, where it knows it).
     """
 
     kind: str = "text"
     role: Optional[str] = "raw"
     system: Optional[str] = None
     prompt: Optional[str] = None
-    readout: Optional[str] = "assistant_all_mean"
+    readout: Optional[str] = "text_mean"
 
     def __post_init__(self):
         if self.kind not in ("text", "generated"):
             raise ValueError(f"ReadContext kind must be 'text' or 'generated'; got {self.kind!r}")
         if self.kind == "text" and self.role not in TEXT_ROLES:
             raise ValueError(f"ReadContext role must be one of {TEXT_ROLES}; got {self.role!r}")
+        if self.readout is not None:
+            object.__setattr__(self, "readout", upgrade_readout_name(self.readout))
 
     @classmethod
-    def generated(cls, readout: Optional[str] = "assistant_all_mean") -> "ReadContext":
-        return cls(kind="generated", role=None, system=None, prompt=None, readout=readout)
+    def generated(cls, readout: Optional[str] = "text_mean", system: Optional[str] = None) -> "ReadContext":
+        return cls(kind="generated", role=None, system=system or None, prompt=None, readout=readout)
 
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, Any]]) -> "ReadContext":
-        """From the dict runs save (``{"kind", "role", "system", "prompt", "mode"}``)."""
+        """From the dict probes save (``{"kind", "role", "system", "prompt", "readout"}``; runs saved
+        by earlier versions wrote ``"mode"``, in the readout names of then)."""
         d = dict(d or {})
+        readout = d.get("readout", d.get("mode"))
         if d.get("kind") == "generated":
-            return cls.generated(d.get("mode", d.get("readout")))
+            return cls.generated(readout, d.get("system"))
         return cls(kind="text", role=d.get("role") or "raw", system=d.get("system") or None,
-                   prompt=d.get("prompt"), readout=d.get("mode", d.get("readout")))
+                   prompt=d.get("prompt"), readout=readout)
 
     def to_dict(self) -> Dict[str, Any]:
-        """The dict runs save, as before this class existed."""
         if self.kind == "generated":
-            return {"kind": "generated", "mode": self.readout}
+            return {"kind": "generated", "system": self.system or None, "readout": self.readout}
         return {"kind": "text", "role": self.role, "system": self.system or None, "prompt": self.prompt,
-                "mode": self.readout}
+                "readout": self.readout}
 
     def matches(self, other: "ReadContext") -> bool:
         if self.kind != other.kind:
             return False
         if self.kind == "generated":
-            return True
+            return (self.system or None) == (other.system or None)
         return all((getattr(self, k) or None) == (getattr(other, k) or None) for k in ("role", "system", "prompt"))
 
     def describe(self) -> str:
         """A short description, for messages."""
         if self.kind == "generated":
-            return "as generated completions"
+            return "as replies to their own prompts" + (f", after the system prompt {self.system!r}" if self.system
+                                                        else "")
         parts = [f"as {'raw text' if self.role == 'raw' else self.role + ' turns'}"]
         if self.system:
             parts.append(f"after the system prompt {self.system!r}")
@@ -446,13 +469,13 @@ def preview_input(
 ) -> Dict[str, Any]:
     """Exactly what the library feeds the model for ``text``, before running anything.
 
-    ``generation=False`` encodes ``text`` as a text to read, as texts-mode training, eval texts,
-    ``score_texts`` and ``extract_text_reps`` do with the same ``role``/``system``/``prompt``.
-    ``generation=True`` encodes it as a prompt to generate from, as ``score_prompts`` does: a user
+    ``generation=False`` encodes ``text`` as a text to read, as :func:`concept_probe.read_texts` and
+    ``ConceptProbe.score_texts`` do with the same ``role``/``system``/``prompt``.
+    ``generation=True`` encodes it as a prompt to generate from, as :func:`concept_probe.generate` does: a user
     turn (after ``system`` if set) and the assistant header; ``role`` and ``prompt`` are ignored.
 
     Returns ``input_text`` (decoded with every special and template token), ``input_ids``,
-    ``tokens``, ``text_span`` / ``span_text`` (the tokens the ``assistant_*`` readouts pool over),
+    ``tokens``, ``text_span`` / ``span_text`` (the tokens the ``text_*`` readouts pool over),
     and ``message_spans``: for each message of the chat (the system
     prompt, the user turns, the reply being read), its ``role``, its token ``span`` (None where it
     cannot be located) and the ``text`` of that span. A raw text has no messages.

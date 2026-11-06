@@ -1,224 +1,68 @@
+"""The probe object (layers 2 and 3 of docs/DESIGN.md).
+
+A :class:`ConceptProbe` is one direction per layer of a model to read a concept with, the layer it
+reads at, the calibrations that turn its projections into z scores, and the directions it steers
+with. It is built from representations already read (:meth:`ConceptProbe.fit`, which can also
+evaluate it on named eval sets), from directions computed elsewhere
+(:meth:`ConceptProbe.from_directions`), or from a saved probe (:meth:`ConceptProbe.load`, also for
+runs saved by earlier versions). It reads arrays without a model; with one attached
+(:meth:`ConceptProbe.attach`) it also scores texts token by token and builds its steering
+intervention.
+"""
 import json
 import os
-import shutil
-import sys
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
-import torch
 
-from .config import ConceptSpec, check_config_keys, load_defaults, resolve_config
-from .logger import JsonlLogger, NullLogger
-from .modeling import (
-    ModelBundle,
-    _chat_template_kwargs,
-    _resolve_attr_path,
-    apply_chat,
-    get_transformer_layers,
-    attention_mask_from_ids,
-    identity_from_config,
-    identity_mismatches,
-    identity_of,
-    upgrade_saved_config,
-)
-from .record import Choice, announce
-from .settings import settings
 from .directions import estimator_spec, fit_directions, make_estimator
 from .evaluation import EvalSet, ReadingEvaluation, evaluate_reading, label_shuffle_control
-from .generation import (
-    TokenScorer,
-    TokenStep,
-    _project_tokens,
-    completion_end as _completion_end,
-    eos_token_ids as _eos_token_ids,
-    generate,
-)
-from .interventions import Add
-from .scoring import Condition, ScoreInput, Scores, batch_dir, generate_and_score, score_inputs
-from .linear_probe import Calibration, _token_references, calibrations_from_tensors, sigmoid, steer_directions_for
-from .directions import (  # re-exported: they lived here before
-    DIRECTION_NORMALIZATIONS,
-    concept_direction,
-    normed_np,
-)
-from .stats import (  # re-exported: they lived here before
-    SWEEP_SELECTS,
-    _bootstrap_d_ci,
-    _cohen_d_columns,
-    _max_d_permutation_p,
-    _pooled_sd_columns,
-    _select_best_layer,
-    _split_indices,
-    _welch_p_columns,
-    cohen_d_np,
-    ttest_ind,
-    ttest_rel,
-)
-from .reading import (  # re-exported: they lived here before
-    EmptySpanError,
-    NonFiniteActivationsError,
-    READ_MODES,
-    Readout,
-    Reps,
-    _FINAL_NORM_PATHS,
-    _get_final_norm_module,
-    _model_dtype,
-    _read,
-    _span_bounds,
-    check_finite_hidden_states,
-    extract_completion_reps,
-    extract_text_reps,
-    read_encoded,
-    read_texts,
-    reps_from_hs_layers,
-)
-from .inputs import (  # re-exported: they lived here before
-    Encoded,
-    ReadContext,
-    encode_text,
-    PromptLike,
-    PromptMessage,
+from .inputs import (
     TEXT_ROLES,
-    _TEXT_SENTINEL,
+    Encoded,
+    PromptLike,
+    ReadContext,
     _completion_input_ids,
-    _decode_tokens,
-    _encode_for_read,
-    _encode_text_for_read,
-    _has_chat_template,
-    _no_bos_sink_start,
     _normalize_messages,
     _prompt_to_text,
-    _token_count,
-    _user_text_span,
-    preview_input,
+    encode_text,
 )
-from .utils import (
-    deep_merge,
-    ensure_dir,
-    json_dump,
-    jsonl_to_pretty,
-    now_tag,
-    resolve_layer_index,
-    safe_slug,
-    set_seed,
-)
+from .interventions import Add
+from .linear_probe import Calibration, calibrations_from_tensors, sigmoid, steer_directions_for
+from .modeling import ModelBundle, identity_from_config, identity_mismatches, upgrade_saved_config
+from .reading import Readout, _read
+from .record import Choice, announce
+from .scoring import ScoreInput, Scores, TokenScorer, score_inputs
+from .settings import settings
+from .stats import _pooled_sd_columns, bootstrap_ci, summarize_tokens
+from .utils import ensure_dir, json_dump, now_tag, resolve_layer_index, safe_slug
 from .visuals import plot_score_hist, plot_sweep
-from .console import ConsoleLogger
 
-def _render_progress(current: int, total: int, *, width: int = 28) -> str:
-    if total <= 0:
-        return "[----------------------------] 0/0"
-    frac = min(1.0, max(0.0, current / total))
-    filled = int(round(width * frac))
-    bar = "#" * filled + "-" * (width - filled)
-    return f"[{bar}] {current}/{total}"
+#: Units of a steering dose: as is, the eval items' within-pole SD on the steering direction, or each
+#: layer's mean residual norm.
+ALPHA_UNITS = ("raw", "sigma", "resid_norm")
+#: Units of a probe's z: within-pole SDs, or the poles' scale (+1 the positive mean, 0 the zero).
+Z_UNITS = ("sd", "poles")
 
 
-def _progress_print(current: int, total: int, *, label: str, enabled: bool, last: bool = False) -> None:
-    if not enabled:
-        return
-    inline_env = os.environ.get("CP_PROGRESS_INLINE", "").strip().lower()
-    if inline_env in {"1", "true", "yes"}:
-        inline = True
-    elif inline_env in {"0", "false", "no"}:
-        inline = False
-    else:
-        inline = sys.stdout.isatty()
-    bar = _render_progress(current, total)
-    end = "\n" if (last or not inline) else "\r"
-    print(f"{label} {bar}", end=end, flush=True)
+# ------------------------------------------------------------------------------------- helpers
+def _as_array(reps: Any) -> np.ndarray:
+    return np.asarray(getattr(reps, "data", reps))
 
 
-def _mean_token_norms(hs_layers: List[torch.Tensor], start: Optional[int], end: Optional[int]) -> np.ndarray:
-    """Mean L2 norm per layer of the hidden states of the span ``[start, end)``."""
-    lo, hi = _span_bounds(int(hs_layers[0].shape[0]), start, end)
-    return np.array([float(h[lo:hi].float().norm(dim=-1).mean()) for h in hs_layers], dtype=np.float64)
-
-
-def _span_token_projections(
-    hs_layers: List[torch.Tensor], vectors: np.ndarray, start: Optional[int], end: Optional[int]
-) -> np.ndarray:
-    """Each span token's projection on each layer's vector: ``(n_tokens, layers)``."""
-    lo, hi = _span_bounds(int(hs_layers[0].shape[0]), start, end)
-    return np.stack(
-        [hs_layers[l][lo:hi].float().numpy().astype(np.float64) @ vectors[l].astype(np.float64)
-         for l in range(len(hs_layers))],
-        axis=1,
-    )
-
-
-def pick_layer(num_layers: int, layer_idx: Optional[int], layer_frac: float) -> int:
-    if layer_idx is not None:
-        return resolve_layer_index(layer_idx, num_layers, "training.layer_idx")
-    return resolve_layer_index({"frac": layer_frac}, num_layers, "training.layer_frac")
-
-
-def _normalize_best_layer_search(
-    search_spec: Optional[Any], num_layers: int
-) -> Dict[str, Any]:
-    """Layers the sweep picks the best layer from.
-
-    ``[lo, hi]`` or ``[[lo, hi], ...]`` with layer indices (negative count from the end), or
-    ``{"frac": [lo, hi]}`` / ``{"frac": [[lo, hi], ...]}`` with fractions of depth. Bounds are
-    inclusive; indices outside the model raise.
-    """
-    if search_spec is None:
-        return {
-            "intervals": [(0, num_layers - 1)],
-            "layers": list(range(num_layers)),
-            "is_default": True,
-        }
-
-    as_frac = False
-    if isinstance(search_spec, dict):
-        if set(search_spec) != {"frac"}:
-            raise ValueError("training.best_layer_search as a dict must be {'frac': [lo, hi]} or {'frac': [[lo, hi], ...]}.")
-        as_frac = True
-        search_spec = search_spec["frac"]
-
-    if not isinstance(search_spec, (list, tuple)):
-        raise TypeError("training.best_layer_search must be a list like [lo, hi] or [[lo, hi], ...].")
-
-    if len(search_spec) == 0:
-        raise ValueError("training.best_layer_search is empty; provide [lo, hi] or [[lo, hi], ...].")
-
-    if len(search_spec) == 2 and not isinstance(search_spec[0], (list, tuple)):
-        raw_intervals: List[Any] = [search_spec]
-    else:
-        raw_intervals = list(search_spec)
-
-    intervals: List[Tuple[int, int]] = []
-    for i, raw in enumerate(raw_intervals):
-        if not isinstance(raw, (list, tuple)) or len(raw) != 2:
-            raise ValueError(f"training.best_layer_search[{i}] must be [lo, hi].")
-        lo, hi = (
-            resolve_layer_index({"frac": v} if as_frac else v, num_layers, f"training.best_layer_search[{i}]")
-            for v in raw
-        )
-        intervals.append((min(lo, hi), max(lo, hi)))
-
-    intervals.sort(key=lambda x: x[0])
-    merged: List[List[int]] = []
-    for lo, hi in intervals:
-        if not merged or lo > merged[-1][1] + 1:
-            merged.append([lo, hi])
-        else:
-            merged[-1][1] = max(merged[-1][1], hi)
-    merged_intervals = [(int(lo), int(hi)) for lo, hi in merged]
-
-    layers: List[int] = []
-    for lo, hi in merged_intervals:
-        layers.extend(range(lo, hi + 1))
-
-    return {"intervals": merged_intervals, "layers": layers, "is_default": False}
-
-
-def _window(center: int, radius: Any, num_layers: int, what: str) -> List[int]:
+def _window(center: int, radius: Any, num_layers: int) -> Tuple[List[int], Optional[Choice]]:
+    """The layers within ``radius`` of ``center``, and the choice made when the window is clipped."""
     radius = int(radius)
     if radius < 0:
-        raise ValueError(f"{what} must be >= 0; got {radius}")
-    return list(range(max(0, center - radius), min(num_layers - 1, center + radius) + 1))
+        raise ValueError(f"the window radius must be >= 0; got {radius}")
+    lo, hi = center - radius, center + radius
+    layers = list(range(max(0, lo), min(num_layers - 1, hi) + 1))
+    clipped = None
+    if lo < 0 or hi > num_layers - 1:
+        clipped = Choice("steering layers", f"layers {lo} to {hi}", f"layers {layers[0]} to {layers[-1]}",
+                         f"the window around layer {center} reaches past the model's {num_layers} layers")
+    return layers, clipped
 
 
 def _layer_list(values: Any, num_layers: int, what: str) -> List[int]:
@@ -233,167 +77,7 @@ def _layer_list(values: Any, num_layers: int, what: str) -> List[int]:
     return layers
 
 
-def select_layers(selection: Dict[str, Any], best_layer: int, num_layers: int) -> List[int]:
-    mode = selection.get("mode", "best")
-    if mode == "best":
-        return [best_layer]
-    if mode == "window":
-        return _window(best_layer, selection.get("window_radius", 0), num_layers, "layer_selection.window_radius")
-    if mode == "explicit":
-        return _layer_list(selection.get("layers", []), num_layers, "layer_selection.layers")
-    if mode == "all":
-        return list(range(num_layers))
-    raise ValueError(f"Unknown layer selection mode: {mode}")
-
-
-ALPHA_UNITS = ("raw", "sigma", "resid_norm")
-# Below this many eval items per pole, training warns that the layer choice and d are unreliable.
-MIN_EVAL_ITEMS_PER_POLE = 10
-
-
-def _validate_alpha_unit(alpha_unit: Any) -> str:
-    if alpha_unit not in ALPHA_UNITS:
-        raise ValueError(f"alpha_unit must be one of {ALPHA_UNITS}; got {alpha_unit!r}")
-    return str(alpha_unit)
-
-
-def _resolve_steer_layers(
-    steer_layers: Any, best_layer: int, window_radius: Any, num_layers: int
-) -> List[int]:
-    """Layers to steer: ``"probe"`` (the best layer), ``"window"`` (best layer +/- radius),
-    or explicit layer indices (an int or a list; negative indices count from the end)."""
-    if isinstance(steer_layers, str):
-        if steer_layers == "probe":
-            return [int(best_layer)]
-        if steer_layers == "window":
-            return _window(int(best_layer), window_radius, num_layers, "steer_window_radius")
-        raise ValueError(
-            f"steer_layers must be 'probe', 'window' or a list of layer indices; got {steer_layers!r}"
-        )
-    return _layer_list(steer_layers, num_layers, "steer_layers")
-
-
-def _has_system_message(prompt: Any) -> bool:
-    return isinstance(prompt, list) and any(isinstance(m, dict) and m.get("role") == "system" for m in prompt)
-
-
-def _text_context(role: str, system: Optional[str], prompt: Optional[str], mode: str) -> Dict[str, Any]:
-    """How texts were read: the context a set of z references applies to (see :class:`ReadContext`)."""
-    return ReadContext(kind="text", role=role, system=system or None, prompt=prompt, readout=mode).to_dict()
-
-
-GENERATED_CONTEXT = {"kind": "generated"}
-
-
-def _same_context(reference: Optional[Dict[str, Any]], context: Dict[str, Any]) -> bool:
-    if not reference:
-        return False
-    return ReadContext.from_dict(reference).matches(ReadContext.from_dict(context))
-
-
-@torch.no_grad()
-def score_text_tokens(
-    model,
-    tokenizer,
-    concept_vectors: np.ndarray,
-    text: str,
-    *,
-    layer_indices: Optional[List[int]] = None,
-    reference_layer: Optional[int] = None,
-    unit_norm: bool = False,
-    add_bos: bool = True,
-) -> Dict[str, Any]:
-    """Score every token of a RAW text against the per-layer concept directions, in memory.
-
-    Low-level read primitive for callers that need per-token, per-layer scores together with
-    character offsets (e.g. to target a specific word/subtoken), without the artifact-writing of
-    ``ConceptProbe.score_texts``. The text is read as ``role="raw"`` reads it everywhere else: the
-    BOS token (if the tokenizer has one) and the text, with no chat template and no other special
-    tokens. The forward pass uses the same all-layers capture as training (with the final-norm
-    fix), so layer ``l`` of the result aligns with ``concept_vectors[l]`` (i.e. hidden_states[l+1]).
-
-    Args:
-        concept_vectors: (num_layers, hidden_dim) directions. Pass unit vectors, or set
-            ``unit_norm=True`` to divide each row by its L2 norm before projecting (so the score is
-            ``hs · v̂``, i.e. divided by ``||v_l||``).
-        layer_indices: which layers to score (default: all). ``scores_per_layer`` has shape
-            ``(num_tokens, len(layer_indices))``.
-        reference_layer: if set, project every selected layer onto the single direction of that
-            layer (a logit-lens-style read: the direction is held fixed across layers).
-        unit_norm: L2-normalize each concept vector before projecting (default False).
-        add_bos: put the BOS token first (default True; it gets offset (0, 0)).
-
-    Returns:
-        dict with ``token_ids`` (np.int32 [num_tokens]), ``tokens`` (List[str]),
-        ``offset_mapping`` (List[[start, end]] char spans), ``scores_per_layer``
-        (np.float32 [num_tokens, len(layer_indices)]) and ``layer_indices`` (List[int]).
-    """
-    cv = np.asarray(concept_vectors, dtype=np.float32)
-    if cv.ndim != 2:
-        raise ValueError(f"concept_vectors must be 2D [num_layers, hidden_dim], got shape={cv.shape}")
-    num_layers = int(cv.shape[0])
-    if unit_norm:
-        norms = np.linalg.norm(cv, axis=1, keepdims=True)
-        cv = cv / np.clip(norms, 1e-12, None)
-    layers = (
-        list(range(num_layers))
-        if layer_indices is None
-        else _layer_list(list(layer_indices), num_layers, "layer_indices")
-    )
-
-    enc = tokenizer(text, return_tensors="pt", return_offsets_mapping=True, add_special_tokens=False)
-    om = enc["offset_mapping"]
-    if hasattr(om, "tolist"):
-        om = om.tolist()
-    offsets = [list(span) for span in om[0]]
-    input_ids = enc["input_ids"]
-    if input_ids.dim() == 1:
-        input_ids = input_ids.unsqueeze(0)
-    bos = getattr(tokenizer, "bos_token_id", None)
-    if add_bos and bos is not None:
-        input_ids = torch.cat([torch.tensor([[bos]], dtype=input_ids.dtype), input_ids], dim=1)
-        offsets = [[0, 0]] + offsets
-
-    n_blocks = len(get_transformer_layers(model))
-    if n_blocks != num_layers:
-        raise ValueError(f"Layer mismatch: the model has {n_blocks} layers, concept_vectors has {num_layers}.")
-    if reference_layer is not None:
-        ref = resolve_layer_index(reference_layer, num_layers, "reference_layer")
-        rows = np.stack([cv[ref] for _ in layers])
-    else:
-        rows = cv[layers]
-    scorer = TokenScorer("vectors", list(layers), rows)
-    scores_per_layer = _project_tokens(model, tokenizer, [input_ids[0]], [scorer])[0]["vectors"]
-    token_ids = input_ids[0].detach().cpu().numpy().astype(np.int32)
-    return {
-        "token_ids": token_ids,
-        "tokens": _decode_tokens(tokenizer, token_ids),
-        "offset_mapping": offsets,
-        "scores_per_layer": scores_per_layer.astype(np.float32),
-        "layer_indices": layers,
-    }
-
-
-def _generate_pairs(model, tokenizer, system, prompts, max_new_tokens, greedy, temperature, top_p, batch_size=16,
-                    warn=None, warn_prefix="prompts") -> List[Tuple[torch.Tensor, int]]:
-    """Training's generations: ``(token ids, prompt length)`` per prompt (see :func:`generate`)."""
-    gens = generate(model, tokenizer, prompts, system=system, max_new_tokens=max_new_tokens, greedy=greedy,
-                    temperature=temperature, top_p=top_p, batch_size=batch_size, save=False, warn=warn,
-                    label=warn_prefix)
-    return [(torch.as_tensor(g.token_ids), g.prompt_len) for g in gens]
-
-
-def _default_concept() -> ConceptSpec:
-    return ConceptSpec(name="concept", pos_label="positive", neg_label="negative", pos_system="", neg_system="")
-
-
-def _as_reps(reps: Any) -> np.ndarray:
-    data = np.asarray(getattr(reps, "data", reps))  # a reading.Reps, or an array
-    if data.ndim != 3:
-        raise ValueError(f"representations must be (items, layers, dim); got shape {data.shape}")
-    return data
-
-
+# ------------------------------------------------------------------------------------- the probe
 @dataclass
 class ConceptProbe:
     """A concept probe: one direction per layer of a model to read the concept with, the layer it
@@ -401,989 +85,46 @@ class ConceptProbe:
 
     A probe always belongs to a model (``identity``: the model, dtype, quantization and chat
     template its directions were computed on), but needs that model loaded (``model_bundle``) only to
-    read texts, generate and steer. With representations already read (:func:`read_texts`), it
-    trains, reads, calibrates and classifies without it. Build one by training
-    (:meth:`ProbeWorkspace.train_concept`), from representations (:meth:`fit`), from directions
-    computed elsewhere (:meth:`from_directions`), or from a saved run (:meth:`load`); a loaded model
-    is added with :meth:`attach`. Probes save to their ``run_dir`` by default.
+    score texts and to steer. Build one with :meth:`fit`, :meth:`from_directions` or :meth:`load`,
+    and attach a loaded model with :meth:`attach`.
     """
 
+    #: the concept's name and the labels of its two poles (the second may be a baseline)
+    name: str = "concept"
+    pos_label: str = "positive"
+    neg_label: str = "negative"
     #: (layers, dim) unit directions to read with, pointing toward the positive pole
     directions: Optional[np.ndarray] = None
     #: the layer the probe reads at
     layer: Optional[int] = None
-    #: (layers, dim) directions steering adds (decision D1: the raw difference of means by default,
-    #: which may differ from the reading directions)
+    #: the layers a score combines (their mean, or sum with ``score_aggregate="sum"``); default the probe's
+    score_layers: Optional[List[int]] = None
+    score_aggregate: str = "mean"
+    #: (layers, dim) directions steering adds (decision D1: the raw difference of means by default)
     steer_directions: Optional[np.ndarray] = None
     #: one calibration per reading context: the zero and unit of z scores, a threshold, neutral texts
     calibrations: List[Calibration] = field(default_factory=list)
-    #: the unit of alpha_unit="sigma": the eval items' pooled within-pole SD on the steering direction
+    #: the unit of ``unit="sigma"``: the eval items' pooled within-pole SD on the steering direction
     steer_sigma: Optional[float] = None
-    #: the unit of alpha_unit="resid_norm": the mean residual norm per layer of the training tokens
+    #: the unit of ``unit="resid_norm"``: the mean residual norm per layer of the training texts
     resid_norm: Optional[np.ndarray] = None
     #: the model the directions belong to (see :func:`concept_probe.modeling.identity_of`)
     identity: Optional[Dict[str, Any]] = None
     #: the estimators the reading and steering directions came from
     estimator: Optional[Dict[str, Any]] = None
     steer_estimator: Optional[Dict[str, Any]] = None
-    concept: ConceptSpec = field(default_factory=_default_concept)
-    config: Dict[str, Any] = field(default_factory=resolve_config)
-    model_bundle: Optional[ModelBundle] = None
-    run_dir: Optional[str] = None
-    #: where a probe without a run folder creates one when it first saves (None: the session's
-    #: output_root; see :func:`concept_probe.configure`)
-    save_root: Optional[str] = None
-    logger: Any = field(default_factory=NullLogger)
-    console: Optional[ConsoleLogger] = None
-    #: training diagnostics: Cohen's d and its p per layer on the eval items
+    #: Cohen's d and its p per layer on the primary eval set (all its items)
     sweep_d: Optional[np.ndarray] = None
     sweep_p: Optional[np.ndarray] = None
-
-    def train(self) -> "ConceptProbe":
-        readout = self.config["readout"]
-        train_cfg = self.config["training"]
-        eval_cfg = self.config["evaluation"]
-        out_cfg = self.config["output"]
-        plot_cfg = self.config["plots"]
-        prompts_cfg = self.config["prompts"]
-        seed = int(self.config["random"]["seed"])
-        train_prompt_mode = train_cfg.get("train_prompt_mode", "shared")
-        train_prompts = list(prompts_cfg.get("train_questions", []))
-        train_prompts_pos = list(prompts_cfg.get("train_questions_pos", []))
-        train_prompts_neg = list(prompts_cfg.get("train_questions_neg", []))
-
-        # ---- Validate everything before generating or writing anything.
-        if train_prompt_mode not in ("shared", "opposed", "texts"):
-            raise ValueError(f"Unknown train_prompt_mode: {train_prompt_mode}")
-        early_choices: List[Choice] = []
-        read_estimator = make_estimator(train_cfg.get("estimator", "mean_diff"))
-        read_spec = estimator_spec(read_estimator)
-        steer_direction_cfg = self.config.get("steering", {}).get("steer_direction", "mean_diff")
-        if steer_direction_cfg != "read":
-            make_estimator(steer_direction_cfg)  # an unknown estimator fails here, before anything runs
-        sweep_select = train_cfg.get("sweep_select", "effect_size")
-        if sweep_select not in SWEEP_SELECTS:
-            raise ValueError(f"training.sweep_select must be one of {SWEEP_SELECTS}; got {sweep_select!r}")
-        eval_mode = eval_cfg.get("eval_mode", "auto")
-        if eval_mode not in ("auto", "read", "generate", "skip"):
-            raise ValueError(f"Unknown evaluation.eval_mode: {eval_mode!r} (use 'auto', 'read', 'generate' or 'skip').")
-        selection_split = eval_cfg.get("selection_split", 0.5)
-        if selection_split is not None and not 0.0 < float(selection_split) < 1.0:
-            raise ValueError(f"evaluation.selection_split must be in (0, 1) or null; got {selection_split!r}")
-        generated_questions = {
-            "shared": {"prompts.train_questions": train_prompts},
-            "opposed": {"prompts.train_questions_pos": train_prompts_pos, "prompts.train_questions_neg": train_prompts_neg},
-            "texts": {},
-        }[train_prompt_mode]
-        if eval_cfg.get("do_eval", True) and (eval_mode == "generate" or (eval_mode == "auto" and train_prompt_mode != "texts")):
-            generated_questions["prompts.eval_questions"] = list(prompts_cfg.get("eval_questions", []))
-        for key, questions in generated_questions.items():
-            with_system = [i for i, q in enumerate(questions) if _has_system_message(q)]
-            if with_system:
-                raise ValueError(
-                    f"{key}{with_system} carry their own system message, which would replace pos_system/neg_system "
-                    "and make the two conditions identical. Pass the questions without a system message."
-                )
-        if self.concept.pos_system == self.concept.neg_system and (
-            train_prompt_mode in ("shared", "opposed") or (eval_cfg.get("do_eval", True) and eval_mode == "generate")
-        ):
-            raise ValueError(
-                "concept.pos_system == concept.neg_system: contrasting generations under identical system "
-                "prompts learns noise. Set the two system prompts that define the concept."
-            )
-
-        # Labelled texts (the training texts in texts mode, the eval texts in every mode) are read
-        # with training.train_text_role: by default the raw text, with no chat template and no
-        # system prompt. Every evaluation (texts or generated completions) is pooled like the
-        # vector's training data: with read_mode in texts mode, and with train_mode (the readout
-        # of the model's own completions) otherwise.
-        if train_prompt_mode == "texts":
-            train_readout_mode, train_readout_last_k = readout["read_mode"], readout["read_last_k"]
-        else:
-            train_readout_mode, train_readout_last_k = readout["train_mode"], readout["train_last_k"]
-        for key, mode in (("read_mode", readout["read_mode"]), ("train_mode", readout["train_mode"])):
-            if mode not in READ_MODES:
-                raise ValueError(f"readout.{key} must be one of {READ_MODES}; got {mode!r}")
-        eval_readout_mode, eval_readout_last_k = train_readout_mode, train_readout_last_k
-        if str(train_readout_mode).endswith("_tokens"):
-            if eval_cfg.get("score_aggregate", "mean") != "mean":
-                raise ValueError("Training on token samples scores eval items by their mean token score; "
-                                 "set evaluation.score_aggregate to 'mean'.")
-            eval_readout_mode = "assistant_all_mean" if train_readout_mode.startswith("assistant") else "sequence_all_mean"
-            early_choices.append(Choice(
-                "evaluation readout", train_readout_mode, eval_readout_mode,
-                "every token is a training sample; eval items are scored by the mean over their tokens, so the "
-                "statistics compare items, not tokens of the same text",
-            ))
-        text_role = train_cfg.get("train_text_role") or "raw"
-        if text_role not in TEXT_ROLES:
-            raise ValueError(f"training.train_text_role must be one of {TEXT_ROLES}; got {text_role!r}")
-        text_prompt = train_cfg.get("train_text_prompt")
-        if text_role == "user" and text_prompt is not None:
-            raise ValueError(
-                "training.train_text_prompt is a user turn before the text, so it only applies to "
-                "train_text_role='assistant'; unset it or change the role."
-            )
-        train_text_system = train_cfg.get("train_text_system")
-        if train_text_system is None:
-            train_text_system = prompts_cfg.get("neutral_system")
-        eval_system = eval_cfg.get("eval_system")
-        if eval_system is None:
-            eval_system = train_text_system if train_prompt_mode == "texts" else prompts_cfg.get("neutral_system")
-        if text_role == "raw":
-            if text_prompt is not None or train_cfg.get("train_text_system") or eval_cfg.get("eval_system"):
-                raise ValueError(
-                    "train_text_role='raw' reads each text alone, so train_text_prompt, train_text_system and "
-                    "evaluation.eval_system would be ignored; unset them or use train_text_role='user'/'assistant'."
-                )
-            train_text_system = eval_system = None
-        eval_texts_given = len(self.concept.eval_pos_texts) > 0 and len(self.concept.eval_neg_texts) > 0
-        reads_eval_texts = (
-            eval_cfg.get("do_eval", True)
-            and eval_texts_given
-            and eval_mode != "skip"
-            and not (train_prompt_mode == "texts" and eval_mode == "generate")
-        )
-        if (
-            train_prompt_mode == "texts" and text_role == "assistant" and not train_text_system
-            and text_prompt is None
-        ):
-            raise ValueError(
-                "training.train_text_role='assistant' reads each training text as the model's reply, and a chat "
-                "template needs a turn before a reply. Set training.train_text_prompt (a user turn before every "
-                "text, e.g. a neutral request) or a system prompt (training.train_text_system or "
-                "prompts.neutral_system). preview_input shows the resulting input."
-            )
-        if reads_eval_texts and text_role == "assistant" and not eval_system and text_prompt is None:
-            raise ValueError(
-                "Eval texts are read as the assistant's reply, which needs a turn before them: set "
-                "training.train_text_prompt (a user turn), or a system prompt (evaluation.eval_system or "
-                "prompts.neutral_system)."
-            )
-
-        if ttest_ind is None:
-            self._warn("scipy not available; sweep_p will be NaN.")
-        if str(train_readout_mode).startswith("sequence_"):
-            self._warn(
-                f"readout {train_readout_mode} reads template tokens too: the BOS, system prompt and role "
-                "headers are identical in every input, and under mean pooling their weight shrinks as "
-                "1/length, which adds a length effect to the direction and the scores. Use an assistant_* "
-                "mode to pool over the text's own tokens."
-            )
-        set_seed(seed)
-        ensure_dir(self.run_dir)
-        # The saved config holds the concept actually trained, not the defaults' concept section.
-        self.config = {**self.config, "concept": self.concept.to_dict()}
-        json_dump(os.path.join(self.run_dir, "config.json"), self.config)
-        json_dump(os.path.join(self.run_dir, "concept.json"), self.concept.to_dict())
-        self.logger.log("config", {"config": self.config, "concept": self.concept.to_dict()})
-        self.identity = model_identity_of(self.model_bundle, self.config)
-        self.logger.log("model_identity", self.identity)
-        # Every choice made on the caller's behalf goes to the run log and to metrics.json; the ones
-        # made when the model was loaded were printed then.
-        run_choices: List[Choice] = list(getattr(self.model_bundle, "choices", []) or [])
-        announce(run_choices, console=False, logger=self.logger)
-        run_choices.extend(early_choices)
-        announce(early_choices, console=self.console is not None and self.console.enabled, logger=self.logger)
-
-        tokenizer = self.model_bundle.tokenizer
-        model = self.model_bundle.model
-        num_layers = self.model_bundle.num_layers
-        eos_ids = _eos_token_ids(model, tokenizer)
-        gen_bs = int(train_cfg.get("gen_batch_size", 16))
-
-        dropped_items: Dict[str, List[int]] = {}
-
-        read_batch_size = int(readout.get("batch_size", 16))
-        rep_cache = self._rep_cache_dir()
-        rep_cache_dtype = str(out_cfg.get("rep_cache_dtype", "float32"))
-
-        def note(choices: Sequence[Choice]) -> None:
-            """Announce and log reading's choices once per run (they repeat for every set read)."""
-            fresh = [c for c in choices if all(c != seen for seen in run_choices)]
-            run_choices.extend(fresh)
-            announce(fresh, console=self.console is not None and self.console.enabled, logger=self.logger)
-
-        def pooled_reps(ids_list, starts, ends, mode, last_k, label, vectors=None, report_dropped=True):
-            """Pooled reps ``(n, layers, dim)`` and mean token norms ``(n, layers)`` over each span, and,
-            given ``vectors``, each item's per-token projections ``(n_tokens, layers)``. The items go
-            through the model ``readout.batch_size`` at a time, and through the representations cache
-            when it is on.
-
-            An item with no tokens of its own (an empty completion or text) is left out and listed
-            under ``dropped_items[label]``; a side left with no items raises.
-            """
-            encodings = [Encoded(ids.reshape(-1), start, end) for ids, start, end in zip(ids_list, starts, ends)]
-            result = _read(model, tokenizer, encodings, [Readout.parse(mode, last_k)], batch_size=read_batch_size,
-                           norms=True, project_on=vectors, cache=rep_cache if rep_cache else False,
-                           cache_dtype=rep_cache_dtype, identity=self.identity, skip_empty=True,
-                           label=label)[0]
-            note(result.choices)
-            if result.skipped and report_dropped:
-                dropped_items[label] = sorted(result.skipped)
-                self._warn(
-                    f"{label}: items {dropped_items[label]} have no tokens to pool (an empty completion or text) "
-                    "and are left out."
-                )
-            if result.data.shape[0] == 0:
-                raise ValueError(f"{label}: no item has tokens to pool (every completion or text is empty).")
-            return result.data, result.norms, result.projections or [], result.read_items
-
-        self._status(f"Training concept '{self.concept.name}' with model {self.model_bundle.model_id}")
-        phase1_action = "Reading training texts" if train_prompt_mode == "texts" else "Generating training completions"
-        self._status(f"[Phase 1/4] {phase1_action} ({train_prompt_mode})")
-        # Each training item is pooled over [start, end): a generated completion up to (not
-        # including) its end-of-sequence token, or a text's own tokens.
-        train_pos_ids, train_neg_ids = [], []
-        train_pos_starts: List[Optional[int]] = []
-        train_neg_starts: List[Optional[int]] = []
-        train_pos_ends: List[Optional[int]] = []
-        train_neg_ends: List[Optional[int]] = []
-
-        if train_prompt_mode == "shared":
-            total_train = len(train_prompts)
-            progress_every = max(1, total_train // 5) if total_train else 1
-            if not train_prompts:
-                raise ValueError("prompts.train_questions is empty; provide training prompts.")
-            if train_prompts_pos or train_prompts_neg:
-                self._warn(
-                    "train_prompt_mode=shared; ignoring prompts.train_questions_pos/train_questions_neg."
-                )
-            pos_results = _generate_pairs(
-                model,
-                tokenizer,
-                self.concept.pos_system,
-                train_prompts,
-                train_cfg["train_max_new_tokens"],
-                train_cfg["train_greedy"],
-                temperature=train_cfg.get("train_temperature", 0.7),
-                top_p=train_cfg.get("train_top_p", 0.9),
-                batch_size=gen_bs,
-                warn=self._warn,
-                warn_prefix="train_questions (pos_system)",
-            )
-            neg_results = _generate_pairs(
-                model,
-                tokenizer,
-                self.concept.neg_system,
-                train_prompts,
-                train_cfg["train_max_new_tokens"],
-                train_cfg["train_greedy"],
-                temperature=train_cfg.get("train_temperature", 0.7),
-                top_p=train_cfg.get("train_top_p", 0.9),
-                batch_size=gen_bs,
-                warn=self._warn,
-                warn_prefix="train_questions (neg_system)",
-            )
-            for i, q in enumerate(train_prompts):
-                ids_pos, plen_pos = pos_results[i]
-                ids_neg, plen_neg = neg_results[i]
-                train_pos_ids.append(ids_pos)
-                train_neg_ids.append(ids_neg)
-                train_pos_starts.append(plen_pos)
-                train_neg_starts.append(plen_neg)
-                train_pos_ends.append(_completion_end(ids_pos, plen_pos, eos_ids))
-                train_neg_ends.append(_completion_end(ids_neg, plen_neg, eos_ids))
-
-                pos_completion = tokenizer.decode(ids_pos[plen_pos:], skip_special_tokens=True)
-                neg_completion = tokenizer.decode(ids_neg[plen_neg:], skip_special_tokens=True)
-                self.logger.log(
-                    "train_gen",
-                    {
-                        "i": i,
-                        "question": q,
-                        "pos_label": self.concept.pos_label,
-                        "neg_label": self.concept.neg_label,
-                        "pos_system": self.concept.pos_system,
-                        "neg_system": self.concept.neg_system,
-                        "pos_text": tokenizer.decode(ids_pos, skip_special_tokens=False),
-                        "neg_text": tokenizer.decode(ids_neg, skip_special_tokens=False),
-                        "pos_completion": pos_completion,
-                        "neg_completion": neg_completion,
-                    },
-                )
-                if total_train and ((i + 1) % progress_every == 0 or (i + 1) == total_train):
-                    self._status(f"Generated training completions {i + 1}/{total_train}")
-        elif train_prompt_mode == "opposed":
-            if train_prompts:
-                self._warn("train_prompt_mode=opposed; ignoring prompts.train_questions.")
-            if not train_prompts_pos or not train_prompts_neg:
-                raise ValueError(
-                    "train_prompt_mode=opposed requires prompts.train_questions_pos and prompts.train_questions_neg."
-                )
-            for side, questions, system, label in (
-                ("pos", train_prompts_pos, self.concept.pos_system, self.concept.pos_label),
-                ("neg", train_prompts_neg, self.concept.neg_system, self.concept.neg_label),
-            ):
-                ids_list, starts, ends = (
-                    (train_pos_ids, train_pos_starts, train_pos_ends) if side == "pos"
-                    else (train_neg_ids, train_neg_starts, train_neg_ends)
-                )
-                progress_every_side = max(1, len(questions) // 5)
-                side_results = _generate_pairs(
-                    model, tokenizer, system, questions, train_cfg["train_max_new_tokens"], train_cfg["train_greedy"],
-                    temperature=train_cfg.get("train_temperature", 0.7), top_p=train_cfg.get("train_top_p", 0.9),
-                    batch_size=gen_bs, warn=self._warn, warn_prefix=f"train_questions_{side} ({side}_system)",
-                )
-                for i, (q, (ids, plen)) in enumerate(zip(questions, side_results)):
-                    ids_list.append(ids)
-                    starts.append(plen)
-                    ends.append(_completion_end(ids, plen, eos_ids))
-                    self.logger.log(
-                        f"train_gen_{side}",
-                        {
-                            "i": i,
-                            "question": q,
-                            "label": label,
-                            "system": system,
-                            "text": tokenizer.decode(ids, skip_special_tokens=False),
-                            "completion": tokenizer.decode(ids[plen:], skip_special_tokens=True),
-                        },
-                    )
-                    if (i + 1) % progress_every_side == 0 or (i + 1) == len(questions):
-                        self._status(f"Generated {side} training completions {i + 1}/{len(questions)}")
-        else:
-            if train_prompts:
-                self._warn("train_prompt_mode=texts; ignoring prompts.train_questions.")
-            if train_prompts_pos or train_prompts_neg:
-                self._warn(
-                    "train_prompt_mode=texts; ignoring prompts.train_questions_pos/train_questions_neg."
-                )
-            train_pos_texts = list(self.concept.train_pos_texts)
-            train_neg_texts = list(self.concept.train_neg_texts)
-            if not train_pos_texts or not train_neg_texts:
-                raise ValueError(
-                    "train_prompt_mode=texts requires concept.train_pos_texts and concept.train_neg_texts."
-                )
-            for side, texts, label in (
-                ("pos", train_pos_texts, self.concept.pos_label),
-                ("neg", train_neg_texts, self.concept.neg_label),
-            ):
-                ids_list, starts, ends = (
-                    (train_pos_ids, train_pos_starts, train_pos_ends) if side == "pos"
-                    else (train_neg_ids, train_neg_starts, train_neg_ends)
-                )
-                progress_every_side = max(1, len(texts) // 5)
-                for i, s in enumerate(texts):
-                    input_ids, text_start, text_end = _encode_text_for_read(
-                        tokenizer,
-                        s,
-                        train_text_system,
-                        role=text_role,
-                        prompt=text_prompt,
-                        warn=self._warn,
-                        warn_prefix=f"train_{side}_texts[{i}]",
-                    )
-                    ids_1d = input_ids[0].detach().cpu()
-                    ids_list.append(ids_1d)
-                    starts.append(text_start)
-                    ends.append(text_end)
-                    self.logger.log(
-                        f"train_read_{side}",
-                        {
-                            "i": i,
-                            "label": label,
-                            "system": train_text_system,
-                            "text": tokenizer.decode(ids_1d, skip_special_tokens=False),
-                        },
-                    )
-                    if (i + 1) % progress_every_side == 0 or (i + 1) == len(texts):
-                        self._status(f"Read {side} training texts {i + 1}/{len(texts)}")
-
-        self._status("[Phase 2/4] Forward passes for training reps")
-        reps_pos, norms_pos, _, train_pos_kept = pooled_reps(train_pos_ids, train_pos_starts, train_pos_ends,
-                                                             train_readout_mode, train_readout_last_k, "train_pos")
-        reps_neg, norms_neg, _, train_neg_kept = pooled_reps(train_neg_ids, train_neg_starts, train_neg_ends,
-                                                             train_readout_mode, train_readout_last_k, "train_neg")
-        if reps_pos.shape[1] != num_layers:
-            raise ValueError("Layer count mismatch between model and reps.")
-        # Mean residual norm of the training tokens per layer: the unit of alpha_unit="resid_norm".
-        resid_norm = np.concatenate([norms_pos, norms_neg], axis=0).mean(axis=0)
-
-        concept_vectors = fit_directions(read_estimator, reps_pos, reps_neg)
-        # Decision D1: steering has its own direction (the raw difference of means by default).
-        steer_vectors, steer_spec, steer_choice = steer_directions_for(
-            read_estimator, steer_direction_cfg, reps_pos, reps_neg, concept_vectors
-        )
-        steer_differs = steer_vectors is not concept_vectors
-        if steer_choice is not None:
-            note([steer_choice])
-        # ---- Evaluation (layer 6b): named sets of eval items. The primary one chooses the layer and
-        # gives the reported numbers; the others are measured at that layer.
-        # - texts mode: the eval texts ("eval").
-        # - shared/opposed mode: completions generated for eval_questions under each pole's system
-        #   prompt. The primary set reads them as replies to their question without that system prompt
-        #   (decision D2: the prompt itself pushes the score toward its pole); reading them after it, as
-        #   they were generated, is "eval_with_system_prompt"; the eval texts, if any, are "texts".
-        # - every set in concept.eval_sets is read like the eval texts.
-        eval_prompts = list(prompts_cfg["eval_questions"])
-        neutral_system = prompts_cfg.get("neutral_system")
-        primary_name = str(eval_cfg.get("primary_set", "eval"))
-        texts_paired = bool(eval_cfg.get("eval_pairs", False))
-        eval_sets: List[EvalSet] = []
-        set_tokens: Dict[str, Tuple[List[np.ndarray], List[np.ndarray]]] = {}
-        eval_question_idx: List[int] = []
-        eval_readout: Optional[Dict[str, Any]] = None
-        text_readout = {"role": text_role, "prompt": text_prompt, "system": eval_system, "mode": eval_readout_mode,
-                        "last_k": eval_readout_last_k}
-
-        def keep_pairs(name: str, kept_pos: List[int], kept_neg: List[int]) -> List[int]:
-            """The pairs whose two items were both read; the other item of a pair with an empty one is
-            left out too, so the poles stay paired."""
-            both = sorted(set(kept_pos) & set(kept_neg))
-            for side, kept in (("pos", kept_pos), ("neg", kept_neg)):
-                unpaired = sorted(set(kept) - set(both))
-                if unpaired:
-                    dropped_items.setdefault(f"{name}_{side}", []).extend(unpaired)
-                    self._warn(f"{name}_{side}: items {unpaired} are left out because the other pole's item of their "
-                               "pair is empty; the poles are compared pair by pair.")
-            return both
-
-        def text_set(name: str, pos_texts: List[PromptLike], neg_texts: List[PromptLike], *, paired: bool,
-                     description: str, role: str = text_role, system: Optional[str] = eval_system,
-                     prompt: Optional[str] = text_prompt) -> EvalSet:
-            """Read two lists of texts as an eval set."""
-            if paired and len(pos_texts) != len(neg_texts):
-                raise ValueError(f"eval set {name!r} is paired but has {len(pos_texts)} positive and "
-                                 f"{len(neg_texts)} negative texts.")
-            sides = {}
-            for side, texts in (("pos", pos_texts), ("neg", neg_texts)):
-                ids_list, starts, ends = [], [], []
-                for i, s in enumerate(texts):
-                    input_ids, a, b = _encode_text_for_read(tokenizer, s, system, role=role, prompt=prompt, warn=self._warn,
-                                                            warn_prefix=f"{name}_{side}_texts[{i}]")
-                    ids_list.append(input_ids[0])
-                    starts.append(a)
-                    ends.append(b)
-                    self.logger.log(f"{name}_read_{side}",
-                                    {"i": i, "text": tokenizer.decode(input_ids[0], skip_special_tokens=False)})
-                sides[side] = pooled_reps(ids_list, starts, ends, eval_readout_mode, eval_readout_last_k,
-                                          f"{name}_{side}", vectors=concept_vectors)
-                self._status(f"Read {len(texts)} {name} {side} texts")
-            (rp, _, tp, kp), (rn, _, tn, kn) = sides["pos"], sides["neg"]
-            if paired:
-                both = keep_pairs(name, kp, kn)
-                rp, tp = rp[[kp.index(i) for i in both]], [tp[kp.index(i)] for i in both]
-                rn, tn = rn[[kn.index(i) for i in both]], [tn[kn.index(i)] for i in both]
-            set_tokens[name] = (tp, tn)
-            ctx = ReadContext(kind="text", role=role, system=system or None, prompt=prompt, readout=eval_readout_mode)
-            return EvalSet(name, rp, rn, context=ctx, paired=paired, description=description)
-
-        def generated_sets() -> None:
-            """The eval completions, read without and with each pole's system prompt (see above)."""
-            nonlocal eval_question_idx, eval_readout
-            eval_bs = eval_cfg.get("gen_batch_size")
-            eval_bs = gen_bs if eval_bs is None else int(eval_bs)
-            read: Dict[str, Dict[str, Any]] = {"eval": {}, "eval_with_system_prompt": {}}
-            for side, system in (("pos", self.concept.pos_system), ("neg", self.concept.neg_system)):
-                results = _generate_pairs(model, tokenizer, system, eval_prompts, eval_cfg["eval_max_new_tokens"],
-                                         eval_cfg["eval_greedy"], temperature=eval_cfg.get("eval_temperature", 0.7),
-                                         top_p=eval_cfg.get("eval_top_p", 0.9), batch_size=eval_bs, warn=self._warn,
-                                         warn_prefix=f"eval_questions ({side}_system)")
-                ends = [_completion_end(ids, plen, eos_ids) for ids, plen in results]
-                plain_ids, plain_starts = [], []
-                for i, ((ids, plen), end) in enumerate(zip(results, ends)):
-                    self.logger.log(f"eval_gen_{side}", {
-                        "i": i, "question": eval_prompts[i], "text": tokenizer.decode(ids, skip_special_tokens=False),
-                        "completion": tokenizer.decode(ids[plen:], skip_special_tokens=True)})
-                    # the same completion tokens, after the question alone
-                    messages, _ = _normalize_messages(eval_prompts[i], neutral_system)
-                    prompt_ids = apply_chat(tokenizer, messages, add_generation_prompt=True)[0]
-                    plain_ids.append(torch.cat([prompt_ids, ids[plen:end].to(prompt_ids.dtype)]))
-                    plain_starts.append(int(prompt_ids.shape[-1]))
-                read["eval"][side] = pooled_reps(plain_ids, plain_starts, [int(x.shape[-1]) for x in plain_ids],
-                                                 eval_readout_mode, eval_readout_last_k, f"eval_{side}",
-                                                 vectors=concept_vectors)
-                read["eval_with_system_prompt"][side] = pooled_reps(
-                    [ids for ids, _ in results], [plen for _, plen in results], ends, eval_readout_mode,
-                    eval_readout_last_k, f"eval_with_system_prompt_{side}", vectors=concept_vectors,
-                    report_dropped=False)  # the same completions: their empty ones are already reported
-            # Keep the questions answered on both poles, so the two poles stay paired by question.
-            eval_question_idx = keep_pairs("eval", read["eval"]["pos"][3], read["eval"]["neg"][3])
-            descriptions = {
-                "eval": "completions generated for eval_questions under each pole's system prompt, read as replies "
-                        "to the question alone",
-                "eval_with_system_prompt": "the same completions read after the pole's system prompt they were "
-                                           "generated with (the system prompt pushes the score toward its pole)",
-            }
-            for name, sides in read.items():
-                (rp, _, tp, kp), (rn, _, tn, kn) = sides["pos"], sides["neg"]
-                rows_p, rows_n = [kp.index(q) for q in eval_question_idx], [kn.index(q) for q in eval_question_idx]
-                set_tokens[name] = ([tp[r] for r in rows_p], [tn[r] for r in rows_n])
-                context = ReadContext.generated(eval_readout_mode)
-                eval_sets.append(EvalSet(name, rp[rows_p], rn[rows_n], context=context, paired=True,
-                                         description=descriptions[name]))
-            eval_readout = {"role": "assistant", "source": descriptions[primary_name] if primary_name in descriptions
-                            else descriptions["eval"], "system": neutral_system if primary_name == "eval" else "pole",
-                            "mode": eval_readout_mode, "last_k": eval_readout_last_k}
-
-        if eval_cfg.get("do_eval", True):
-            if eval_mode == "auto":
-                if train_prompt_mode != "texts":
-                    eval_mode = "generate"
-                elif eval_texts_given:
-                    eval_mode = "read"
-                else:
-                    self._warn(
-                        "eval_mode=auto with train_prompt_mode=texts but no eval_pos_texts/"
-                        "eval_neg_texts; skipping evaluation (generate-mode eval would contrast "
-                        "pos_system vs neg_system, which texts-mode concepts typically leave identical)."
-                    )
-                    eval_mode = "skip"
-            if eval_mode == "read":
-                if eval_texts_given:
-                    self._status("[Phase 3/4] Reading eval texts")
-                    if train_prompt_mode == "texts" and eval_system != train_text_system:
-                        self._warn(
-                            "evaluation.eval_system differs from the system prompt the training texts were "
-                            "read with; the layer sweep then measures a different readout than training."
-                        )
-                    if train_prompt_mode != "texts":
-                        self._warn(
-                            f"eval_mode=read with train_prompt_mode={train_prompt_mode}: the layer is chosen on "
-                            "eval texts read on their own, while the vector was trained on completions generated "
-                            "in a chat; eval_mode=auto evaluates on generated completions instead."
-                        )
-                        if readout["read_mode"] != readout["train_mode"]:
-                            self._warn(
-                                f"readout.read_mode={readout['read_mode']} is not used in {train_prompt_mode} "
-                                f"mode: eval texts are pooled with readout.train_mode={readout['train_mode']}, "
-                                "the readout the vector was trained with."
-                            )
-                    eval_sets.append(text_set("eval", self.concept.eval_pos_texts, self.concept.eval_neg_texts,
-                                              paired=texts_paired, description="the concept's eval texts"))
-                    eval_readout = dict(text_readout)
-                else:
-                    self._warn("eval_mode=read but eval_pos_texts/eval_neg_texts are empty.")
-            elif eval_mode == "generate":
-                used_questions = train_prompts if train_prompt_mode == "shared" else train_prompts_pos + train_prompts_neg
-                repeated = sorted({str(q) for q in eval_prompts} & {str(q) for q in used_questions})
-                if repeated and train_prompt_mode != "texts":
-                    self._warn(
-                        f"{len(repeated)} eval_questions are also training questions, so the evaluation is not "
-                        f"held out: {repeated[:3]}"
-                    )
-                if len(eval_prompts) > 0:
-                    self._status("[Phase 3/4] Generating eval completions")
-                    generated_sets()
-                if eval_texts_given and train_prompt_mode != "texts":
-                    self._status("Reading eval texts")
-                    eval_sets.append(text_set(
-                        "texts", self.concept.eval_pos_texts, self.concept.eval_neg_texts, paired=texts_paired,
-                        description="the concept's eval texts, read on their own: whether the direction finds the concept "
-                                    "outside the chat it was trained in"))
-            if eval_mode != "skip":
-                for name, spec in (getattr(self.concept, "eval_sets", None) or {}).items():
-                    eval_sets.append(text_set(
-                        name, list(spec["pos"]), list(spec["neg"]), paired=bool(spec.get("paired", False)),
-                        description=str(spec.get("description", f"eval set {name}")),
-                        role=spec.get("role", text_role), system=spec.get("system", eval_system),
-                        prompt=spec.get("prompt", text_prompt)))
-
-        main_set = next((s for s in eval_sets if s.name == primary_name), None)
-        if eval_sets and main_set is None:
-            raise ValueError(f"evaluation.primary_set={primary_name!r} is not among the eval sets "
-                             f"{[s.name for s in eval_sets]}.")
-        did_eval = main_set is not None and len(main_set.pos) > 0 and len(main_set.neg) > 0
-        n_eval_pos = len(main_set.pos) if main_set is not None else 0
-        n_eval_neg = len(main_set.neg) if main_set is not None else 0
-        if did_eval and min(n_eval_pos, n_eval_neg) < MIN_EVAL_ITEMS_PER_POLE:
-            self._warn(
-                f"Only {n_eval_pos} positive and {n_eval_neg} negative eval items: the layer choice and best_d "
-                f"rest on very few items (with selection_split, about half of them each). Use at least "
-                f"{MIN_EVAL_ITEMS_PER_POLE} per pole."
-            )
-        if not did_eval:
-            reason = "evaluation disabled"
-            if eval_cfg.get("do_eval", True):
-                if eval_mode == "read":
-                    reason = "missing eval_pos_texts/eval_neg_texts"
-                elif eval_mode == "skip":
-                    reason = "no eval texts provided for texts-mode concept"
-                elif len(eval_prompts) == 0:
-                    reason = "empty eval_questions"
-            self._warn(reason)
-            self.logger.log("eval_skipped", {"reason": reason})
-
-        # ---- The layer, and the numbers at it.
-        search_info = None
-        search_intervals_plot = None
-        evaluation: Optional[ReadingEvaluation] = None
-        if did_eval:
-            fixed_layer = None
-            if train_cfg["do_layer_sweep"]:
-                search_info = _normalize_best_layer_search(train_cfg.get("best_layer_search"), num_layers)
-                if not search_info["is_default"]:
-                    search_intervals_plot = search_info["intervals"]
-            else:
-                fixed_layer = pick_layer(num_layers, train_cfg.get("layer_idx"), train_cfg.get("layer_frac", 0.75))
-            evaluation = evaluate_reading(
-                concept_vectors, eval_sets, primary=primary_name, layer=fixed_layer, selection_split=selection_split,
-                search_layers=None if search_info is None else search_info["layers"], sweep_select=sweep_select,
-                n_random=int(eval_cfg.get("n_random_directions", 50) or 0),
-                n_bootstrap=int(eval_cfg.get("n_bootstrap") or 0), n_permutations=int(eval_cfg.get("n_permutations") or 0),
-                seed=seed,
-            )
-            for message in evaluation.warnings:
-                self._warn(message)
-            best_layer = evaluation.layer
-        else:
-            best_layer = pick_layer(num_layers, train_cfg.get("layer_idx"), train_cfg.get("layer_frac", 0.75))
-
-        # ---- Control: the same training with the labels shuffled.
-        label_shuffle = None
-        n_shuffles = eval_cfg.get("n_label_shuffles", "auto")
-        if n_shuffles == "auto":
-            n_shuffles = 10 if read_spec.get("kind") == "mean_diff" else 0
-            note([Choice("evaluation.n_label_shuffles", "auto", n_shuffles,
-                         "refitting the difference of means is quick, so ten shuffles run by default"
-                         if n_shuffles else
-                         f"refitting a {read_spec.get('kind')} direction for every shuffle is slow; set "
-                         "evaluation.n_label_shuffles to run them")])
-        if did_eval and int(n_shuffles) > 0:
-            report_pos, report_neg = evaluation.report_idx
-            label_shuffle = label_shuffle_control(read_estimator, reps_pos, reps_neg, main_set.pos[report_pos],
-                                                  main_set.neg[report_neg], best_layer, int(n_shuffles), seed=seed)
-
-        # ---- Calibrations (layer 3): the primary set's, with the threshold, and one for each set read
-        # in another context.
-        nan_layers = np.full((num_layers,), np.nan)
-        calibrations: List[Calibration] = []
-        if did_eval:
-            P, N = evaluation.main.pos_scores, evaluation.main.neg_scores
-            main_cal = Calibration.from_scores(P, N, main_set.context, pos_tokens=set_tokens[primary_name][0],
-                                               neg_tokens=set_tokens[primary_name][1], source="evaluation")
-            main_cal.threshold = evaluation.threshold
-            calibrations.append(main_cal)
-            for s in eval_sets:
-                result = evaluation.sets.get(s.name)
-                if s.name == primary_name or result is None or any(c.context.matches(s.context) for c in calibrations):
-                    continue
-                calibrations.append(Calibration.from_scores(
-                    result.pos_scores, result.neg_scores, s.context, pos_tokens=set_tokens[s.name][0],
-                    neg_tokens=set_tokens[s.name][1], source=s.name))
-        score_scale = calibrations[0].scale if calibrations else nan_layers.copy()
-        sigma = float(score_scale[best_layer])
-        # The unit of alpha_unit="sigma" is measured on the direction that steers (D1).
-        steer_sigma = sigma
-        if steer_differs and did_eval:
-            steer_sigma = float(_pooled_sd_columns(
-                np.einsum("nd,d->n", main_set.pos[:, best_layer].astype(np.float64), steer_vectors[best_layer])[:, None],
-                np.einsum("nd,d->n", main_set.neg[:, best_layer].astype(np.float64), steer_vectors[best_layer])[:, None],
-            )[0])
-
-        # Where texts without the concept fall (entry 19): read like the eval texts, reported with the
-        # calibration of that reading, not used as the zero.
-        neutral_report: Optional[Dict[str, Any]] = None
-        neutral_texts = list(getattr(self.concept, "neutral_texts", []) or [])
-        if neutral_texts:
-            self._status(f"Reading {len(neutral_texts)} neutral texts")
-            encs = [_encode_text_for_read(tokenizer, t, eval_system, role=text_role, prompt=text_prompt,
-                                          warn=self._warn, warn_prefix=f"neutral_texts[{i}]")
-                    for i, t in enumerate(neutral_texts)]
-            reps_neutral, _, _, _ = pooled_reps([e[0][0] for e in encs], [e[1] for e in encs], [e[2] for e in encs],
-                                                eval_readout_mode, eval_readout_last_k, "neutral")
-            neutral_scores = np.einsum("nld,ld->nl", reps_neutral, concept_vectors)
-            text_ctx = ReadContext.from_dict(_text_context(text_role, eval_system, text_prompt, eval_readout_mode))
-            cal = next((c for c in calibrations if c.context.matches(text_ctx)), None)
-            neutral_report = {"n": int(neutral_scores.shape[0]),
-                              "mean_score_at_best_layer": float(neutral_scores[:, best_layer].mean()),
-                              "z_at_best_layer": None, "z_sd_at_best_layer": None, "calibration": None}
-            if cal is not None and cal.usable([best_layer]):
-                cal.add_neutral(neutral_scores)
-                z = cal.items_z(neutral_scores[:, [best_layer]], [best_layer])
-                neutral_report.update(z_at_best_layer=float(z.mean()),
-                                      z_sd_at_best_layer=float(z.std(ddof=1)) if len(z) > 1 else None,
-                                      calibration=cal.source)
-            else:
-                neutral_report["note"] = ("no calibration was measured on texts read like these, so only the raw "
-                                          "score is reported")
-
-        self.directions = concept_vectors
-        self.layer = int(best_layer)
-        self.steer_directions = steer_vectors
-        self.calibrations = calibrations
-        self.steer_sigma = steer_sigma if np.isfinite(steer_sigma) else None
-        self.resid_norm = resid_norm
-        self.estimator, self.steer_estimator = read_spec, steer_spec
-        main = evaluation.main if evaluation is not None else None
-        self.sweep_d = main.d_curve if main is not None else nan_layers.copy()
-        self.sweep_p = main.p_curve if main is not None else nan_layers.copy()
-
-        def _opt(x: Any) -> Optional[float]:
-            return None if x is None or not np.isfinite(x) else float(x)
-
-        self._status("[Phase 4/4] Sweep + artifact saving")
-        self.logger.log("sweep_full", {
-            "best_layer": best_layer, "best_d": None if main is None else main.d, "best_p": None if main is None else main.p,
-            "selection": None if evaluation is None else evaluation.selection,
-            "best_layer_search": train_cfg.get("best_layer_search"),
-            "sweep_d": self.sweep_d.tolist(), "sweep_p": [_opt(x) for x in self.sweep_p], "sigma_best_layer": _opt(sigma),
-        })
-
-        plots_dir = os.path.join(self.run_dir, "plots")
-        ensure_dir(plots_dir)
-        if plot_cfg.get("enabled", True) and did_eval:
-            if plot_cfg.get("sweep_plot", True):
-                ok = plot_sweep(
-                    main.d_curve, main.p_curve, os.path.join(plots_dir, "sweep.png"), best_layer=best_layer,
-                    search_intervals=search_intervals_plot, selection_d=evaluation.selection_d_curve,
-                    report_d=evaluation.report_d_curve if evaluation.selection == "split" else None,
-                    null_d95=evaluation.report_null_d95_curve, best_d=main.d,
-                    title=f"{self.concept.name}: Cohen's d per layer on the {main_set.name} items",
-                )
-                self.logger.log("plot_sweep", {"ok": ok})
-            if plot_cfg.get("score_hist", True):
-                rp, rn = evaluation.report_idx
-                ok = plot_score_hist(
-                    main.pos_scores[rp, best_layer], main.neg_scores[rn, best_layer],
-                    os.path.join(plots_dir, "score_hist.png"),
-                    title=f"Scores at layer {best_layer}: {main.measured_on} of the {main_set.name} items "
-                          f"({len(rp)} {self.concept.pos_label}, {len(rn)} {self.concept.neg_label})",
-                    labels=(self.concept.pos_label, self.concept.neg_label),
-                )
-                self.logger.log("plot_score_hist", {"ok": ok})
-            if plot_cfg.get("sweep_plot", True):
-                for name, result in evaluation.sets.items():
-                    if name == primary_name:
-                        continue
-                    ok = plot_sweep(result.d_curve, result.p_curve, os.path.join(plots_dir, f"sweep_{safe_slug(name)}.png"),
-                                    best_layer=best_layer, null_d95=result.null_d95_curve, best_d=result.d,
-                                    title=f"{self.concept.name}: Cohen's d per layer on the {name} items")
-                    self.logger.log("plot_sweep_set", {"set": name, "ok": ok})
-
-        tensors: Dict[str, Any] = {
-            "best_layer": np.array([best_layer], dtype=np.int32),
-            "best_v": concept_vectors[best_layer].astype(np.float32),
-            "concept_vectors": concept_vectors.astype(np.float32),
-            "sweep_d": self.sweep_d.astype(np.float32),
-            "sweep_p": self.sweep_p.astype(np.float64),
-            "resid_norm": resid_norm.astype(np.float64),
-            "steer_vectors": np.asarray(steer_vectors, dtype=np.float32),
-            "steer_sigma_best_layer": np.array([steer_sigma], dtype=np.float64),
-            "calibrations": np.array([json.dumps([c.to_dict() for c in calibrations])]),
-            "eval_question_idx": np.asarray(eval_question_idx, dtype=np.int32),
-        }
-        if evaluation is not None:
-            sel_p, sel_n = evaluation.selection_idx
-            tensors.update({
-                "eval_pos_scores_mat": main.pos_scores.astype(np.float32),
-                "eval_neg_scores_mat": main.neg_scores.astype(np.float32),
-                "eval_selection_pos_idx": np.asarray(sel_p, dtype=np.int32),
-                "eval_selection_neg_idx": np.asarray(sel_n, dtype=np.int32),
-                "eval_null_d95": main.null_d95_curve.astype(np.float64),
-            })
-            if evaluation.report_d_curve is not None:
-                tensors["eval_report_d"] = evaluation.report_d_curve.astype(np.float64)
-            for name, result in evaluation.sets.items():
-                if name == primary_name:
-                    continue
-                key = safe_slug(name)
-                tensors.update({f"set_{key}_pos_scores": result.pos_scores.astype(np.float32),
-                                f"set_{key}_neg_scores": result.neg_scores.astype(np.float32),
-                                f"set_{key}_d": result.d_curve.astype(np.float32),
-                                f"set_{key}_p": result.p_curve.astype(np.float64),
-                                f"set_{key}_null_d95": result.null_d95_curve.astype(np.float64)})
-        if out_cfg.get("save_reps_to_npz", True):
-            tensors.update({"train_pos_reps": reps_pos.astype(np.float32), "train_neg_reps": reps_neg.astype(np.float32)})
-        npz_path = os.path.join(self.run_dir, "tensors.npz")
-        np.savez_compressed(npz_path, **tensors)
-
-        n_train_pos = len(train_pos_kept)
-        n_train_neg = len(train_neg_kept)
-        n_train = n_train_pos if train_prompt_mode == "shared" else n_train_pos + n_train_neg
-        metrics = {
-            "best_layer": best_layer,
-            "best_d": None if main is None else main.d,
-            "best_p": None if main is None else main.p,
-            "best_d_ci95": None if main is None else main.d_ci95,
-            "best_auroc": None if main is None else main.auroc,
-            "best_auroc_ci95": None if main is None else main.auroc_ci95,
-            "best_accuracy": None if main is None else main.accuracy,
-            "best_accuracy_ci95": None if main is None else main.accuracy_ci95,
-            "null_d95_at_best_layer": None if main is None else main.null_d95,
-            "selection": None if evaluation is None else evaluation.selection,
-            "best_d_selection": None if evaluation is None else evaluation.d_selection,
-            "best_d_all_eval": None if main is None else _opt(main.d_curve[best_layer]),
-            "n_eval_selection": ({"pos": int(len(evaluation.selection_idx[0])), "neg": int(len(evaluation.selection_idx[1]))}
-                                 if evaluation is not None and evaluation.selection == "split" else None),
-            "sweep_max_d": None if evaluation is None else evaluation.sweep_max_d,
-            "sweep_max_d_perm_p": None if evaluation is None else evaluation.sweep_max_d_perm_p,
-            "best_layer_search": train_cfg.get("best_layer_search"),
-            "best_layer_search_intervals": None if search_info is None else search_info["intervals"],
-            "label_shuffle": label_shuffle,
-            "sigma_best_layer": _opt(sigma),
-            "num_layers": num_layers,
-            "n_train": n_train,
-            "n_train_pos": n_train_pos,
-            "n_train_neg": n_train_neg,
-            "train_prompt_mode": train_prompt_mode,
-            "estimator": read_spec,
-            "steer_direction": steer_spec,
-            "steer_sigma_best_layer": _opt(steer_sigma),
-            "threshold": None if evaluation is None else evaluation.threshold,
-            "neutral_texts": neutral_report,
-            "train_samples": ({"pos": int(reps_pos.shape[0]), "neg": int(reps_neg.shape[0])}
-                              if str(train_readout_mode).endswith("_tokens") else None),
-            "train_text_role": text_role,
-            "gen_batch_size": gen_bs if train_prompt_mode == "shared" else None,
-            "n_eval": n_eval_pos + n_eval_neg,
-            "n_eval_pos": n_eval_pos,
-            "n_eval_neg": n_eval_neg,
-            "eval_mode_used": eval_mode if did_eval else None,
-            "eval_paired": bool(main_set.paired) if main_set is not None else False,
-            "reference_context": calibrations[0].context.to_dict() if calibrations else None,
-            "eval_readout": eval_readout,
-            "evaluation": None if evaluation is None else evaluation.to_metrics(),
-            "dropped_items": dropped_items or None,
-            "model_identity": self.identity,
-            "read_batch_size": read_batch_size,
-            "rep_cache": rep_cache,
-            "choices": [c.to_dict() for c in run_choices],
-        }
-        json_dump(os.path.join(self.run_dir, "metrics.json"), metrics)
-        self.logger.log("artifacts_saved", {"npz_path": npz_path})
-        if self.config["output"].get("pretty_json_log", False) and self.config["output"].get("log_jsonl", True):
-            pretty_path = os.path.join(self.run_dir, "log.pretty.json")
-            jsonl_to_pretty(os.path.join(self.run_dir, "log.jsonl"), pretty_path)
-        self._status(f"Saved artifacts to {self.run_dir}")
-        return self
-
-    def _rep_cache_dir(self) -> Optional[str]:
-        """Where this probe caches representations: ``output.rep_cache_dir``, or else
-        ``<output.root_dir>/rep_cache``; None when ``output.rep_cache`` is false or the session does
-        not save (``concept_probe.configure(save=False)`` turns off every implicit write)."""
-        out_cfg = self.config.get("output", {})
-        if not out_cfg.get("rep_cache", True) or not settings().save:
-            return None
-        return out_cfg.get("rep_cache_dir") or os.path.join(out_cfg.get("root_dir", "outputs"), "rep_cache")
-
-    def _require_trained(self) -> None:
-        if self.directions is None or self.layer is None:
-            raise ValueError("The probe has no directions yet: train, fit, or load it first.")
-
-    def _ensure_run_dir(self) -> str:
-        """The probe's run folder, created under ``output.root_dir`` the first time it saves."""
-        if not self.run_dir:
-            root = self.save_root or settings().output_root
-            self.run_dir = os.path.join(root, safe_slug(self.concept.name), now_tag())
-            ensure_dir(self.run_dir)
-        return self.run_dir
-
-    def _require_model(self, what: str) -> None:
-        self._require_trained()
-        if self.model_bundle is None:
-            raise ValueError(f"{what} needs the model loaded: attach it with probe.attach(model, tokenizer) "
-                             "(the probe's identity says which model it belongs to).")
-
-    def _status(self, message: str) -> None:
-        if self.console is not None:
-            self.console.info(message)
-
-    def _warn(self, message: str) -> None:
-        if self.console is not None:
-            self.console.warn(message)
-        self.logger.log("warning", {"message": message})
-
-    @property
-    def num_layers(self) -> int:
-        self._require_trained()
-        return int(np.asarray(self.directions).shape[0])
-
-    def _layer_selection(self, override: Optional[Dict[str, Any]] = None) -> List[int]:
-        self._require_trained()
-        selection = dict(self.config["evaluation"]["layer_selection"])
-        if override:
-            selection = deep_merge(selection, override)
-        return select_layers(selection, int(self.layer), self.num_layers)
-
-    # ------------------------------------------------------------------ calibrations and z
-    def calibration_for(self, context: Optional[Union[ReadContext, Dict[str, Any]]] = None) -> Optional[Calibration]:
-        """The calibration measured on items read like ``context`` (a :class:`ReadContext` or its
-        dict); with no context, the only calibration if there is one."""
-        if context is None:
-            return self.calibrations[0] if len(self.calibrations) == 1 else None
-        target = context if isinstance(context, ReadContext) else ReadContext.from_dict(context)
-        return next((c for c in self.calibrations if c.context.matches(target)), None)
-
-    def _missing_z_reason(self, context: Optional[Union[ReadContext, Dict[str, Any]]]) -> str:
-        """Why items read in ``context`` get no z score."""
-        have = "; ".join(c.context.describe() for c in self.calibrations) or "in no context"
-        if context is None:
-            return (f"the probe has {len(self.calibrations)} calibrations (items read {have}); say which reading "
-                    "context the items come from (context=...).")
-        target = context if isinstance(context, ReadContext) else ReadContext.from_dict(context)
-        return (f"the probe has no calibration for items read {target.describe()} (it has one for items read "
-                f"{have}); z scores from another reading context are not comparable. Add one with "
-                "probe.calibrate(pos, neg, ...).")
-
-    def _token_z(
-        self, scores_per_layer: np.ndarray, layers: List[int], aggregate: str, context: Dict[str, Any]
-    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-        """Single-token z scores per selected layer and their aggregate, with the calibration of
-        ``context``; None when there is none (see :meth:`Calibration.tokens_z`)."""
-        cal = self.calibration_for(context)
-        return None if cal is None else cal.tokens_z(scores_per_layer, layers, aggregate)
-
-    def _item_z(
-        self, span_scores_per_layer: np.ndarray, layers: List[int], aggregate: str, context: Dict[str, Any]
-    ) -> Optional[float]:
-        """The z score of an item, from its tokens' scores at the selected layers: their mean,
-        standardized with the calibration of ``context``. None without such a calibration, or when it
-        was measured with a pooling other than the mean (its zero would not apply to a mean)."""
-        cal = self.calibration_for(context)
-        span = np.asarray(span_scores_per_layer, dtype=np.float64)
-        if cal is None or (cal.context.readout or "assistant_all_mean") != "assistant_all_mean" or span.shape[0] == 0:
-            return None
-        z = cal.items_z(span.mean(axis=0)[None, :], layers, aggregate)
-        return None if z is None else float(z[0])
-
-    # ------------------------------------------------------------------ reading arrays
-    def project(self, reps: Any) -> np.ndarray:
-        """Each item's projection on each layer's reading direction: ``(items, layers)``, from
-        representations ``(items, layers, dim)`` (an array, or what :func:`read_texts` returns)."""
-        self._require_trained()
-        R = _as_reps(reps)
-        if R.shape[1:] != np.asarray(self.directions).shape:
-            raise ValueError(f"representations of shape {R.shape[1:]} (layers, dim) do not fit the probe's directions "
-                             f"{np.asarray(self.directions).shape}")
-        return np.einsum("nld,ld->nl", R.astype(np.float64), np.asarray(self.directions, dtype=np.float64))
-
-    def scores(self, reps: Any) -> np.ndarray:
-        """Each item's raw score: its projection at the probe's layers (``evaluation.layer_selection``,
-        the probe's layer by default), aggregated as ``evaluation.score_aggregate``. The offset is
-        arbitrary; see :meth:`z`."""
-        layers = self._layer_selection()
-        proj = self.project(reps)[:, layers]
-        return proj.mean(axis=1) if self.config["evaluation"]["score_aggregate"] == "mean" else proj.sum(axis=1)
-
-    def z(self, reps: Any, context: Optional[Union[ReadContext, Dict[str, Any]]] = None) -> np.ndarray:
-        """Each item's z score, with the calibration of ``context`` (how the items were read; with one
-        calibration it may be left out). 0 is the calibration's zero (the midpoint between the poles,
-        not "without the concept"), 1 its within-pole SD. Raises, saying which contexts the probe
-        has, when there is no calibration for ``context``."""
-        cal = self.calibration_for(context)
-        if cal is None:
-            raise ValueError(self._missing_z_reason(context))
-        layers = self._layer_selection()
-        z = cal.items_z(self.project(reps)[:, layers], layers, self.config["evaluation"]["score_aggregate"])
-        if z is None:
-            raise ValueError(f"the calibration for items read {cal.context.describe()} has no usable references "
-                             f"at layers {layers}.")
-        return z
-
-    def classify(self, reps: Any, context: Optional[Union[ReadContext, Dict[str, Any]]] = None
-                 ) -> Tuple[np.ndarray, np.ndarray]:
-        """Whether each item belongs to the positive pole, and the probability, from the calibrated
-        threshold of ``context`` (not from z = 0, which is the midpoint, not the best cut)."""
-        cal = self.calibration_for(context)
-        if cal is None:
-            raise ValueError(self._missing_z_reason(context))
-        if not cal.threshold:
-            raise ValueError("That calibration has no threshold; calibrate again to fit one.")
-        t = cal.threshold
-        prob = sigmoid(t["slope"] * self.project(reps)[:, int(t["layer"])] + t["intercept"])
-        return prob >= 0.5, prob
+    #: the evaluation made when the probe was fitted (in memory), and its numbers (also saved)
+    evaluation: Optional[ReadingEvaluation] = None
+    metrics: Dict[str, Any] = field(default_factory=dict)
+    #: every choice made on the caller's behalf
+    choices: List[Choice] = field(default_factory=list)
+    model_bundle: Optional[ModelBundle] = None
+    run_dir: Optional[str] = None
+    #: where a probe without a folder creates one when it first saves (None: the session's output_root)
+    save_root: Optional[str] = None
 
     # ------------------------------------------------------------------ building
     @classmethod
@@ -1392,77 +133,153 @@ class ConceptProbe:
         pos: Any,
         neg: Any,
         *,
+        eval: Union[None, EvalSet, Sequence[EvalSet]] = None,
+        layer: Optional[int] = None,
         estimator: Any = "mean_diff",
         steer: Any = "mean_diff",
-        layer: Optional[int] = None,
-        select: Optional[Tuple[Any, Any]] = None,
         search_layers: Optional[Sequence[int]] = None,
         sweep_select: str = "effect_size",
-        calibrate: Optional[Tuple[Any, Any]] = None,
-        context: Optional[Union[ReadContext, Dict[str, Any]]] = None,
+        selection_split: Any = 0.5,
+        n_random: int = 50,
+        n_bootstrap: int = 1000,
+        n_permutations: int = 1000,
+        n_label_shuffles: Union[int, str] = "auto",
+        neutral: Any = None,
         baseline: bool = False,
         erase: Any = None,
-        concept: Optional[ConceptSpec] = None,
+        threshold_l2: float = 1e-2,
+        seed: int = 0,
+        score_layers: Optional[Sequence[int]] = None,
+        score_aggregate: str = "mean",
+        name: str = "concept",
+        pos_label: str = "positive",
+        neg_label: str = "negative",
         model: Any = None,
         tokenizer: Any = None,
         identity: Optional[Union[Dict[str, Any], str]] = None,
-        config_overrides: Optional[Dict[str, Any]] = None,
+        allow_model_mismatch: bool = False,
         root_dir: Optional[str] = None,
         run_name: Optional[str] = None,
         save: Optional[bool] = None,
         overwrite: bool = False,
+        plots: bool = True,
     ) -> "ConceptProbe":
         """Train a probe from representations already read: ``(items, layers, dim)`` of each pole
-        (arrays, or what :func:`read_texts` returns, which says which model they come from).
+        (arrays, or what :func:`concept_probe.read_texts` returns, which says which model they come
+        from and how they were read).
 
         ``estimator`` and ``steer`` set the reading and steering directions (see
-        :mod:`concept_probe.directions`). The layer is ``layer``, or the one whose direction separates
-        ``select = (pos, neg)`` the most (``sweep_select``), within ``search_layers``; choose it on
-        items that did not train the directions. ``calibrate = (pos, neg)`` adds the calibration of
-        ``context`` (how those items were read; default raw text), with a threshold; use items that
-        did not train or choose. ``baseline=True`` reads ``neg`` as a baseline (text without the
-        concept) rather than an opposite pole, so the zero is the baseline's mean.
+        :mod:`concept_probe.directions`; ``steer="read"`` steers with the reading direction).
+        ``erase`` (an :class:`~concept_probe.directions.Eraser`) fits both without a confound.
 
-        ``erase`` (an :class:`~concept_probe.directions.Eraser`, fitted on reps with a confound's
-        labels) fits both directions with that confound erased, and stores them as directions on raw
-        reps: the probe then reads, and steers, without what separates the confound's groups.
+        With ``eval`` (an :class:`~concept_probe.evaluation.EvalSet`, or several: the first is the
+        primary), the probe is evaluated as :func:`concept_probe.evaluate_reading` does: the layer is
+        chosen on a ``selection_split`` part of the primary set (a fraction, or the items that choose
+        it; see there) within ``search_layers``, its numbers come from the rest, every other set is
+        measured there, with random-direction nulls (``n_random``), bootstrap intervals and a
+        permutation p; ``n_label_shuffles`` refits with shuffled labels (``"auto"``: 10 for the
+        difference of means, which is quick, else 0; announced). Each set's scores calibrate the
+        probe for items read like it (the primary one with a threshold; ``baseline=True`` puts the
+        zero at the second pole's mean, for a concept read against a baseline). ``neutral``, texts
+        without the concept read like the primary set, are placed on its calibration (reported, not
+        used as the zero). Without ``eval``, give the ``layer``.
 
-        The probe belongs to the model the representations came from: the one ``read_texts`` recorded,
-        ``model`` (loaded, then attached), or ``identity`` (a dict, or a model id). One is required.
-        It saves to ``<root>/<concept name>/<run_name or timestamp>`` unless ``save=False`` (or the
-        session does not save), where ``root`` is ``root_dir``, else ``output.root_dir`` if
-        ``config_overrides`` sets it, else the session's ``output_root``.
+        The probe belongs to the model the representations came from: the one ``read_texts``
+        recorded, ``model`` (loaded, then attached; another one raises unless
+        ``allow_model_mismatch``), or ``identity`` (a dict, or a model id). Representations read with
+        ``norms=True`` give the unit of ``unit="resid_norm"``. The probe saves to
+        ``<root>/<name>/<run_name or time>`` unless ``save=False`` (or the session does not save),
+        with the plots of its evaluation unless ``plots=False``.
         """
-        P, N = _as_reps(pos), _as_reps(neg)
-        probe = cls._new(concept, model, tokenizer, identity, getattr(pos, "identity", None), config_overrides, root_dir)
-        read = fit_directions(estimator, P, N, erase=erase)
-        steer_dirs, steer_spec, choice = steer_directions_for(estimator, steer, P, N, read, erase=erase)
+        P, N = _as_array(pos), _as_array(neg)
+        sets = [] if eval is None else ([eval] if isinstance(eval, EvalSet) else list(eval))
+        if layer is None and not sets:
+            raise ValueError("Pass eval= (eval sets, to choose the layer on items that did not train) or layer=.")
+        probe = cls._new(name, pos_label, neg_label, model, tokenizer, identity, getattr(pos, "identity", None),
+                         root_dir, allow_model_mismatch)
+        choices: List[Choice] = []
+        flips: List[int] = []
+        est = make_estimator(estimator)
+        read = fit_directions(est, P, N, erase=erase, flips=flips)
+        probe.estimator = estimator_spec(est)
+        _record_estimator_notes(probe, est, flips, choices)
+        steer_dirs, steer_spec, choice = steer_directions_for(est, steer, P, N, read, erase=erase)
+        if choice is not None:
+            choices.append(choice)
         probe.directions, probe.steer_directions = read, steer_dirs
-        probe.estimator, probe.steer_estimator = estimator_spec(estimator), steer_spec
+        probe.steer_estimator = steer_spec
         if erase is not None:
             probe.estimator = dict(probe.estimator, erased=erase.describe())
             probe.steer_estimator = dict(probe.steer_estimator, erased=erase.describe())
-        if layer is None:
-            if select is None:
-                raise ValueError("Pass layer=, or select=(pos, neg) to choose the layer on items that did not train.")
-            sp = np.einsum("nld,ld->nl", _as_reps(select[0]).astype(np.float64), read.astype(np.float64))
-            sn = np.einsum("nld,ld->nl", _as_reps(select[1]).astype(np.float64), read.astype(np.float64))
-            layers = list(range(read.shape[0])) if search_layers is None else list(search_layers)
-            layer = _select_best_layer(_cohen_d_columns(sp, sn), _welch_p_columns(sp, sn), layers, sweep_select)
-            probe.sweep_d, probe.sweep_p = _cohen_d_columns(sp, sn), _welch_p_columns(sp, sn)
-        probe.layer = resolve_layer_index(layer, read.shape[0], "layer")
-        choices = [choice] if choice is not None else []
-        if calibrate is not None:
-            cal = probe.calibrate(calibrate[0], calibrate[1], context=context, baseline=baseline)
+        num_layers = read.shape[0]
+        norms = [getattr(r, "norms", None) for r in (pos, neg)]
+        if all(n is not None for n in norms):
+            probe.resid_norm = np.concatenate(norms, axis=0).mean(axis=0)
+
+        if sets:
+            ev = evaluate_reading(read, sets, layer=layer, selection_split=selection_split, search_layers=search_layers,
+                                  sweep_select=sweep_select, n_random=int(n_random), n_bootstrap=int(n_bootstrap),
+                                  n_permutations=int(n_permutations), threshold_l2=threshold_l2, seed=seed)
+            probe.layer = int(ev.layer)
+            probe.evaluation = ev
+            main = ev.main
+            probe.sweep_d, probe.sweep_p = main.d_curve, main.p_curve
+            primary = sets[0]
+            for s in sets:
+                result = ev.sets.get(s.name)
+                context = s.context or ReadContext()
+                if result is None or any(c.context.matches(context) for c in probe.calibrations):
+                    continue
+                tokens = _token_projections(s, read)
+                cal = Calibration.from_scores(result.pos_scores, result.neg_scores, context, pos_tokens=tokens[0],
+                                              neg_tokens=tokens[1], zero="baseline" if baseline else "midpoint",
+                                              source="evaluation" if s is primary else s.name)
+                if s is primary:
+                    cal.threshold = ev.threshold
+                probe.calibrations.append(cal)
+            n_shuffles = n_label_shuffles
+            if n_shuffles == "auto":
+                n_shuffles = 10 if probe.estimator.get("kind") == "mean_diff" else 0
+                choices.append(Choice("n_label_shuffles", "auto", n_shuffles,
+                                      "refitting the difference of means is quick, so ten shuffles run" if n_shuffles else
+                                      f"refitting a {probe.estimator.get('kind')} direction for every shuffle is slow; "
+                                      "pass n_label_shuffles to run them"))
+            shuffle = None
+            if int(n_shuffles) > 0:
+                rp, rn = ev.report_idx
+                shuffle = label_shuffle_control(est, P, N, primary.pos[rp], primary.neg[rn], probe.layer,
+                                                int(n_shuffles), seed=seed)
+            neutral_report = None
+            if neutral is not None:
+                cal = probe.calibrations[0]
+                scores = np.einsum("nld,ld->nl", _as_array(neutral).astype(np.float64), read.astype(np.float64))
+                cal.add_neutral(scores)
+                z = cal.items_z(scores[:, [probe.layer]], [probe.layer])
+                neutral_report = {"n": int(len(scores)), "mean_score": float(scores[:, probe.layer].mean()),
+                                  "z": None if z is None else float(z.mean()),
+                                  "z_sd": None if z is None or len(z) < 2 else float(z.std(ddof=1))}
+            probe.metrics = _metrics(ev, shuffle, neutral_report, len(P), len(N))
+            for message in ev.warnings:
+                _warn(message)
+        else:
+            probe.layer = resolve_layer_index(layer, num_layers, "layer")
+        probe.score_layers = None if score_layers is None else _layer_list(list(score_layers), num_layers, "score_layers")
+        if score_aggregate not in ("mean", "sum"):
+            raise ValueError(f"score_aggregate must be 'mean' or 'sum'; got {score_aggregate!r}")
+        probe.score_aggregate = score_aggregate
+        if probe.calibrations:
+            primary_set = sets[0]
             if steer_dirs is not read:
-                probe.steer_sigma = float(_pooled_sd_columns(
-                    np.einsum("nld,ld->nl", _as_reps(calibrate[0]).astype(np.float64), steer_dirs.astype(np.float64)),
-                    np.einsum("nld,ld->nl", _as_reps(calibrate[1]).astype(np.float64), steer_dirs.astype(np.float64)),
-                )[probe.layer])
+                sp = np.einsum("nd,d->n", primary_set.pos[:, probe.layer].astype(np.float64), steer_dirs[probe.layer])
+                sn = np.einsum("nd,d->n", primary_set.neg[:, probe.layer].astype(np.float64), steer_dirs[probe.layer])
+                probe.steer_sigma = float(_pooled_sd_columns(sp[:, None], sn[:, None])[0])
             else:
-                probe.steer_sigma = float(cal.scale[probe.layer])
-        announce(choices, console=probe.console is not None and probe.console.enabled)
-        probe._save_new(root_dir, run_name, save, overwrite, "fit", choices)
+                probe.steer_sigma = float(probe.calibrations[0].scale[probe.layer])
+            if not np.isfinite(probe.steer_sigma):
+                probe.steer_sigma = None
+        probe.choices = choices
+        announce(choices)
+        probe._save_new(run_name, save, overwrite, "fit", plots=plots)
         return probe
 
     @classmethod
@@ -1472,45 +289,53 @@ class ConceptProbe:
         layer: int,
         *,
         steer_directions: Optional[np.ndarray] = None,
-        concept: Optional[ConceptSpec] = None,
+        name: str = "concept",
+        pos_label: str = "positive",
+        neg_label: str = "negative",
         model: Any = None,
         tokenizer: Any = None,
         identity: Optional[Union[Dict[str, Any], str]] = None,
-        config_overrides: Optional[Dict[str, Any]] = None,
+        allow_model_mismatch: bool = False,
         root_dir: Optional[str] = None,
         run_name: Optional[str] = None,
         save: Optional[bool] = None,
         overwrite: bool = False,
     ) -> "ConceptProbe":
-        """A probe from directions computed elsewhere: ``(layers, dim)``, scaled to unit length per
-        layer (steering uses them too unless ``steer_directions`` is given). Calibrate it with
-        :meth:`calibrate` to get z scores. The model and saving work as in :meth:`fit`."""
-        probe = cls._new(concept, model, tokenizer, identity, None, config_overrides, root_dir)
+        """A probe from directions computed elsewhere, ``(layers, dim)``. It reads with them scaled to
+        unit length per layer (announced when they were not), and steers with ``steer_directions``,
+        or with the directions as given. Calibrate it with :meth:`calibrate` to get z scores. The
+        model and saving work as in :meth:`fit`."""
+        probe = cls._new(name, pos_label, neg_label, model, tokenizer, identity, None, root_dir, allow_model_mismatch)
         v = np.asarray(directions, dtype=np.float64)
         if v.ndim != 2:
             raise ValueError(f"directions must be (layers, dim); got shape {v.shape}")
-        probe.directions = (v / np.clip(np.linalg.norm(v, axis=1, keepdims=True), 1e-12, None)).astype(np.float32)
-        probe.steer_directions = probe.directions if steer_directions is None else np.asarray(steer_directions, np.float32)
+        lengths = np.linalg.norm(v, axis=1)
+        probe.directions = (v / np.clip(lengths, 1e-12, None)[:, None]).astype(np.float32)
+        if not np.allclose(lengths, 1.0, atol=1e-6):
+            probe.choices.append(Choice("reading directions", "as given", "scaled to unit length",
+                                        "a probe reads with unit directions, so its scores are projections; steering "
+                                        "uses the directions as given"))
+        probe.steer_directions = (np.asarray(directions, np.float32) if steer_directions is None
+                                  else np.asarray(steer_directions, np.float32))
         probe.layer = resolve_layer_index(layer, v.shape[0], "layer")
         probe.estimator = {"kind": "given"}
-        probe.steer_estimator = probe.estimator if steer_directions is None else {"kind": "given"}
-        probe._save_new(root_dir, run_name, save, overwrite, "from_directions", [])
+        probe.steer_estimator = {"kind": "given"}
+        announce(probe.choices)
+        probe._save_new(run_name, save, overwrite, "from_directions", plots=False)
         return probe
 
     @classmethod
-    def _new(cls, concept, model, tokenizer, identity, reps_identity, config_overrides, root_dir) -> "ConceptProbe":
-        cfg = resolve_config(config_overrides)
-        # where it saves: root_dir, else a root_dir given in the config overrides, else the session's
-        save_root = root_dir or ((config_overrides or {}).get("output") or {}).get("root_dir")
-        probe = cls(concept=concept or _default_concept(), config=cfg, save_root=save_root,
-                    console=ConsoleLogger(cfg["output"].get("console", True)))
+    def _new(cls, name, pos_label, neg_label, model, tokenizer, identity, reps_identity, root_dir,
+             allow_model_mismatch) -> "ConceptProbe":
+        probe = cls(name=str(name), pos_label=str(pos_label), neg_label=str(neg_label), save_root=root_dir)
         if isinstance(identity, str):
             identity = {"model_id": identity}
         if model is not None:
-            probe.attach(model, tokenizer)
-            if reps_identity and identity_mismatches(reps_identity, probe.identity):
-                raise ValueError("The representations were read with another model than the one passed: "
-                                 + "; ".join(identity_mismatches(reps_identity, probe.identity)))
+            probe.attach(model, tokenizer, allow_model_mismatch=True)
+            mismatched = identity_mismatches(reps_identity, probe.identity) if reps_identity else []
+            if mismatched and not allow_model_mismatch:
+                raise ValueError("The representations were read with another model than the one passed ("
+                                 + "; ".join(mismatched) + "); pass allow_model_mismatch=True to use it anyway.")
         else:
             probe.identity = reps_identity or identity
         if not probe.identity:
@@ -1520,14 +345,14 @@ class ConceptProbe:
 
     def attach(self, model: Any, tokenizer: Any = None, *, allow_model_mismatch: bool = False) -> "ConceptProbe":
         """Give the probe a loaded model (a :class:`ModelBundle`, or a model and its tokenizer), so it
-        can read texts, generate and steer. A model of another identity than the probe's raises
-        unless ``allow_model_mismatch``."""
+        can score texts and steer. A model of another identity than the probe's raises unless
+        ``allow_model_mismatch``."""
         bundle = model if isinstance(model, ModelBundle) else None
         if bundle is None:
             if tokenizer is None:
                 raise ValueError("attach a ModelBundle, or a model together with its tokenizer.")
-            bundle = ModelBundle.from_loaded(model, tokenizer, model_cfg=self.config.get("model"))
-        mine = bundle.identity or identity_of(bundle.model, bundle.tokenizer, bundle.model_id)
+            bundle = ModelBundle.from_loaded(model, tokenizer)
+        mine = bundle.identity
         if self.identity:
             mismatched = identity_mismatches(self.identity, mine)
             if mismatched and not allow_model_mismatch:
@@ -1540,425 +365,120 @@ class ConceptProbe:
         self.model_bundle = bundle
         return self
 
-    def _save_new(self, root_dir, run_name, save, overwrite, how: str, choices: List[Choice]) -> None:
+    # ------------------------------------------------------------------ saving and loading
+    def _save_new(self, run_name: Optional[str], save: Optional[bool], overwrite: bool, how: str,
+                  plots: bool = True) -> None:
         if not (settings().save if save is None else save):
             return
         root = self.save_root or settings().output_root
-        run_dir = os.path.join(root, safe_slug(self.concept.name), run_name or now_tag())
+        run_dir = os.path.join(root, safe_slug(self.name), run_name or now_tag())
         if os.path.isdir(run_dir) and os.listdir(run_dir):
             if not overwrite:
-                raise FileExistsError(f"{run_dir} already holds a run; pass another run_name, or overwrite=True.")
-            shutil.rmtree(run_dir)
-        self.save(run_dir, how=how, choices=choices)
+                raise FileExistsError(f"{run_dir} already holds files; pass overwrite=True or another run_name.")
+            import shutil
 
-    def save(self, run_dir: Optional[str] = None, *, how: str = "save", choices: Sequence[Choice] = ()) -> str:
-        """Write the probe to ``run_dir`` (default: its own) in the format of a training run, so
-        :meth:`load` reads it back. Into a training run's folder it updates the probe's own entries
-        (directions, layer, calibrations, steering units) and keeps everything else."""
+            shutil.rmtree(run_dir)
+        self.save(run_dir, how=how)
+        if plots and self.evaluation is not None:
+            self._plots(os.path.join(run_dir, "plots"))
+        if settings().console:
+            print(f"[concept-probe] saved the probe to {run_dir}", flush=True)
+
+    def _plots(self, folder: str) -> None:
+        ev = self.evaluation
+        ensure_dir(folder)
+        main = ev.main
+        plot_sweep(main.d_curve, main.p_curve, os.path.join(folder, "sweep.png"), best_layer=self.layer,
+                   selection_d=ev.selection_d_curve, report_d=ev.report_d_curve if ev.selection == "split" else None,
+                   null_d95=ev.report_null_d95_curve, best_d=main.d,
+                   title=f"{self.name}: Cohen's d per layer on the {ev.primary} items")
+        rp, rn = ev.report_idx
+        plot_score_hist(main.pos_scores[rp, self.layer], main.neg_scores[rn, self.layer],
+                        os.path.join(folder, "score_hist.png"),
+                        title=f"Scores at layer {self.layer}: {main.measured_on} of the {ev.primary} items "
+                              f"({len(rp)} {self.pos_label}, {len(rn)} {self.neg_label})",
+                        labels=(self.pos_label, self.neg_label))
+        for set_name, result in ev.sets.items():
+            if set_name != ev.primary:
+                plot_sweep(result.d_curve, result.p_curve, os.path.join(folder, f"sweep_{safe_slug(set_name)}.png"),
+                           best_layer=self.layer, null_d95=result.null_d95_curve, best_d=result.d,
+                           title=f"{self.name}: Cohen's d per layer on the {set_name} items")
+
+    def save(self, run_dir: Optional[str] = None, *, how: str = "save") -> str:
+        """Write the probe to ``run_dir`` (default: its own): ``probe.json`` (what it is, its
+        calibrations, its evaluation's numbers, the choices made) and ``probe.npz`` (its directions
+        and per-layer curves). :meth:`load` reads it back."""
         self._require_trained()
         run_dir = run_dir or self.run_dir
         if not run_dir:
-            raise ValueError("The probe has no run folder; pass run_dir.")
+            raise ValueError("The probe has no folder; pass run_dir.")
         ensure_dir(run_dir)
         self.run_dir = run_dir
-        cal_eval = next((c for c in self.calibrations if c.source == "evaluation"), None)
-        state = {
-            "concept_vectors": np.asarray(self.directions, dtype=np.float32),
-            "best_layer": np.array([int(self.layer)], dtype=np.int32),
-            "steer_vectors": np.asarray(self.steer_directions if self.steer_directions is not None else self.directions,
-                                        dtype=np.float32),
-            "steer_sigma_best_layer": np.array([np.nan if self.steer_sigma is None else self.steer_sigma]),
-            "calibrations": np.array([json.dumps([c.to_dict() for c in self.calibrations])]),
-        }
-        if self.resid_norm is not None:
-            state["resid_norm"] = np.asarray(self.resid_norm, dtype=np.float64)
-        tensors_path = os.path.join(run_dir, "tensors.npz")
-        if os.path.exists(tensors_path):
-            with np.load(tensors_path) as old:
-                state = {**{k: old[k] for k in old.files}, **state}
-        np.savez_compressed(tensors_path, **state)
-        metrics_path = os.path.join(run_dir, "metrics.json")
-        metrics: Dict[str, Any] = {}
-        if os.path.exists(metrics_path):
-            with open(metrics_path, "r", encoding="utf-8") as f:
-                metrics = json.load(f)
-        metrics.update({
-            "best_layer": int(self.layer), "num_layers": self.num_layers, "estimator": self.estimator,
-            "steer_direction": self.steer_estimator, "steer_sigma_best_layer": self.steer_sigma,
-            "threshold": None if cal_eval is None else cal_eval.threshold, "model_identity": self.identity,
-            "calibrations": [{"context": c.context.to_dict(), "source": c.source, "n_pos": c.n_pos, "n_neg": c.n_neg}
-                             for c in self.calibrations],
+        arrays = {"directions": np.asarray(self.directions, dtype=np.float32)}
+        if self.steer_directions is not None and self.steer_directions is not self.directions:
+            arrays["steer_directions"] = np.asarray(self.steer_directions, dtype=np.float32)
+        for key in ("resid_norm", "sweep_d", "sweep_p"):
+            if getattr(self, key) is not None:
+                arrays[key] = np.asarray(getattr(self, key), dtype=np.float64)
+        np.savez_compressed(os.path.join(run_dir, "probe.npz"), **arrays)
+        json_dump(os.path.join(run_dir, "probe.json"), {
+            "name": self.name, "pos_label": self.pos_label, "neg_label": self.neg_label, "layer": int(self.layer),
+            "score_layers": self.score_layers, "score_aggregate": self.score_aggregate, "identity": self.identity,
+            "estimator": self.estimator, "steer_estimator": self.steer_estimator, "steer_sigma": self.steer_sigma,
+            "calibrations": [c.to_dict() for c in self.calibrations], "metrics": self.metrics,
+            "choices": [c.to_dict() for c in self.choices], "built_by": how,
         })
-        metrics.setdefault("built_by", how)
-        if choices:
-            metrics["choices"] = list(metrics.get("choices", [])) + [c.to_dict() for c in choices]
-        json_dump(metrics_path, metrics)
-        if not os.path.exists(os.path.join(run_dir, "config.json")):
-            json_dump(os.path.join(run_dir, "config.json"), {**self.config, "concept": self.concept.to_dict()})
-        json_dump(os.path.join(run_dir, "concept.json"), self.concept.to_dict())
         return run_dir
-
-    # ------------------------------------------------------------------ calibrating
-    def calibrate(
-        self,
-        pos: Any,
-        neg: Any,
-        *,
-        context: Optional[Union[ReadContext, Dict[str, Any]]] = None,
-        as_reply_to: Optional[Union[str, List[str]]] = None,
-        role: str = "raw",
-        system_prompt: Optional[str] = None,
-        prompt: Optional[str] = None,
-        neutral: Any = None,
-        baseline: bool = False,
-        batch_size: Optional[int] = None,
-    ) -> Calibration:
-        """Measure a calibration on items of each pole, so items read the same way get z scores and
-        a calibrated threshold. It replaces any calibration for the same reading context.
-
-        ``pos`` / ``neg`` (and ``neutral``, texts without the concept, whose place is recorded) are
-        representations already read, with ``context`` saying how (default: raw text); or texts,
-        which the probe reads with its model: as replies to ``as_reply_to`` (one user turn, or one
-        per text), which is how generated completions are read, or with ``role`` /
-        ``system_prompt`` / ``prompt``, as :meth:`score_texts` reads them. ``baseline=True`` sets the
-        zero at ``neg``'s mean instead of the midpoint. Call :meth:`save` to keep it.
-        """
-        self._require_trained()
-        if isinstance(pos, np.ndarray) or hasattr(pos, "data"):
-            ctx = ReadContext() if context is None else (
-                context if isinstance(context, ReadContext) else ReadContext.from_dict(context))
-            scores = {"pos": self.project(pos), "neg": self.project(neg)}
-            if neutral is not None:
-                scores["neutral"] = self.project(neutral)
-            tokens: Dict[str, Optional[List[np.ndarray]]] = {"pos": None, "neg": None}
-        else:
-            ctx, scores, tokens = self._read_for_calibration(pos, neg, neutral, as_reply_to, role, system_prompt,
-                                                             prompt, batch_size)
-        cal = Calibration.from_scores(scores["pos"], scores["neg"], ctx, pos_tokens=tokens["pos"],
-                                      neg_tokens=tokens["neg"], zero="baseline" if baseline else "midpoint",
-                                      source="calibrate()")
-        layer = int(self.layer)
-        cal.add_threshold(scores["pos"][:, layer], scores["neg"][:, layer], layer, "the calibration items")
-        if "neutral" in scores:
-            cal.add_neutral(scores["neutral"])
-        self.calibrations = [c for c in self.calibrations if not c.context.matches(ctx)] + [cal]
-        self.logger.log("calibrate", {"context": ctx.to_dict(), "n_pos": cal.n_pos, "n_neg": cal.n_neg})
-        return cal
-
-    def _read_for_calibration(self, pos_texts, neg_texts, neutral_texts, as_reply_to, role, system_prompt, prompt,
-                              batch_size):
-        self._require_model("calibrating on texts")
-        tokenizer, model = self.model_bundle.tokenizer, self.model_bundle.model
-        sys_prompt = self.config["prompts"].get("neutral_system") if system_prompt is None else system_prompt
-
-        def encode(texts: List[PromptLike], label: str) -> List[Encoded]:
-            if as_reply_to is None:
-                sp = self._system_for(role, system_prompt, prompt)
-                return [encode_text(tokenizer, t, sp, role=role, prompt=prompt, warn=self._warn,
-                                    warn_prefix=f"calibrate.{label}[{i}]") for i, t in enumerate(texts)]
-            turns = [as_reply_to] * len(texts) if isinstance(as_reply_to, str) else list(as_reply_to)
-            if len(turns) != len(texts):
-                raise ValueError(f"as_reply_to has {len(turns)} turns for {len(texts)} {label} texts.")
-            out = []
-            for turn, text in zip(turns, texts):
-                messages, _ = _normalize_messages(turn, sys_prompt)
-                ids, plen = _completion_input_ids(tokenizer, messages, str(text))
-                out.append(Encoded(ids[0], plen, int(ids.shape[-1])))
-            return out
-
-        ctx = (ReadContext.generated() if as_reply_to is not None else
-               ReadContext(kind="text", role=role, system=self._system_for(role, system_prompt, prompt),
-                           prompt=prompt, readout="assistant_all_mean"))
-        bs = int(batch_size or self.config.get("readout", {}).get("batch_size", 16))
-        scores, tokens = {}, {}
-        for label, texts in (("pos", pos_texts), ("neg", neg_texts), ("neutral", neutral_texts or [])):
-            if not texts:
-                continue
-            reps = _read(model, tokenizer, encode(list(texts), label), [Readout.parse("assistant_all_mean")],
-                         batch_size=bs, project_on=self.directions, cache=self._rep_cache_dir() or False,
-                         identity=self.identity, label=f"calibrate.{label}")[0]
-            announce(reps.choices, console=self.console is not None and self.console.enabled, logger=self.logger)
-            scores[label] = np.einsum("nld,ld->nl", reps.data, self.directions)
-            tokens[label] = reps.projections
-        return ctx, scores, tokens
-
-    def _system_for(self, role: str, system_prompt: Optional[str], prompt: Optional[str]) -> Optional[str]:
-        """The system prompt for reading texts with ``role``; raises on settings ``role`` would ignore."""
-        if role not in TEXT_ROLES:
-            raise ValueError(f"role must be one of {TEXT_ROLES}; got {role!r}")
-        if role == "raw":
-            if system_prompt or prompt is not None:
-                raise ValueError("role='raw' reads each text alone; system_prompt and prompt would be ignored.")
-            return None
-        if role == "user" and prompt is not None:
-            raise ValueError("prompt is a user turn before the text, so it only applies to role='assistant'.")
-        return self.config["prompts"].get("neutral_system") if system_prompt is None else system_prompt
-
-    def _token_scorer(self, *, generated: bool = False, context: Optional[Dict[str, Any]] = None,
-                      layer_selection: Optional[Dict[str, Any]] = None, vectors: Optional[np.ndarray] = None,
-                      reference_layer: Optional[int] = None) -> TokenScorer:
-        """How this probe scores tokens read in ``context`` (or as generated completions): its
-        directions at its scoring layers (``evaluation.layer_selection``), combined as
-        ``evaluation.score_aggregate``, with the calibration for that context. ``vectors`` replaces
-        the directions (a random control: then there is no calibration); ``reference_layer`` reads
-        every layer with that one layer's direction (a logit-lens-style read, also without one)."""
-        layers = self._layer_selection(layer_selection)
-        V = np.asarray(self.directions if vectors is None else vectors, dtype=np.float32)
-        if reference_layer is not None:
-            ref = resolve_layer_index(reference_layer, V.shape[0], "reference_layer")
-            rows = np.stack([V[ref] for _ in layers])
-        else:
-            rows = V[layers]
-        own = vectors is None and reference_layer is None
-        cal = self.calibration_for(GENERATED_CONTEXT if generated else context) if own else None
-        return TokenScorer(str(self.concept.name), list(layers), rows,
-                           self.config["evaluation"]["score_aggregate"], cal)
-
-    def score_texts(
-        self,
-        texts: List[PromptLike],
-        system_prompt: Optional[str] = None,
-        layer_selection: Optional[Dict[str, Any]] = None,
-        output_subdir: str = "scores",
-        save_html: Optional[bool] = None,
-        batch_subdir: Optional[str] = None,
-        reference_layer: Optional[int] = None,
-        role: str = "raw",
-        prompt: Optional[str] = None,
-        overwrite: bool = False,
-        batch_size: Optional[int] = None,
-        save: Optional[bool] = None,
-    ) -> Scores:
-        """Score every token of each text with the probe, in batches; returns :class:`Scores`.
-
-        By default each text is read raw: the BOS token and the text, with no chat template and
-        no system prompt. ``role="user"`` reads it as a user turn (a message list is read as
-        given) after ``system_prompt``, or ``prompts.neutral_system`` if that is set;
-        ``role="assistant"`` reads it as the model's reply, after that system prompt and an
-        optional user turn ``prompt``. :func:`preview_input` shows the exact input; each item's
-        ``info`` has it as ``input_text``, and its ``span`` is the text's own tokens.
-
-        Each item has raw projections per token and layer, their combination per token and, where
-        the probe has a calibration for texts read this way, token z scores (0 is the midpoint
-        between the poles, which is not "without the concept"; 1 the within-pole SD of single
-        tokens). ``score_mean`` is the text's mean token score and ``score_mean_z`` its z with the
-        per-item references. Without such a calibration only raw projections are given, and
-        ``z_missing`` says why. ``reference_layer`` reads every layer with one layer's direction.
-
-        Saved by default (``save``, or the session's setting) to
-        ``<run_dir>/<output_subdir>/<batch_subdir>``: ``scores.npz``, ``scores.jsonl``,
-        ``heatmaps.html`` and ``settings.json`` (see :class:`concept_probe.scoring.Scores`).
-        """
-        self._require_model("score_texts")
-        tokenizer, model = self.model_bundle.tokenizer, self.model_bundle.model
-        sys_prompt = self._system_for(role, system_prompt, prompt)
-        read_context = _text_context(role, sys_prompt, prompt, "assistant_all_mean")
-        save_html = self.config["plots"].get("heatmap_html", True) if save_html is None else save_html
-        scorer = self._token_scorer(context=read_context, layer_selection=layer_selection,
-                                    reference_layer=reference_layer)
-        z_missing = None
-        if reference_layer is None and scorer.calibration is None:
-            z_missing = self._missing_z_reason(read_context)
-            self._warn(f"score_texts: only raw projections are given: {z_missing}")
-        elif scorer.calibration is None:
-            z_missing = "read with one layer's direction"
-
-        inputs = []
-        for i, text in enumerate(texts):
-            input_ids, start, end = _encode_text_for_read(tokenizer, text, sys_prompt, role=role, prompt=prompt,
-                                                          warn=self._warn, warn_prefix=f"score_texts.texts[{i}]")
-            ids = input_ids[0]
-            span = (0, 0) if start is None else (int(start), int(end))
-            info = {"input": text, "role": role, "system_prompt": sys_prompt,
-                    "system_prompt_overridden": _has_system_message(text),
-                    "input_text": tokenizer.decode(ids.tolist(), skip_special_tokens=False),
-                    "text_span": None if start is None else [int(start), int(end)]}
-            inputs.append(ScoreInput(ids, span, _prompt_to_text(text), i, info))
-        bs = int(batch_size or self.config["readout"].get("batch_size", 16))
-        self._status(f"Scoring {len(texts)} texts")
-        items = score_inputs(model, tokenizer, inputs, [scorer], batch_size=bs)
-        run_settings = {"role": role, "system_prompt": sys_prompt, "prompt": prompt, "layers": scorer.layers,
-                        "aggregate": scorer.aggregate, "reference_layer": reference_layer, "batch_size": bs,
-                        "calibration": None if scorer.calibration is None else scorer.calibration.context.to_dict()}
-        result = Scores("texts", [scorer.name], items, run_settings, {scorer.name: z_missing})
-        if settings().save if save is None else save:
-            out = batch_dir(os.path.join(self._ensure_run_dir(), output_subdir), batch_subdir, overwrite)
-            result.save(out, html=save_html)
-            self._status(f"Saved the scores of {len(items)} texts to {out}")
-        self.logger.log("score_texts", {"n_texts": len(items), "dir": result.dir, **run_settings})
-        return result
-
-    def _steer_sigma(self) -> Optional[float]:
-        """The unit of alpha_unit="sigma": the eval items' pooled within-pole SD on the steering
-        direction at the probe's layer (decision D1)."""
-        sigma = self.steer_sigma
-        return None if sigma is None or not np.isfinite(sigma) else float(sigma)
-
-    def _check_alpha_unit(self, alpha_unit: str) -> None:
-        """Raise if the probe lacks the reference that ``alpha_unit`` scales by."""
-        if alpha_unit == "sigma" and self._steer_sigma() is None:
-            raise ValueError("alpha_unit='sigma' needs the probe's steering unit (steer_sigma), which comes from "
-                             "evaluation or calibration items; this probe has none.")
-        if alpha_unit == "resid_norm" and self.resid_norm is None:
-            raise ValueError("resid_norm is not available for alpha_unit='resid_norm'; re-train the probe.")
-
-    def _steering_alpha(
-        self, alpha: float, alpha_unit: str, steer_layers: List[int]
-    ) -> Tuple[float, Optional[Dict[int, float]]]:
-        """The alpha to inject, and per-layer scales of it, for ``alpha`` in ``alpha_unit``."""
-        value = float(alpha)
-        if alpha_unit == "sigma" and abs(value) > 1e-12:
-            return value * float(self._steer_sigma()), None
-        if alpha_unit == "resid_norm":
-            return value, {li: float(self.resid_norm[li]) for li in steer_layers}
-        return value, None
-
-    def steer_layer_list(self, steer_layers: Optional[Union[str, List[int]]] = None,
-                         window_radius: Optional[int] = None) -> List[int]:
-        """The layers :meth:`steering` steers: ``steering.steer_layers`` (``"probe"``, ``"window"`` of
-        ``steering.steer_window_radius`` around the probe's layer, or a list), or the arguments."""
-        self._require_trained()
-        cfg = self.config["steering"]
-        return _resolve_steer_layers(cfg["steer_layers"] if steer_layers is None else steer_layers, int(self.layer),
-                                     cfg["steer_window_radius"] if window_radius is None else window_radius,
-                                     self.num_layers)
-
-    def steering(
-        self,
-        alpha: float,
-        unit: str = "raw",
-        *,
-        layers: Optional[Union[str, List[int]]] = None,
-        window_radius: Optional[int] = None,
-        distribute: Optional[bool] = None,
-        positions: Any = None,
-        vectors: Optional[np.ndarray] = None,
-    ) -> Add:
-        """The intervention that steers with this probe: an :class:`~concept_probe.interventions.Add`
-        of ``alpha_l * v_l`` at each steered layer ``l``, where ``v_l`` is the probe's steering
-        direction at that layer (``steer_directions``; decision D1) and ``alpha`` is in ``unit``:
-
-        - ``"raw"``: as is;
-        - ``"sigma"``: times ``steer_sigma``, the eval items' pooled within-pole SD on the steering
-          direction at the probe's layer (a scale knob, not literally "n standard deviations of
-          behavior");
-        - ``"resid_norm"``: times each layer's mean residual norm on the training tokens, so 0.1
-          adds 10% of a typical token's norm.
-
-        ``layers`` defaults to ``steering.steer_layers`` (see :meth:`steer_layer_list`); with
-        several layers and ``distribute`` (``steering.steer_distribute``), alpha is divided among
-        them. ``positions`` restricts it to some tokens (see :mod:`concept_probe.interventions`),
-        ``vectors`` replaces the directions (a random control). Use it with
-        :func:`concept_probe.intervene`, :func:`concept_probe.generate` or
-        :func:`concept_probe.answer_logprobs`; the added vector compounds through later layers.
-        """
-        unit = _validate_alpha_unit(unit)
-        steer_layers = self.steer_layer_list(layers, window_radius)
-        distribute = self.config["steering"]["steer_distribute"] if distribute is None else bool(distribute)
-        if abs(float(alpha)) > 1e-12:
-            self._check_alpha_unit(unit)
-        value, scales = self._steering_alpha(alpha, unit, steer_layers)
-        per = value / len(steer_layers) if distribute else value
-        alphas = {l: float(per * (1.0 if scales is None else scales[l])) for l in steer_layers}
-        V = self.steer_directions if vectors is None else vectors
-        return Add({l: np.asarray(V[l], dtype=np.float32) for l in steer_layers}, alpha=alphas, positions=positions,
-                   label=f"steering with {self.concept.name!r}: alpha {float(alpha):g} ({unit})")
-
-    def score_prompts(
-        self,
-        prompts: List[PromptLike],
-        system_prompt: Optional[str] = None,
-        max_new_tokens: Optional[int] = None,
-        greedy: Optional[bool] = None,
-        temperature: Optional[float] = None,
-        top_p: Optional[float] = None,
-        layer_selection: Optional[Dict[str, Any]] = None,
-        output_subdir: str = "scores",
-        alphas: Optional[List[float]] = None,
-        alpha_unit: str = "raw",
-        steer_layers: Optional[Union[str, List[int]]] = None,
-        steer_window_radius: Optional[int] = None,
-        steer_distribute: Optional[bool] = None,
-        save_html: Optional[bool] = None,
-        save_segments: Optional[bool] = None,
-        keep_logits: Union[None, int, str] = None,
-        batch_subdir: Optional[str] = None,
-        n_random: int = 0,
-        random_seed: Optional[int] = None,
-        seed: Optional[int] = None,
-        overwrite: bool = False,
-        batch_size: Optional[int] = None,
-        on_token: Optional[Callable[[TokenStep], Any]] = None,
-        save: Optional[bool] = None,
-    ) -> Scores:
-        """Generate completions (steered with this probe at each of ``alphas``) and score them.
-
-        Each prompt is a user turn of the chat template, after ``system_prompt`` (or
-        ``prompts.neutral_system``) if one is set; by default there is none.
-        :func:`preview_input` with ``generation=True`` shows the exact input. For each alpha, the
-        prompts are generated ``batch_size`` at a time (``steering.gen_batch_size``) under
-        :meth:`steering` with that alpha (``alpha_unit``, ``steer_layers``, ``steer_window_radius``,
-        ``steer_distribute``); then every completion is read again without the intervention (with
-        it, an added vector reads itself back) and scored. Items come in the order of the prompts,
-        each prompt's alphas in the order given; ``info`` has the alpha, the alpha applied at each
-        layer (``steer_alpha_per_layer``) and the intervention.
-
-        ``score_mean`` averages the completion's tokens, up to and not including the
-        end-of-sequence token; ``score_mean_z`` standardizes that mean with the calibration for
-        generated completions (0 is the midpoint between the poles, not "without the concept"; 1
-        their pooled within-pole SD), and the token z scores use its per-token references.
-
-        Generation is greedy by default (``steering.steer_sampling``). When sampling, the
-        generators are seeded with ``seed``, or else ``random.seed``, so completions are
-        reproducible for the same batch size (best-effort: GPU kernels are not bit-deterministic).
-        ``n_random`` adds, at each non-zero alpha, that many random controls: the same steering with
-        a random direction of the same length at each layer (control ``k`` is the same direction at
-        every alpha; ``random_seed``, else ``random.seed``, seeds them). Their items have
-        ``info["control"] = k`` (None for the probe's own steering). To compare the steering with
-        them, see :func:`concept_probe.evaluate_steering`.
-        ``on_token`` gets each step's scores while generating (see :func:`concept_probe.generate`);
-        ``keep_logits`` keeps the steered model's logits of each generated token (``"all"`` or the
-        top ``k``, default ``output.generation_logits``).
-
-        Saved by default like :meth:`score_texts`; ``save_segments`` adds each message's mean score
-        to the lines of ``scores.jsonl``.
-        """
-        self._require_model("score_prompts")
-        save_html = self.config["plots"].get("heatmap_html", True) if save_html is None else save_html
-        result = _score_generations(
-            [self], prompts, steer=self, alphas=alphas, alpha_unit=alpha_unit, steer_layers=steer_layers,
-            steer_window_radius=steer_window_radius, steer_distribute=steer_distribute, system_prompt=system_prompt,
-            max_new_tokens=max_new_tokens, greedy=greedy, temperature=temperature, top_p=top_p, seed=seed,
-            batch_size=batch_size, layer_selection=layer_selection, n_random=n_random, random_seed=random_seed,
-            keep_logits=keep_logits, on_token=on_token, warn=self._warn, status=self._status,
-        )
-        if settings().save if save is None else save:
-            out = batch_dir(os.path.join(self._ensure_run_dir(), output_subdir), batch_subdir, overwrite)
-            result.save(out, html=save_html, segments=bool(save_segments))
-            self._status(f"Saved the scores of {len(result)} generations to {out}")
-        self.logger.log("score_prompts", {"n_generations": len(result), "dir": result.dir, **result.settings})
-        return result
 
     @classmethod
     def load(cls, run_dir: str, model: Any = None, tokenizer: Any = None, *,
              allow_model_mismatch: bool = False) -> "ConceptProbe":
-        """A probe saved in ``run_dir`` (by training, :meth:`fit`, :meth:`from_directions` or
-        :meth:`save`), with ``model`` attached if given (see :meth:`attach`). Runs saved by earlier
-        versions load too."""
+        """A probe saved in ``run_dir`` (by :meth:`save`, or a training run of an earlier version),
+        with ``model`` attached if given (see :meth:`attach`)."""
+        if os.path.exists(os.path.join(run_dir, "probe.json")):
+            obj = cls._load_probe(run_dir)
+        else:
+            obj = cls._load_old_run(run_dir)
+        obj.run_dir = run_dir
+        if model is not None:
+            obj.attach(model, tokenizer, allow_model_mismatch=allow_model_mismatch)
+        return obj
+
+    @classmethod
+    def _load_probe(cls, run_dir: str) -> "ConceptProbe":
+        with open(os.path.join(run_dir, "probe.json"), "r", encoding="utf-8") as f:
+            d = json.load(f)
+        with np.load(os.path.join(run_dir, "probe.npz")) as z:
+            arrays = {k: z[k] for k in z.files}
+        obj = cls(name=d["name"], pos_label=d["pos_label"], neg_label=d["neg_label"])
+        obj.directions = arrays["directions"]
+        obj.steer_directions = arrays.get("steer_directions", obj.directions)
+        obj.layer = int(d["layer"])
+        obj.score_layers, obj.score_aggregate = d.get("score_layers"), d.get("score_aggregate", "mean")
+        obj.identity, obj.estimator, obj.steer_estimator = d.get("identity"), d.get("estimator"), d.get("steer_estimator")
+        obj.steer_sigma = d.get("steer_sigma")
+        obj.calibrations = [Calibration.from_dict(c) for c in d.get("calibrations", [])]
+        obj.metrics = d.get("metrics") or {}
+        obj.choices = [Choice(**c) for c in d.get("choices", [])]
+        obj.resid_norm, obj.sweep_d, obj.sweep_p = (arrays.get(k) for k in ("resid_norm", "sweep_d", "sweep_p"))
+        return obj
+
+    @classmethod
+    def _load_old_run(cls, run_dir: str) -> "ConceptProbe":
+        """A training run of an earlier version: ``config.json``, ``concept.json``, ``metrics.json``
+        and ``tensors.npz``, in the names of then."""
         with open(os.path.join(run_dir, "config.json"), "r", encoding="utf-8") as f:
             cfg = upgrade_saved_config(json.loads(f.read()))
         with open(os.path.join(run_dir, "concept.json"), "r", encoding="utf-8") as f:
-            concept = ConceptSpec.from_config({"concept": json.loads(f.read())})
+            concept = json.loads(f.read())
         metrics: Dict[str, Any] = {}
         if os.path.exists(os.path.join(run_dir, "metrics.json")):
             with open(os.path.join(run_dir, "metrics.json"), "r", encoding="utf-8") as f:
                 metrics = json.loads(f.read())
         with np.load(os.path.join(run_dir, "tensors.npz")) as t:
             tensors = {k: t[k] for k in t.files}
-        out_cfg = cfg.get("output", {})
-        obj = cls(config=cfg, concept=concept, run_dir=run_dir,
-                  logger=JsonlLogger(os.path.join(run_dir, "log.jsonl"), enabled=bool(out_cfg.get("log_jsonl", True))),
-                  console=ConsoleLogger(bool(out_cfg.get("console", True))))
+        obj = cls(name=concept.get("name", "concept"), pos_label=concept.get("pos_label", "positive"),
+                  neg_label=concept.get("neg_label", "negative"))
         obj.directions = tensors["concept_vectors"]
         obj.layer = int(tensors["best_layer"][0])
         obj.sweep_d, obj.sweep_p = tensors.get("sweep_d"), tensors.get("sweep_p")
@@ -1966,6 +486,19 @@ class ConceptProbe:
         obj.calibrations = calibrations_from_tensors(tensors)
         obj.identity = metrics.get("model_identity") or identity_from_config(cfg.get("model", {}))
         obj.estimator = metrics.get("estimator") or estimator_spec(cfg.get("training", {}).get("estimator", "mean_diff"))
+        evaluation = cfg.get("evaluation", {})
+        selection = evaluation.get("layer_selection") or {"mode": "best"}
+        num_layers = int(np.asarray(obj.directions).shape[0])
+        mode = selection.get("mode", "best")
+        if mode == "window":
+            obj.score_layers = _window(obj.layer, selection.get("window_radius", 0), num_layers)[0]
+        elif mode == "explicit":
+            obj.score_layers = _layer_list(selection.get("layers", []), num_layers, "layer_selection.layers")
+        elif mode == "all":
+            obj.score_layers = list(range(num_layers))
+        obj.score_aggregate = evaluation.get("score_aggregate", "mean")
+        obj.metrics = {k: metrics.get(k) for k in ("best_layer", "best_d", "best_p", "best_d_ci95", "best_auroc",
+                                                   "null_d95_at_best_layer", "selection") if k in metrics}
         if "steer_vectors" in tensors:
             obj.steer_directions = tensors["steer_vectors"]
             if np.array_equal(obj.steer_directions, obj.directions):
@@ -1977,352 +510,438 @@ class ConceptProbe:
             obj.steer_directions, obj.steer_estimator = obj.directions, obj.estimator
             sigma = float(tensors["score_scale"][obj.layer]) if "score_scale" in tensors else float("nan")
             if obj.estimator != {"kind": "mean_diff", "normalization": "none"}:
-                announce([Choice("steering.steer_direction", "mean_diff", "the run's reading direction",
-                                 f"this run ({obj.estimator}) was saved before steering had its own direction, so it "
-                                 "steers with the one it reads with; retrain it to steer with the raw difference of means")],
-                         console=obj.console.enabled, logger=obj.logger)
+                obj.choices.append(Choice(
+                    "steering direction", "mean_diff", "the run's reading direction",
+                    f"this run ({obj.estimator}) was saved before steering had its own direction, so it steers with "
+                    "the one it reads with; refit it to steer with the raw difference of means"))
+                announce(obj.choices)
         obj.steer_sigma = sigma if np.isfinite(sigma) else None
-        if model is not None:
-            obj.attach(model, tokenizer, allow_model_mismatch=allow_model_mismatch)
         return obj
 
+    # ------------------------------------------------------------------ reading arrays
+    @property
+    def num_layers(self) -> int:
+        self._require_trained()
+        return int(np.asarray(self.directions).shape[0])
 
-def _shared_setting(probes: List["ConceptProbe"], section: str, key: str, explicit: Any, argument: str) -> Any:
-    """A setting a call over several probes uses: ``explicit`` if given, else the probes' common
-    config value. Probes whose configs disagree raise, instead of the first one's value being used."""
-    if explicit is not None:
-        return explicit
-    values = [probe.config.get(section, {}).get(key) for probe in probes]
-    if any(v != values[0] for v in values[1:]):
-        named = ", ".join(f"{p.concept.name}={v!r}" for p, v in zip(probes, values))
-        raise ValueError(f"The probes disagree on {section}.{key} ({named}); pass {argument}= to choose one.")
-    return values[0]
+    def _score_layers(self) -> List[int]:
+        return [int(self.layer)] if not self.score_layers else [int(l) for l in self.score_layers]
+
+    def project(self, reps: Any) -> np.ndarray:
+        """Each row's projection on each layer's reading direction: ``(rows, layers)``, from
+        representations ``(rows, layers, dim)`` (an array, or what :func:`read_texts` returns)."""
+        self._require_trained()
+        R = _as_array(reps)
+        if R.shape[1:] != np.asarray(self.directions).shape:
+            raise ValueError(f"representations of shape {R.shape[1:]} (layers, dim) do not fit the probe's directions "
+                             f"{np.asarray(self.directions).shape}; read every layer")
+        return np.einsum("nld,ld->nl", R.astype(np.float64), np.asarray(self.directions, dtype=np.float64))
+
+    def scores(self, reps: Any, *, per_text: Optional[str] = None) -> np.ndarray:
+        """Each item's raw score: its projection at the probe's score layers (the probe's layer by
+        default), combined as ``score_aggregate``. The offset is arbitrary; see :meth:`z`.
+
+        For representations read token by token (a ``*_tokens`` readout), ``per_text`` summarizes
+        each text's token scores into one (see :func:`summarize_tokens`: ``"mean"``, ``"max"``,
+        ``"min"``, ``"median"``, ``"p90"``, ``"extreme"``); without it, every token gets a score."""
+        layers = self._score_layers()
+        proj = self.project(reps)[:, layers]
+        out = proj.mean(axis=1) if self.score_aggregate == "mean" else proj.sum(axis=1)
+        return self._per_text(out, reps, per_text, 0.0)
+
+    def _per_text(self, values: np.ndarray, reps: Any, per_text: Optional[str], center: float) -> np.ndarray:
+        if per_text is None:
+            return values
+        items = getattr(reps, "items", None)
+        if items is None or getattr(getattr(reps, "readout", None), "agg", None) != "tokens":
+            raise ValueError("per_text summarizes token scores: read the texts with a *_tokens readout")
+        return summarize_tokens(values, items, per_text, center)[0]
+
+    def z(self, reps: Any, context: Optional[Union[ReadContext, Dict[str, Any]]] = None, *, unit: str = "sd",
+          per_text: Optional[str] = None) -> np.ndarray:
+        """Each item's z score, with the calibration of how the items were read (``context``; by
+        default what the representations say, or the only calibration). ``unit="sd"``: 0 is the
+        calibration's zero (the midpoint between the poles, which is not "without the concept"; or
+        the baseline's mean), 1 its within-pole SD. ``unit="poles"``: 0 the same zero, +1 the
+        positive pole's mean (and -1 the negative's, with a midpoint). ``per_text`` summarizes the
+        z of each text's tokens (see :meth:`scores`; single tokens get the calibration's per-item
+        references). Raises when there is no calibration for that reading, or when the items were
+        pooled another way than the calibration's items."""
+        if unit not in Z_UNITS:
+            raise ValueError(f"unit must be one of {Z_UNITS}; got {unit!r}")
+        cal = self._calibration_of(reps, context, tokens=per_text is not None)
+        layers = self._score_layers()
+        z = cal.items_z(self.project(reps)[:, layers], layers, self.score_aggregate, unit=unit)
+        if z is None:
+            raise ValueError(f"the calibration for items read {cal.context.describe()} has no usable references "
+                             f"{'in poles units ' if unit == 'poles' else ''}at layers {layers}.")
+        return self._per_text(z, reps, per_text, 0.0)
+
+    def _calibration_of(self, reps: Any, context: Any, tokens: bool = False) -> Calibration:
+        """The calibration for ``reps``: of ``context``, or of the context the reps record; and the
+        check that they were pooled like the calibration's items."""
+        ctx = context if context is not None else getattr(reps, "context", None)
+        cal = self.calibration_for(ctx)
+        if cal is None and context is None and len(self.calibrations) == 1 and ctx is not None:
+            raise ValueError(self._missing_z_reason(ctx))
+        if cal is None:
+            raise ValueError(self._missing_z_reason(ctx))
+        readout = getattr(getattr(reps, "readout", None), "name", None)
+        if readout is not None and not tokens and cal.context.readout and readout != cal.context.readout:
+            raise ValueError(f"these items were read with {readout!r} and the calibration's with "
+                             f"{cal.context.readout!r}: their z would not be comparable; calibrate on items read the "
+                             "same way (probe.calibrate).")
+        return cal
+
+    def classify(self, reps: Any, context: Optional[Union[ReadContext, Dict[str, Any]]] = None
+                 ) -> Tuple[np.ndarray, np.ndarray]:
+        """Whether each item belongs to the positive pole, and the probability, from the calibrated
+        threshold (not from z = 0, which is the midpoint, not the best cut)."""
+        cal = self._calibration_of(reps, context)
+        if not cal.threshold:
+            raise ValueError("That calibration has no threshold; calibrate again to fit one.")
+        t = cal.threshold
+        prob = sigmoid(t["slope"] * self.project(reps)[:, int(t["layer"])] + t["intercept"])
+        return prob >= 0.5, prob
+
+    def accuracy(self, pos: Any, neg: Any, *, cut: str = "threshold",
+                 context: Optional[Union[ReadContext, Dict[str, Any]]] = None, n_bootstrap: int = 1000,
+                 paired: bool = False, seed: int = 0) -> Dict[str, Any]:
+        """The share of items of each pole on the right side of a cut, with a bootstrap 95% interval:
+        ``cut="threshold"`` (the calibrated threshold) or ``"zero"`` (z = 0: the midpoint between
+        the poles of the calibration, or the baseline)."""
+        if cut == "threshold":
+            right = np.r_[self.classify(pos, context)[0], ~self.classify(neg, context)[0]]
+        elif cut == "zero":
+            right = np.r_[self.z(pos, context) > 0, self.z(neg, context) <= 0]
+        else:
+            raise ValueError(f"cut must be 'threshold' or 'zero'; got {cut!r}")
+        n_pos = len(_as_array(pos))
+        a, b = right[:n_pos].astype(float), right[n_pos:].astype(float)
+        share = lambda x, y: float(np.r_[x, y].mean())  # noqa: E731
+        ci = bootstrap_ci(share, a, b, int(n_bootstrap), np.random.default_rng(seed), paired=paired)
+        return {"accuracy": float(right.mean()), "ci95": ci, "cut": cut, "n": int(len(right))}
+
+    # ------------------------------------------------------------------ calibrations
+    def calibration_for(self, context: Optional[Union[ReadContext, Dict[str, Any]]] = None) -> Optional[Calibration]:
+        """The calibration measured on items read like ``context`` (a :class:`ReadContext` or its
+        dict); with no context, the only calibration if there is one."""
+        if context is None:
+            return self.calibrations[0] if len(self.calibrations) == 1 else None
+        target = context if isinstance(context, ReadContext) else ReadContext.from_dict(context)
+        return next((c for c in self.calibrations if c.context.matches(target)), None)
+
+    def _missing_z_reason(self, context: Optional[Union[ReadContext, Dict[str, Any]]]) -> str:
+        have = "; ".join(c.context.describe() for c in self.calibrations) or "in no context"
+        if context is None:
+            return (f"the probe has {len(self.calibrations)} calibrations (items read {have}); say which reading "
+                    "context the items come from (context=...).")
+        target = context if isinstance(context, ReadContext) else ReadContext.from_dict(context)
+        return (f"the probe has no calibration for items read {target.describe()} (it has one for items read "
+                f"{have}); z scores from another reading context are not comparable. Add one with "
+                "probe.calibrate(pos, neg, ...).")
+
+    def calibrate(
+        self,
+        pos: Any,
+        neg: Any,
+        *,
+        context: Optional[Union[ReadContext, Dict[str, Any]]] = None,
+        as_reply_to: Optional[Union[str, List[str]]] = None,
+        role: str = "raw",
+        system: Optional[str] = None,
+        prompt: Optional[str] = None,
+        neutral: Any = None,
+        baseline: bool = False,
+        threshold_l2: float = 1e-2,
+        batch_size: int = 16,
+    ) -> Calibration:
+        """Measure a calibration on items of each pole, so items read the same way get z scores and
+        a calibrated threshold. It replaces any calibration for the same reading context.
+
+        ``pos`` / ``neg`` (and ``neutral``, texts without the concept, whose place is recorded) are
+        representations already read, with ``context`` saying how (default: what they record, or raw
+        text); or texts, which the probe reads with its model: as replies to ``as_reply_to`` (one
+        user turn, or one per text), after ``system`` if given, which is how generated completions
+        are read; or with ``role`` / ``system`` / ``prompt``, as :meth:`score_texts` reads them.
+        Texts also give single tokens their references. ``baseline=True`` sets the zero at ``neg``'s
+        mean instead of the midpoint. Call :meth:`save` to keep it.
+        """
+        self._require_trained()
+        if isinstance(pos, np.ndarray) or hasattr(pos, "data"):
+            ctx = context if context is not None else getattr(pos, "context", None)
+            ctx = ReadContext() if ctx is None else (ctx if isinstance(ctx, ReadContext) else ReadContext.from_dict(ctx))
+            scores = {"pos": self.project(pos), "neg": self.project(neg)}
+            if neutral is not None:
+                scores["neutral"] = self.project(neutral)
+            tokens: Dict[str, Optional[List[np.ndarray]]] = {"pos": None, "neg": None}
+        else:
+            ctx, scores, tokens = self._read_for_calibration(pos, neg, neutral, as_reply_to, role, system, prompt,
+                                                             batch_size)
+        cal = Calibration.from_scores(scores["pos"], scores["neg"], ctx, pos_tokens=tokens["pos"],
+                                      neg_tokens=tokens["neg"], zero="baseline" if baseline else "midpoint",
+                                      source="calibrate()")
+        layer = int(self.layer)
+        cal.add_threshold(scores["pos"][:, layer], scores["neg"][:, layer], layer, "the calibration items",
+                          l2=threshold_l2)
+        if "neutral" in scores:
+            cal.add_neutral(scores["neutral"])
+        self.calibrations = [c for c in self.calibrations if not c.context.matches(ctx)] + [cal]
+        return cal
+
+    def _read_for_calibration(self, pos_texts, neg_texts, neutral_texts, as_reply_to, role, system, prompt,
+                              batch_size):
+        self._require_model("calibrating on texts")
+        tokenizer, model = self.model_bundle.tokenizer, self.model_bundle.model
+
+        def encode(texts: List[PromptLike], label: str) -> List[Encoded]:
+            if as_reply_to is None:
+                return [encode_text(tokenizer, t, system, role=role, prompt=prompt, warn=_warn,
+                                    warn_prefix=f"calibrate.{label}[{i}]") for i, t in enumerate(texts)]
+            turns = [as_reply_to] * len(texts) if isinstance(as_reply_to, str) else list(as_reply_to)
+            if len(turns) != len(texts):
+                raise ValueError(f"as_reply_to has {len(turns)} turns for {len(texts)} {label} texts.")
+            out = []
+            for turn, text in zip(turns, texts):
+                messages, _ = _normalize_messages(turn, system)
+                ids, plen = _completion_input_ids(tokenizer, messages, str(text))
+                out.append(Encoded(ids[0], plen, int(ids.shape[-1])))
+            return out
+
+        if role not in TEXT_ROLES:
+            raise ValueError(f"role must be one of {TEXT_ROLES}; got {role!r}")
+        ctx = (ReadContext.generated("text_mean", system) if as_reply_to is not None else
+               ReadContext(kind="text", role=role, system=None if role == "raw" else system,
+                           prompt=prompt if role == "assistant" else None, readout="text_mean"))
+        scores, tokens = {}, {}
+        for label, texts in (("pos", pos_texts), ("neg", neg_texts), ("neutral", neutral_texts or [])):
+            if not texts:
+                continue
+            reps = _read(model, tokenizer, encode(list(texts), label), [Readout.parse("text_mean")],
+                         batch_size=batch_size, project_on=self.directions, cache=False,
+                         label=f"calibrate.{label}")[0]
+            announce(reps.choices)
+            scores[label] = np.einsum("nld,ld->nl", reps.data, self.directions)
+            tokens[label] = reps.projections
+        return ctx, scores, tokens
+
+    # ------------------------------------------------------------------ with the model
+    def _token_scorer(self, context: Optional[Union[ReadContext, Dict[str, Any]]] = None, *,
+                      vectors: Optional[np.ndarray] = None, reference_layer: Optional[int] = None) -> TokenScorer:
+        """How this probe scores tokens read in ``context``: its directions at its score layers,
+        combined as ``score_aggregate``, with the calibration for that context. ``vectors`` replaces
+        the directions (a random control: then there is no calibration); ``reference_layer`` reads
+        every layer with that one layer's direction (a logit-lens-style read, also without one)."""
+        layers = self._score_layers()
+        V = np.asarray(self.directions if vectors is None else vectors, dtype=np.float32)
+        if reference_layer is not None:
+            ref = resolve_layer_index(reference_layer, V.shape[0], "reference_layer")
+            rows = np.stack([V[ref] for _ in layers])
+        else:
+            rows = V[layers]
+        own = vectors is None and reference_layer is None
+        cal = self.calibration_for(context) if own and context is not None else None
+        return TokenScorer(str(self.name), list(layers), rows, self.score_aggregate, cal)
+
+    def score_texts(
+        self,
+        texts: List[PromptLike],
+        *,
+        role: str = "raw",
+        system: Optional[str] = None,
+        prompt: Optional[str] = None,
+        reference_layer: Optional[int] = None,
+        batch_size: int = 16,
+        save: Optional[bool] = None,
+        out_dir: Optional[str] = None,
+        html: bool = True,
+    ) -> Scores:
+        """Score every token of each text with the probe, in batches; returns
+        :class:`~concept_probe.scoring.Scores`.
+
+        Each text is read as :func:`concept_probe.read_texts` reads it (``role``, ``system``,
+        ``prompt``; by default alone). Each item has raw projections per token and layer, their
+        combination per token and, where the probe has a calibration for texts read this way,
+        single-token z scores (0 the midpoint between the poles, 1 the within-pole SD of single
+        tokens). ``score_mean`` is the text's mean token score and ``score_mean_z`` its z with the
+        per-item references; without such a calibration only raw projections are given, and
+        ``z_missing`` says why. ``reference_layer`` reads every layer with one layer's direction.
+        ``Scores.per_text`` summarizes each text's tokens another way.
+
+        Saved by default (``save``, or the session's setting) to ``out_dir``, or ``scores/<time>``
+        in the probe's folder (or the session's ``output_root``): ``scores.npz``, ``scores.jsonl``,
+        ``heatmaps.html`` (unless ``html=False``) and ``settings.json``.
+        """
+        self._require_model("score_texts")
+        tokenizer, model = self.model_bundle.tokenizer, self.model_bundle.model
+        if role not in TEXT_ROLES:
+            raise ValueError(f"role must be one of {TEXT_ROLES}; got {role!r}")
+        context = ReadContext(kind="text", role=role, system=None if role == "raw" else system,
+                              prompt=prompt if role == "assistant" else None, readout="text_mean")
+        scorer = self._token_scorer(context, reference_layer=reference_layer)
+        z_missing = None
+        if reference_layer is not None:
+            z_missing = "read with one layer's direction"
+        elif scorer.calibration is None:
+            z_missing = self._missing_z_reason(context)
+            _warn(f"score_texts: only raw projections are given: {z_missing}")
+        elif (scorer.calibration.context.readout or "text_mean") != "text_mean":
+            z_missing = (f"the calibration's items were pooled with {scorer.calibration.context.readout!r}, so a "
+                         "text's mean token score has no z (single tokens still do)")
+        inputs = []
+        for i, text in enumerate(texts):
+            enc = encode_text(tokenizer, text, system, role=role, prompt=prompt, warn=_warn,
+                              warn_prefix=f"score_texts.texts[{i}]")
+            span = (0, 0) if enc.start is None else (int(enc.start), int(enc.end))
+            info = {"input": text, "role": role, "system": system,
+                    "input_text": tokenizer.decode(enc.input_ids.tolist(), skip_special_tokens=False),
+                    "text_span": None if enc.start is None else [int(enc.start), int(enc.end)]}
+            inputs.append(ScoreInput(enc.input_ids, span, _prompt_to_text(text), i, info))
+        items = score_inputs(model, tokenizer, inputs, [scorer], batch_size=int(batch_size))
+        run_settings = {"role": role, "system": system, "prompt": prompt, "layers": scorer.layers,
+                        "aggregate": scorer.aggregate, "reference_layer": reference_layer, "batch_size": int(batch_size),
+                        "calibration": None if scorer.calibration is None else scorer.calibration.context.to_dict()}
+        result = Scores("texts", [scorer.name], items, run_settings, {scorer.name: z_missing})
+        if settings().save if save is None else save:
+            if out_dir is None:
+                root = self.run_dir or os.path.join(self.save_root or settings().output_root, safe_slug(self.name))
+                out_dir = os.path.join(root, "scores", now_tag())
+            ensure_dir(out_dir)
+            result.save(out_dir, html=html)
+        return result
+
+    def steering(
+        self,
+        alpha: float,
+        unit: str = "raw",
+        *,
+        layers: Optional[Sequence[int]] = None,
+        window: Optional[int] = None,
+        distribute: bool = False,
+        positions: Any = None,
+        vectors: Optional[np.ndarray] = None,
+    ) -> Add:
+        """The intervention that steers with this probe: an :class:`~concept_probe.interventions.Add`
+        of ``alpha_l * v_l`` at each steered layer ``l``, where ``v_l`` is the probe's steering
+        direction at that layer (``steer_directions``; decision D1) and ``alpha`` is in ``unit``:
+
+        - ``"raw"``: as is;
+        - ``"sigma"``: times ``steer_sigma``, the eval items' pooled within-pole SD on the steering
+          direction at the probe's layer (a scale knob, not "n standard deviations of behavior");
+        - ``"resid_norm"``: times each layer's mean residual norm on the training texts, so 0.1
+          adds 10% of a typical token's norm.
+
+        It steers at the probe's layer, at ``layers``, or at the layers within ``window`` of it (a
+        window that reaches past the model is clipped, and that is announced). With several layers,
+        each gets the whole dose unless ``distribute=True`` divides it among them. ``positions``
+        restricts it to some tokens (see :mod:`concept_probe.interventions`), ``vectors`` replaces
+        the directions (a random control). Use it with :func:`concept_probe.intervene`,
+        :func:`concept_probe.generate` or :func:`concept_probe.answer_logprobs`.
+        """
+        self._require_trained()
+        if unit not in ALPHA_UNITS:
+            raise ValueError(f"unit must be one of {ALPHA_UNITS}; got {unit!r}")
+        steer_layers = self.steer_layer_list(layers, window)
+        if abs(float(alpha)) > 1e-12:
+            self._check_alpha_unit(unit)
+        value = float(alpha)
+        if unit == "sigma" and abs(value) > 1e-12:
+            value *= float(self.steer_sigma)
+        per = value / len(steer_layers) if distribute else value
+        alphas = {l: float(per * (float(self.resid_norm[l]) if unit == "resid_norm" else 1.0)) for l in steer_layers}
+        V = self.steer_directions if vectors is None else vectors
+        return Add({l: np.asarray(V[l], dtype=np.float32) for l in steer_layers}, alpha=alphas, positions=positions,
+                   label=f"steering with {self.name!r}: alpha {float(alpha):g} ({unit})")
+
+    def steer_layer_list(self, layers: Optional[Sequence[int]] = None, window: Optional[int] = None) -> List[int]:
+        """The layers :meth:`steering` steers: the probe's layer, ``layers``, or the layers within
+        ``window`` of the probe's layer."""
+        self._require_trained()
+        if layers is not None and window is not None:
+            raise ValueError("give layers or window, not both")
+        if window is not None:
+            out, clipped = _window(int(self.layer), window, self.num_layers)
+            if clipped is not None:
+                announce([clipped])
+            return out
+        if layers is None:
+            return [int(self.layer)]
+        return _layer_list(list(layers) if not isinstance(layers, (int, np.integer)) else layers, self.num_layers,
+                           "layers")
+
+    def _check_alpha_unit(self, unit: str) -> None:
+        """Raise if the probe lacks the reference that ``unit`` scales by."""
+        if unit == "sigma" and (self.steer_sigma is None or not np.isfinite(self.steer_sigma)):
+            raise ValueError("unit='sigma' needs the probe's steering unit (steer_sigma), which comes from evaluation "
+                             "or calibration items; this probe has none.")
+        if unit == "resid_norm" and self.resid_norm is None:
+            raise ValueError("unit='resid_norm' needs the mean residual norm per layer: fit the probe on texts read "
+                             "with norms=True, or set probe.resid_norm (evaluate_steering measures it on the prompts).")
+
+    def describe(self) -> Dict[str, Any]:
+        """What the probe is, in a dict: its concept, layer, estimators, calibrations and numbers."""
+        self._require_trained()
+        return {"name": self.name, "poles": [self.pos_label, self.neg_label], "layer": int(self.layer),
+                "score_layers": self._score_layers(), "estimator": self.estimator,
+                "steer_estimator": self.steer_estimator, "steer_sigma": self.steer_sigma, "identity": self.identity,
+                "calibrations": [c.context.describe() for c in self.calibrations], "metrics": self.metrics,
+                "run_dir": self.run_dir}
+
+    # ------------------------------------------------------------------ checks
+    def _require_trained(self) -> None:
+        if self.directions is None or self.layer is None:
+            raise ValueError("The probe has no directions yet: fit it, or load one.")
+
+    def _require_model(self, what: str) -> None:
+        self._require_trained()
+        if self.model_bundle is None:
+            raise ValueError(f"{what} needs the model loaded: attach it with probe.attach(model, tokenizer) "
+                             "(the probe's identity says which model it belongs to).")
 
 
-def _control_seed(probes: List["ConceptProbe"], random_seed: Optional[int]) -> int:
-    """The base seed of the random controls: ``random_seed``, else the probes' ``random.seed``."""
-    if random_seed is not None:
-        return int(random_seed)
-    seed = _shared_setting(probes, "random", "seed", None, "random_seed")
-    return 0 if seed is None else int(seed)
+# ------------------------------------------------------------------------------------- fit helpers
+def _warn(message: str) -> None:
+    import warnings
+
+    warnings.warn(message, stacklevel=3)
 
 
-def _steering_conditions(steer: Optional["ConceptProbe"], alphas: List[float], alpha_unit: str,
-                         steer_layer_list: List[int], steer_distribute: Optional[bool], n_random: int,
-                         base_seed: int) -> List[Condition]:
-    """One condition per alpha (the probe's steering at that alpha), and after each non-zero one,
-    its ``n_random`` random controls: the same intervention with a random direction of the same
-    length (control k uses the seed ``[base_seed, k]`` at every alpha, so it is the same direction)."""
-    conditions = []
-    for j, alpha in enumerate(alphas):
-        info = {"alpha": alpha, "alpha_unit": alpha_unit, "alpha_index": j, "alpha_value": 0.0,
-                "steer_alpha_per_layer": {}, "steer_layer_scales": None, "control": None}
-        intervention = None
-        if steer is not None:
-            value, scales = steer._steering_alpha(alpha, alpha_unit, steer_layer_list)
-            info.update(alpha_value=float(value), steer_layer_scales=scales)
-            if abs(value) > 1e-12:
-                intervention = steer.steering(alpha, alpha_unit, layers=steer_layer_list, distribute=steer_distribute)
-                info["steer_alpha_per_layer"] = intervention.alpha_per_layer
-        conditions.append(Condition(info, intervention))
-        if intervention is not None:
-            for k in range(int(n_random)):
-                conditions.append(Condition(dict(info, control=k), intervention.random_like([base_seed, k])))
-    return conditions
+def _token_projections(s: EvalSet, directions: np.ndarray) -> Tuple[Optional[List[np.ndarray]], Optional[List[np.ndarray]]]:
+    """Each item's per-token projections ``(tokens, layers)`` of a set read token by token, per pole."""
+    if s.tokens is None:
+        return None, None
+    out = []
+    for reps in s.tokens:
+        data, items = _as_array(reps), np.asarray(reps.items)
+        proj = np.einsum("nld,ld->nl", data.astype(np.float64), directions.astype(np.float64))
+        out.append([proj[items == i] for i in dict.fromkeys(items.tolist())])
+    return out[0], out[1]
 
 
-def _score_generations(
-    probes: List["ConceptProbe"],
-    prompts: List[PromptLike],
-    *,
-    steer: Optional["ConceptProbe"],
-    alphas: Optional[List[float]],
-    alpha_unit: str,
-    steer_layers: Any,
-    steer_window_radius: Optional[int],
-    steer_distribute: Optional[bool],
-    system_prompt: Optional[str],
-    max_new_tokens: Optional[int],
-    greedy: Optional[bool],
-    temperature: Optional[float],
-    top_p: Optional[float],
-    seed: Optional[int],
-    batch_size: Optional[int],
-    layer_selection: Optional[Dict[str, Any]],
-    n_random: int,
-    random_seed: Optional[int],
-    keep_logits: Union[None, int, str],
-    on_token: Optional[Callable[[TokenStep], Any]],
-    warn: Callable[[str], None],
-    status: Callable[[str], None],
-) -> Scores:
-    """Generate each prompt at each alpha (steered with ``steer``, and with ``n_random`` random
-    controls at each non-zero alpha) and score the completions with every probe: what
-    :meth:`ConceptProbe.score_prompts` and ``multi_probe_score_prompts`` do."""
-    alpha_unit = _validate_alpha_unit(alpha_unit)
-    alphas = [0.0] if alphas is None else [float(a) for a in alphas]
-    if not alphas:
-        raise ValueError("alphas is empty; pass at least one alpha (0.0 for no steering).")
-    steering_on = any(abs(a) > 1e-12 for a in alphas)
-    if steering_on and steer is None:
-        raise ValueError("Non-zero alphas need steer_probe: the probe (index, name or object) whose vectors steer.")
-    if int(n_random) < 0:
-        raise ValueError(f"n_random must be >= 0; got {n_random}")
-    first = probes[0]
-    model, tokenizer = first.model_bundle.model, first.model_bundle.tokenizer
+def _record_estimator_notes(probe: ConceptProbe, est: Any, flips: List[int], choices: List[Choice]) -> None:
+    """Record what the estimator did on the caller's behalf: directions turned around so the positive
+    pole projects higher, and coordinates an outlier rule left out."""
+    if flips:
+        probe.estimator = dict(probe.estimator, flipped_layers=sorted(flips))
+        choices.append(Choice("direction sign", "as the estimator gave it", "turned around",
+                              f"at layers {sorted(flips)} the positive pole projected lower, so those directions were "
+                              "turned around (a direction points toward the positive pole)"))
+    dropped = list(getattr(est, "dropped", None) or [])
+    if dropped:
+        probe.estimator = dict(probe.estimator, dropped_coordinates=list(dropped))
+        choices.append(Choice("outlier coordinates", "every coordinate", "some left out",
+                              f"the outlier rule left out {sum(dropped)} coordinates over {len(dropped)} layers "
+                              f"(per layer: {list(dropped)})"))
 
-    sys_prompt = _shared_setting(probes, "prompts", "neutral_system", system_prompt, "system_prompt")
-    max_new_tokens = int(_shared_setting(probes, "steering", "steer_max_new_tokens", max_new_tokens, "max_new_tokens"))
-    if greedy is None:
-        greedy = not _shared_setting(probes, "steering", "steer_sampling", None, "greedy")
-    if not greedy:
-        temperature = _shared_setting(probes, "steering", "steer_temperature", temperature, "temperature")
-        top_p = _shared_setting(probes, "steering", "steer_top_p", top_p, "top_p")
-        # Sampled completions are reproducible: without an explicit seed, random.seed is used.
-        seed = int(_shared_setting(probes, "random", "seed", seed, "seed"))
-    if batch_size is None:
-        batch_size = _shared_setting(probes, "steering", "gen_batch_size", None, "batch_size") or \
-            _shared_setting(probes, "training", "gen_batch_size", None, "batch_size")
-    batch_size = int(batch_size)
-    read_batch_size = int(first.config["readout"].get("batch_size", 16))
-    if keep_logits is None:
-        keep_logits = _shared_setting(probes, "output", "generation_logits", None, "keep_logits")
 
-    scorers, z_missing = [], {}
-    for probe in probes:
-        scorer = probe._token_scorer(generated=True, layer_selection=layer_selection)
-        scorers.append(scorer)
-        z_missing[scorer.name] = None
-        if scorer.calibration is None:
-            z_missing[scorer.name] = probe._missing_z_reason(GENERATED_CONTEXT)
-            warn(f"{probe.concept.name}: score_mean_z is None: {z_missing[scorer.name]}")
-
-    steer_layer_list = []
-    if steer is not None:
-        steer_layer_list = steer.steer_layer_list(steer_layers, steer_window_radius)
-        if steering_on:
-            steer._check_alpha_unit(alpha_unit)
-    if n_random and not steering_on:
-        warn("n_random random controls need a non-zero alpha; none are generated.")
-    base_seed = _control_seed(probes, random_seed)
-    conditions = _steering_conditions(steer, alphas, alpha_unit, steer_layer_list, steer_distribute, n_random,
-                                      base_seed)
-    status(f"Generating {len(prompts)} prompts x {len(conditions)} conditions ({len(alphas)} alphas"
-           + (f", {n_random} random controls each" if n_random and steering_on else "")
-           + f"), {batch_size} at a time")
-    items = generate_and_score(
-        model, tokenizer, prompts, conditions, scorers, system=sys_prompt, max_new_tokens=max_new_tokens,
-        greedy=greedy, temperature=temperature, top_p=top_p, seed=seed if not greedy else None,
-        batch_size=batch_size, read_batch_size=read_batch_size, on_token=on_token, watch=probes,
-        keep_logits=keep_logits, warn=warn, status=status,
-    )
-    run_settings = {
-        "system_prompt": sys_prompt, "alphas": alphas, "alpha_unit": alpha_unit,
-        "steer_probe": None if steer is None else str(steer.concept.name), "steer_layers": steer_layer_list,
-        "steer_distribute": None if steer is None else (
-            steer.config["steering"]["steer_distribute"] if steer_distribute is None else bool(steer_distribute)),
-        "steer_direction": None if steer is None else steer.steer_estimator,
-        "generation": {"greedy": bool(greedy), "max_new_tokens": max_new_tokens,
-                       "temperature": None if greedy else temperature, "top_p": None if greedy else top_p,
-                       "seed": None if greedy else seed, "batch_size": batch_size},
-        "layers": {s.name: s.layers for s in scorers}, "aggregate": {s.name: s.aggregate for s in scorers},
-        "n_random": int(n_random) if steering_on else 0,
-        "random_seed": base_seed if (n_random and steering_on) else None,
-        "keep_logits": keep_logits,
+def _metrics(ev: ReadingEvaluation, shuffle: Optional[Dict[str, Any]], neutral: Optional[Dict[str, Any]],
+             n_pos: int, n_neg: int) -> Dict[str, Any]:
+    """The numbers a fitted probe saves: its evaluation's, the label-shuffle control and the neutral texts."""
+    main = ev.main
+    return {
+        "layer": int(ev.layer), "d": main.d, "p": main.p, "d_ci95": main.d_ci95, "auroc": main.auroc,
+        "auroc_ci95": main.auroc_ci95, "null_d95": main.null_d95, "accuracy": main.accuracy,
+        "accuracy_ci95": main.accuracy_ci95, "d_all_eval": None if not np.isfinite(main.d_curve[ev.layer])
+        else float(main.d_curve[ev.layer]), "n_train": {"pos": int(n_pos), "neg": int(n_neg)},
+        "evaluation": ev.to_metrics(), "label_shuffle": shuffle, "neutral": neutral,
     }
-    return Scores("generations", [s.name for s in scorers], items, run_settings, z_missing)
-
-
-def _dotted_differences(a: Dict[str, Any], b: Dict[str, Any], prefix: str = "") -> List[str]:
-    """Dotted keys whose values differ between two nested config dicts."""
-    out: List[str] = []
-    for key in sorted(set(a) | set(b), key=str):
-        va, vb = a.get(key), b.get(key)
-        if isinstance(va, dict) and isinstance(vb, dict):
-            out.extend(_dotted_differences(va, vb, prefix=f"{prefix}{key}."))
-        elif va != vb:
-            out.append(f"{prefix}{key}")
-    return out
-
-
-def model_identity_of(obj: Any, config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """The model identity of a bundle or probe: the one recorded when it was loaded or trained, or
-    else the one its config describes (runs saved before identities were recorded)."""
-    identity = getattr(obj, "identity", None)
-    if identity:
-        return identity
-    cfg = config if config is not None else getattr(obj, "config", None) or {}
-    return identity_from_config(cfg.get("model", {}))
-
-
-class ProbeWorkspace:
-    def __init__(
-        self,
-        root_dir: Optional[str] = None,
-        config_overrides: Optional[Dict[str, Any]] = None,
-        defaults_path: Optional[str] = None,
-        model_id: Optional[str] = None,
-        project_directory: Optional[str] = None,
-        model: Any = None,
-        tokenizer: Any = None,
-    ) -> None:
-        """A model and a config to train and load probes with.
-
-        The model is loaded from the config's ``model`` section, or passed in already loaded:
-        ``model`` is a :class:`ModelBundle`, or a Hugging Face model together with its
-        ``tokenizer``. A passed model's own settings (name, dtype, quantization) replace the
-        config's, and that replacement is printed and logged like every automatic choice.
-        """
-        self.project_directory = project_directory
-
-        if project_directory:
-            run_dir = os.path.abspath(project_directory)
-            cfg_path = os.path.join(run_dir, "config.json")
-            if not os.path.exists(cfg_path):
-                raise FileNotFoundError(f"project_directory must point to a trained run dir containing config.json: {run_dir}")
-            with open(cfg_path, "r", encoding="utf-8") as f:
-                cfg = upgrade_saved_config(json.loads(f.read()))
-            if config_overrides:
-                check_config_keys(config_overrides, deep_merge(load_defaults(), cfg))
-                cfg = deep_merge(cfg, config_overrides)
-            if model_id:
-                cfg["model"]["model_id"] = model_id
-            # root_dir isn't used for loading, but keep it consistent for callers.
-            if root_dir:
-                cfg["output"]["root_dir"] = root_dir
-            self.config = cfg
-            self.root_dir = cfg["output"].get("root_dir", "outputs")
-            self.console = ConsoleLogger(cfg["output"].get("console", False))
-        else:
-            cfg = resolve_config(config_overrides, defaults_path=defaults_path)
-            if model_id:
-                cfg["model"]["model_id"] = model_id
-            if root_dir:
-                cfg["output"]["root_dir"] = root_dir
-            self.config = cfg
-            self.root_dir = cfg["output"]["root_dir"]
-            ensure_dir(self.root_dir)
-            self.console = ConsoleLogger(cfg["output"].get("console", False))
-        self.model_bundle = self._model_bundle(model, tokenizer, model_id)
-        announce(self.model_bundle.choices, console=self.console.enabled)
-        self.console.info(f"Model ready ({self.model_bundle.num_layers} layers).")
-
-    def _model_bundle(self, model: Any, tokenizer: Any, model_id: Optional[str]) -> ModelBundle:
-        cfg = self.config
-        if model is None:
-            if tokenizer is not None:
-                raise ValueError("tokenizer was passed without a model.")
-            self.console.info(f"Loading model {cfg['model']['model_id']}...")
-            return ModelBundle.load(cfg["model"])
-        if isinstance(model, ModelBundle):
-            if tokenizer is not None:
-                raise ValueError("Pass either a ModelBundle or a model and its tokenizer, not both.")
-            bundle = model
-            if not bundle.identity:
-                bundle.identity = identity_of(bundle.model, bundle.tokenizer, bundle.model_id)
-        else:
-            if tokenizer is None:
-                raise ValueError("A model passed to ProbeWorkspace needs its tokenizer (tokenizer=...).")
-            bundle = ModelBundle.from_loaded(model, tokenizer, model_id=model_id, model_cfg=cfg["model"])
-        identity = bundle.identity
-        described = identity_from_config(cfg["model"])
-        replaced = {k: identity.get(k) for k in ("model_id", "dtype", "quantization")
-                    if described.get(k) != identity.get(k)}
-        if replaced:
-            bundle.choices = list(bundle.choices) + [Choice(
-                "model", {k: described.get(k) for k in replaced}, replaced,
-                "a loaded model was passed in; its own settings replace the config's model section",
-            )]
-        cfg["model"].update(model_id=identity.get("model_id") or cfg["model"]["model_id"],
-                            dtype=identity.get("dtype") or cfg["model"].get("dtype"),
-                            quantization=identity.get("quantization"))
-        return bundle
-
-    def get_probe(
-        self,
-        name: Optional[str] = None,
-        project_directory: Optional[str] = None,
-        allow_model_mismatch: bool = False,
-    ) -> "ConceptProbe":
-        """Load a previously trained probe without retraining.
-
-        If this workspace was created with project_directory=..., that directory is used by default.
-        The workspace's model identity (model, dtype actually used, quantization, chat template and
-        its date) must match the run's, since the probe's directions only apply to the activations
-        they were trained on; ``allow_model_mismatch=True`` loads it anyway. Scoring then uses the
-        workspace config, and a warning lists the settings that differ from the run's.
-        """
-        if not (project_directory or self.project_directory):
-            raise ValueError("No project_directory provided. Create ProbeWorkspace(project_directory=...) or pass it to get_probe().")
-        run_dir = os.path.abspath(project_directory or self.project_directory)
-
-        probe = ConceptProbe.load(run_dir)
-        mismatched = identity_mismatches(model_identity_of(probe), model_identity_of(self.model_bundle, self.config))
-        if mismatched and not allow_model_mismatch:
-            raise ValueError(
-                "The workspace model differs from the one this probe was trained on (run vs workspace: "
-                + "; ".join(mismatched)
-                + "). Load it with ProbeWorkspace(project_directory=run_dir) to use the run's own model "
-                "settings, or pass allow_model_mismatch=True."
-            )
-        differences = [
-            d for d in _dotted_differences(probe.config, self.config) if not d.startswith(("output.", "concept."))
-        ]
-        if differences:
-            self.console.warn(
-                "Scoring uses the workspace config, which differs from the saved run config in: "
-                + ", ".join(differences[:12]) + (" ..." if len(differences) > 12 else "") + "."
-            )
-        probe.config = self.config
-        probe.console = self.console
-        probe.model_bundle = self.model_bundle
-
-        if name is not None:
-            if safe_slug(str(probe.concept.name)) != safe_slug(str(name)):
-                raise ValueError(
-                    f"Loaded probe concept name '{probe.concept.name}' does not match requested name '{name}'."
-                )
-        return probe
-
-    def train_concept(
-        self,
-        concept: Optional[ConceptSpec] = None,
-        concept_overrides: Optional[Dict[str, Any]] = None,
-        run_name: Optional[str] = None,
-        config_overrides: Optional[Dict[str, Any]] = None,
-        overwrite: bool = False,
-    ) -> ConceptProbe:
-        """Train ``concept`` in ``<root_dir>/<concept name>/<run_name or timestamp>``.
-
-        A run directory that already holds files raises, so two runs never mix their logs and
-        artifacts; ``overwrite=True`` deletes it first.
-        """
-        if config_overrides:
-            check_config_keys(config_overrides, deep_merge(load_defaults(), self.config))
-        cfg = deep_merge(self.config, config_overrides or {})
-        if concept is None:
-            concept = ConceptSpec.from_config(cfg, concept_overrides)
-        elif concept_overrides:
-            concept = ConceptSpec.from_config({"concept": concept.to_dict()}, concept_overrides)
-
-        run_tag = run_name or now_tag()
-        concept_dir = os.path.join(self.root_dir, safe_slug(concept.name), run_tag)
-        if os.path.isdir(concept_dir) and os.listdir(concept_dir):
-            if not overwrite:
-                raise FileExistsError(
-                    f"{concept_dir} already holds a run; pass another run_name, or overwrite=True to replace it."
-                )
-            shutil.rmtree(concept_dir)
-        ensure_dir(concept_dir)
-        log_path = os.path.join(concept_dir, "log.jsonl")
-        logger = JsonlLogger(log_path, enabled=bool(cfg.get("output", {}).get("log_jsonl", True)))
-
-        probe = ConceptProbe(
-            model_bundle=self.model_bundle,
-            config=cfg,
-            concept=concept,
-            run_dir=concept_dir,
-            logger=logger,
-            console=self.console,
-        )
-        return probe.train()

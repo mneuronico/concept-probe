@@ -89,17 +89,25 @@ def test_an_explicit_env_file_wins_over_the_environment(tmp_path, monkeypatch):
     assert [c[1]["Authorization"] for c in calls] == ["Bearer from-file", "Bearer from-environment", "Bearer explicit"]
 
 
-def test_answers_outside_the_rubric_or_missing_raise(monkeypatch):
+def test_answers_outside_the_rubric_or_missing_score_nan_and_warn(monkeypatch):
     monkeypatch.setattr(judges, "_post_json", _fake_service([], lambda x: "maybe"))
-    with pytest.raises(ValueError, match="'maybe'"):
-        APIJudge("openai", "m", api_key="k").rate(["a"], TONE)
+    with pytest.warns(UserWarning, match="'maybe'"):
+        assert APIJudge("openai", "m", api_key="k").rate(["a"], TONE) == [None]
 
     def drops_one(url, headers, payload, timeout):
         return {"choices": [{"message": {"content": '[{"id": 0, "answer": "yes"}]'}}]}
 
     monkeypatch.setattr(judges, "_post_json", drops_one)
-    with pytest.raises(RuntimeError, match="no answer for 1 texts"):
-        APIJudge("openai", "m", api_key="k").rate(["a", "b"], TONE)
+    with pytest.warns(UserWarning, match="no usable answer for 1 of 2"):
+        scores = APIJudge("openai", "m", api_key="k").score(["a", "b"], TONE)
+    assert scores[0] == TONE.answers["yes"] and np.isnan(scores[1])
+
+    def not_json(url, headers, payload, timeout):
+        return {"choices": [{"message": {"content": "I cannot rate these."}}]}
+
+    monkeypatch.setattr(judges, "_post_json", not_json)
+    with pytest.warns(UserWarning, match="did not answer with a JSON list"):
+        assert APIJudge("openai", "m", api_key="k").rate(["a", "b"], TONE) == [None, None]
 
 
 def test_rate_limits_are_retried(monkeypatch):

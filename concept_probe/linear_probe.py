@@ -89,6 +89,9 @@ class Calibration:
     n_pos: int = 0
     n_neg: int = 0
     source: str = ""
+    #: each pole's mean item score per layer (the poles' scale: +1 is the positive mean)
+    pos_mean: Optional[np.ndarray] = None
+    neg_mean: Optional[np.ndarray] = None
 
     @classmethod
     def from_scores(
@@ -115,7 +118,8 @@ class Calibration:
             if zero == "baseline":
                 token_center = np.concatenate(neg_tokens, axis=0).mean(axis=0)
         return cls(context=context, center=center, scale=_pooled_sd_columns(P, N), token_center=token_center,
-                   token_scale=token_scale, zero=zero, n_pos=int(P.shape[0]), n_neg=int(N.shape[0]), source=source)
+                   token_scale=token_scale, zero=zero, n_pos=int(P.shape[0]), n_neg=int(N.shape[0]), source=source,
+                   pos_mean=P.mean(axis=0), neg_mean=N.mean(axis=0))
 
     def usable(self, layers: Sequence[int], tokens: bool = False) -> bool:
         """Whether the references at ``layers`` exist and are finite, with a positive unit."""
@@ -125,14 +129,25 @@ class Calibration:
         c, u = np.asarray(c)[list(layers)], np.asarray(u)[list(layers)]
         return bool(np.all(np.isfinite(c)) and np.all(np.isfinite(u)) and np.all(u > 0))
 
-    def items_z(self, scores: np.ndarray, layers: Sequence[int], aggregate: str = "mean") -> Optional[np.ndarray]:
+    def items_z(self, scores: np.ndarray, layers: Sequence[int], aggregate: str = "mean",
+                unit: str = "sd") -> Optional[np.ndarray]:
         """Item z scores from item scores ``(items, len(layers))`` at ``layers`` (an item's score is
         its mean projection over its tokens): standardized per layer, then aggregated over the
-        layers (``"mean"`` or ``"sum"``). None when the references at those layers are unusable."""
+        layers (``"mean"`` or ``"sum"``). ``unit="sd"`` divides by the within-pole SD; ``"poles"``
+        by the distance from the zero to the positive pole's mean (+1 is that mean). None when the
+        references at those layers are unusable."""
         layers = list(layers)
         if not self.usable(layers):
             return None
-        z = (np.asarray(scores, dtype=np.float64) - self.center[layers]) / self.scale[layers]
+        if unit == "poles":
+            if self.pos_mean is None:
+                return None
+            unit_size = np.asarray(self.pos_mean)[layers] - np.asarray(self.center)[layers]
+            if not np.all(np.abs(unit_size) > 0):
+                return None
+        else:
+            unit_size = self.scale[layers]
+        z = (np.asarray(scores, dtype=np.float64) - self.center[layers]) / unit_size
         return z.mean(axis=1) if aggregate == "mean" else z.sum(axis=1)
 
     def tokens_z(self, scores: np.ndarray, layers: Sequence[int], aggregate: str = "mean"
@@ -151,9 +166,10 @@ class Calibration:
         s = np.asarray(scores, dtype=np.float64)
         self.neutral, self.n_neutral = s.mean(axis=0), int(s.shape[0])
 
-    def add_threshold(self, pos: np.ndarray, neg: np.ndarray, layer: int, fit_on: str) -> Dict[str, Any]:
+    def add_threshold(self, pos: np.ndarray, neg: np.ndarray, layer: int, fit_on: str,
+                      l2: float = 1e-2) -> Dict[str, Any]:
         """Fit :func:`fit_threshold` on item scores at ``layer`` and keep it."""
-        self.threshold = dict(fit_threshold(pos, neg), layer=int(layer), fit_on=fit_on)
+        self.threshold = dict(fit_threshold(pos, neg, l2=l2), layer=int(layer), fit_on=fit_on, l2=float(l2))
         return self.threshold
 
     def to_dict(self) -> Dict[str, Any]:
@@ -163,7 +179,8 @@ class Calibration:
         return {"context": self.context.to_dict(), "center": plain(self.center), "scale": plain(self.scale),
                 "token_center": plain(self.token_center), "token_scale": plain(self.token_scale), "zero": self.zero,
                 "neutral": plain(self.neutral), "n_neutral": self.n_neutral, "threshold": self.threshold,
-                "n_pos": self.n_pos, "n_neg": self.n_neg, "source": self.source}
+                "n_pos": self.n_pos, "n_neg": self.n_neg, "source": self.source,
+                "pos_mean": plain(self.pos_mean), "neg_mean": plain(self.neg_mean)}
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Calibration":
@@ -171,7 +188,7 @@ class Calibration:
                    token_center=_arr(d.get("token_center")), token_scale=_arr(d.get("token_scale")),
                    zero=d.get("zero", "midpoint"), neutral=_arr(d.get("neutral")), n_neutral=int(d.get("n_neutral", 0)),
                    threshold=d.get("threshold"), n_pos=int(d.get("n_pos", 0)), n_neg=int(d.get("n_neg", 0)),
-                   source=d.get("source", ""))
+                   source=d.get("source", ""), pos_mean=_arr(d.get("pos_mean")), neg_mean=_arr(d.get("neg_mean")))
 
 
 def calibrations_from_tensors(tensors: Dict[str, Any]) -> List[Calibration]:
@@ -212,8 +229,7 @@ def steer_directions_for(estimator: Any, steer: Any, pos: np.ndarray, neg: np.nd
         return read_directions, steer_spec, None
     vectors = fit_directions(make_estimator(steer), pos, neg, erase=erase)
     return vectors, steer_spec, Choice(
-        "steering.steer_direction", steer if isinstance(steer, (str, dict)) else steer_spec, steer_spec,
+        "steering direction", steer if isinstance(steer, (str, dict)) else steer_spec, steer_spec,
         f"steering uses its own direction, not the reading one ({read_spec}): the raw difference of means "
-        "pushes further than normalized directions; set steering.steer_direction='read' to steer with the "
-        "reading direction",
+        "pushes further than normalized directions; pass steer='read' to steer with the reading direction",
     )

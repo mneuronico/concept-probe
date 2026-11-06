@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 
+from .inputs import upgrade_readout_name
 from .settings import settings
 from .utils import ensure_dir, json_dump, now_tag
 
@@ -600,6 +601,7 @@ class TargetProbe:
         rank: Optional[int] = None,
         alpha: float = 1.0,
         n_shuffles: int = 20,
+        n_shape_shuffles: int = 200,
         seed: int = 0,
         name: str = "target",
         identity: Optional[Dict[str, Any]] = None,
@@ -613,8 +615,11 @@ class TargetProbe:
         among layers that read equally well, the one whose centroids fit the target's shape best (for
         orders, cycles and layouts) or that is furthest above its shuffled control. The map is then
         refitted on every item of ``reps`` at that layer. ``reading`` keeps the
-        held-out numbers with their shuffled control, and ``shape`` the centroids' fit to a structured
-        target at that layer. Saved by default to ``<root_dir or output_root>/<name>/<time>``.
+        held-out numbers with their shuffled control (``n_shuffles``), and ``shape`` the centroids' fit to a
+        structured target at that layer, against ``n_shape_shuffles`` shuffled orders. When the layer is
+        chosen here, the held-out items that choose it also give its score, which is then the best of
+        many and optimistic: that is warned and recorded; give ``layer``, or choose it on other items,
+        for an unbiased number. Saved by default to ``<root_dir or output_root>/<name>/<time>``.
         """
         X = _reps(reps)
         if model is None:
@@ -623,7 +628,9 @@ class TargetProbe:
                               n_shuffles=n_shuffles, layers=None if layer is None else [layer], seed=seed)
         ts = None
         if target.structured and len(target.classes) >= 3:
-            ts = target_shape(reps, target, layers=None if layer is None else [layer], n_shuffles=200, seed=seed)
+            ts = target_shape(reps, target, layers=None if layer is None else [layer], n_shuffles=int(n_shape_shuffles),
+                              seed=seed)
+        chosen_here = layer is None
         if layer is None:
             best = np.nanmax(reading.score)
             ties = np.flatnonzero(reading.score >= best - 1e-9)
@@ -637,7 +644,13 @@ class TargetProbe:
                      "similarity_null_p95": float(ts.similarity_null_p95[layer]), "share": float(ts.share[layer])}
         summary = {"layer": layer, "score": float(reading.score[layer]), "null_p95": float(reading.null_p95[layer]),
                    "metric": "accuracy" if target.by_class else "R2", "shuffle": reading.shuffle,
-                   "chance": reading.chance, "n_fit": reading.n_fit, "n_test": reading.n_test, "model": reading.model}
+                   "chance": reading.chance, "n_fit": reading.n_fit, "n_test": reading.n_test, "model": reading.model,
+                   "layer_chosen_on": "the items that measure it" if chosen_here else "given"}
+        if chosen_here and X.shape[1] > 1:
+            import warnings
+
+            warnings.warn(f"the layer was chosen as the best of {X.shape[1]} on the same held-out items that give its "
+                          "score, so the score is optimistic; give layer= for an unbiased number", stacklevel=2)
         readout = getattr(getattr(reps, "readout", None), "name", None)
         probe = cls(target.kind, target.classes, target.places, layer, mapping, name=name, readout=readout,
                     identity=identity or getattr(reps, "identity", None), reading=summary, shape=shape)
@@ -649,12 +662,27 @@ class TargetProbe:
 
     # ---- scoring
     def _at_layer(self, reps: Any) -> np.ndarray:
+        """The rows of ``reps`` at the probe's layer: ``(items, dim)`` as given, or the probe's layer of
+        ``(items, layers, dim)``, found by name when the representations say which layers they hold
+        (read with ``layers=``), else by index (every layer must be there)."""
         arr = np.asarray(getattr(reps, "data", reps), dtype=np.float64)
         if arr.ndim == 2:
             return arr
-        if arr.ndim == 3:
-            return arr[:, self.layer, :] if arr.shape[1] > self.layer else arr[:, 0, :]
-        raise ValueError(f"representations must be (items, layers, dim) or (items, dim); got {arr.shape}")
+        if arr.ndim != 3:
+            raise ValueError(f"representations must be (items, layers, dim) or (items, dim); got {arr.shape}")
+        names = getattr(reps, "layers", None)
+        if names is not None:
+            if self.layer not in list(names):
+                raise ValueError(f"these representations hold layers {list(names)}, not the probe's layer {self.layer}")
+            return arr[:, list(names).index(self.layer), :]
+        if self.centroids is not None and arr.shape[1] != self.centroids.shape[1]:
+            raise ValueError(f"these representations hold {arr.shape[1]} layers and the probe was fitted on "
+                             f"{self.centroids.shape[1]}: pass every layer, (items, dim) at layer {self.layer}, or what "
+                             "read_texts returns (it says which layers it holds)")
+        if arr.shape[1] <= self.layer:
+            raise ValueError(f"these representations hold {arr.shape[1]} layers, so not the probe's layer {self.layer}; "
+                             "pass every layer, or what read_texts returns")
+        return arr[:, self.layer, :]
 
     def coordinates(self, reps: Any) -> np.ndarray:
         """Where the map puts each activation ``(items, k)``: representations ``(items, layers, dim)``
@@ -706,14 +734,13 @@ class TargetProbe:
              prompt: Optional[str] = None, batch_size: int = 16) -> TargetScores:
         """Read each text (as ``role``, ``system`` and ``prompt`` say, pooled as the probe's training
         representations were, by default the mean over the text's tokens) and score it."""
-        return self.score(self._read(texts, self.readout or "assistant_all_mean", role, system, prompt,
-                                     batch_size).data[:, 0, :])
+        return self.score(self._read(texts, self.readout or "text_mean", role, system, prompt, batch_size))
 
     def score_tokens(self, texts: Sequence[Any], *, role: str = "raw", system: Optional[str] = None,
                      prompt: Optional[str] = None, batch_size: int = 16) -> List[TargetScores]:
         """Each text's tokens scored one by one (the text's own tokens): one :class:`TargetScores`
         per text, with a row per token."""
-        reps = self._read(texts, "assistant_tokens", role, system, prompt, batch_size)
+        reps = self._read(texts, "text_tokens", role, system, prompt, batch_size)
         return [self.score(reps.data[reps.items == i, 0, :]) for i in range(len(texts))]
 
     # ---- steering
@@ -835,7 +862,7 @@ class TargetProbe:
             mapping = _map_from_params(meta["map"], params)
         places = data["places"] if data["places"].size else None
         probe = cls(meta["kind"], meta.get("classes_raw"), places, meta["layer"], mapping, name=meta["name"],
-                    readout=meta.get("readout"), identity=meta.get("identity"), reading=meta.get("reading"),
+                    readout=upgrade_readout_name(meta.get("readout")), identity=meta.get("identity"), reading=meta.get("reading"),
                     shape=meta.get("shape"))
         probe.centroids = data["centroids"] if data["centroids"].size else None
         probe.dir = path
