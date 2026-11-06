@@ -82,6 +82,10 @@ def test_a_learning_curve_grows_with_items_and_has_its_null():
     assert len(out["rows"]) == 2 * (8 + 8) and "d_other" in out["rows"][0]
     with pytest.raises(ValueError, match="larger than"):
         learning_curve(P, N, [EvalSet("eval", EP, EN)], [500])
+    # Every draw is measured on the same eval items: drawing all the training items every time
+    # gives the same probe, so the same d (no spread from how the eval items are split).
+    full = learning_curve(P, N, [EvalSet("eval", EP, EN)], [120], n_repeats=5, n_null=0, paired=True)
+    assert full["summary"]["probe"][120]["d_sd"] < 1e-9
 
 
 # ------------------------------------------------------------------------------------ confounds

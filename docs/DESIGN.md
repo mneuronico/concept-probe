@@ -537,6 +537,24 @@ esperados, que se listan antes de correr:
 Cualquier otra diferencia es un bug. Salida: una tabla antes/después por experimento, y qué partes de
 `shared/` quedaron reemplazadas por la librería.
 
+- *Hecha el 2026-11-05* (probes-workshop, `experiments/etapa7_libreria/`, con su README y una tabla
+  por experimento). Da igual salvo redondeo: las 1078 representaciones de `outputs/mt`, M0 (capa,
+  d y puntajes de la primera probe; los cuatro estimadores), M1, M5 (borrar, trasplantar y empujar
+  con `answer_logprobs` y las intervenciones), M7 (días y meses con la maquinaria de objetivos), M8,
+  la exactitud de M9 y su empuje cruzado con controles (las probes guardadas en noviembre, cargadas;
+  142 de 144 textos iguales), la carga de Llama y Gemma en cada nivel, sin red, y el modo `texts`.
+  Cambió lo esperado: D1 (la probe `var` empuja como la cruda: 54 de 56 textos iguales a los de la
+  cruda), D2 (valencia `shared` 10.8 → 6.6 en la capa 11; en la 14, 5.3 sin el system prompt y 8.5
+  con él, cerca de los 4.9 y 8.5 que M3 midió a mano; aburrido/interesado 10.1 → 3.1), D5 (Gemma en
+  float32, dicho al cargar) y los pares apareados de E0.1, que también cambian el d (3.05 → 3.41:
+  la mitad que mide es otra). Otro cambio, que el plan no listó: el puntaje leído mientras se empuja
+  (E5.5) ahora incluye el empuje; sin él da lo de antes. Cuatro bugs, arreglados: leer en tandas en
+  float32 en la GPU leía mal un texto (Gemma 3; el núcleo de atención eficiente en memoria de
+  PyTorch, que ahora se deja afuera ahí), la curva de aprendizaje partía el eval en cada sorteo, y
+  dos de identidad del modelo (la ruta de la caché, y una probe con sólo el nombre del modelo).
+  En Gemma 3 1B (la batería), lo de valencia da igual; el d de B1 sale 2.70 y no 2.73 porque la
+  Etapa 1 guardó las representaciones en float16 (redondeadas igual, dan 2.73).
+
 Por qué este orden: las etapas 1-3 son la lectura, que es lo que más usó el workshop y de lo que
 dependen todas las demás; la 4 y la 5 son la generación y el empuje; la 6 necesita todo lo anterior
 estable; la 7 prueba el conjunto.

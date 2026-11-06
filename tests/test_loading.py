@@ -3,12 +3,13 @@ workspaces built around a model that is already loaded."""
 import json
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 import transformers
 from transformers import BitsAndBytesConfig
 
-from concept_probe import ConceptSpec, ModelBundle, ProbeWorkspace, modeling
+from concept_probe import ConceptProbe, ConceptSpec, ModelBundle, ProbeWorkspace, modeling
 from concept_probe.modeling import (
     identity_from_config,
     identity_mismatches,
@@ -156,6 +157,11 @@ def test_identity_reads_the_repo_id_out_of_a_cached_snapshot_path():
     model.config = SimpleNamespace(_name_or_path="/h/hub/models--org--name/snapshots/abc123", _commit_hash="abc123")
     ident = modeling.identity_of(model, CharChatTok())
     assert ident["model_id"] == "org/name" and ident["revision"] == "abc123" and ident["dtype"] == "float64"
+    # Runs saved by earlier versions recorded the snapshot's path: it is the same model as the repo.
+    path = "C:\\Users\\u\\.cache\\huggingface\\hub\\models--org--name\\snapshots\\abc123"
+    assert identity_mismatches(dict(ident, model_id=path), ident) == []
+    assert identity_from_config({"model_id": path})["model_id"] == "org/name"
+    assert identity_mismatches(dict(ident, model_id="org/other"), ident) == ["model_id: 'org/other' vs 'org/name'"]
 
 
 # -------------------------------------------------------------------------------- loaded models
@@ -195,3 +201,33 @@ def test_a_trained_probe_records_its_model_identity_and_refuses_another(tmp_path
     other = _ws(tmp_path, model=TinyCausalLM().float(), tokenizer=CharChatTok(), model_id="tiny-test")
     with pytest.raises(ValueError, match="dtype: 'float64' vs 'float32'"):
         other.get_probe(project_directory=probe.run_dir)
+
+
+def test_a_probe_given_only_its_model_id_attaches_to_that_model():
+    pos, neg = np.random.default_rng(0).normal(size=(2, 6, 3, 8))
+    probe = ConceptProbe.fit(pos + 1.0, neg, layer=1, identity="tiny-test", save=False)
+    probe.attach(ModelBundle.from_loaded(TinyCausalLM(), CharChatTok(), model_id="tiny-test"))  # only its id was known
+    assert probe.identity["model_id"] == "tiny-test" and probe.identity["dtype"] == "float64"
+    other = ConceptProbe.fit(pos + 1.0, neg, layer=1, identity="another-model", save=False)
+    with pytest.raises(ValueError, match="model_id: 'another-model' vs 'tiny-test'"):
+        other.attach(ModelBundle.from_loaded(TinyCausalLM(), CharChatTok(), model_id="tiny-test"))
+
+
+def test_float32_on_a_gpu_leaves_out_the_memory_efficient_attention_kernel(monkeypatch):
+    from torch.nn import attention
+
+    gpu32 = SimpleNamespace(dtype=torch.float32, device=torch.device("cuda", 0),
+                            config=SimpleNamespace(_attn_implementation="sdpa"))
+    used = []
+    monkeypatch.setattr(attention, "sdpa_kernel", lambda backends: (used.append(list(backends)), __import__("contextlib").nullcontext())[1])
+    with modeling.safe_attention(gpu32):
+        pass
+    assert used and attention.SDPBackend.EFFICIENT_ATTENTION not in used[0]
+    assert modeling.attention_choice(gpu32).setting == "attention kernel"
+    for other in (SimpleNamespace(**{**vars(gpu32), "dtype": torch.float16}),
+                  SimpleNamespace(**{**vars(gpu32), "device": torch.device("cpu")}), TinyCausalLM()):
+        assert modeling.attention_choice(other) is None
+    used.clear()
+    with modeling.safe_attention(TinyCausalLM()):
+        pass
+    assert not used  # nothing changes elsewhere

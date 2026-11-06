@@ -1013,6 +1013,16 @@ GitHub Actions CI runs the same lightweight checks and also builds source and wh
 
 ### Unreleased
 
+- **Fixed (found re-running the workshop with this version):**
+  - in float32 on a GPU, reading in batches could read one text wrong at every layer, silently
+    (Gemma 3 1B: the longest text of a padded batch, through PyTorch's memory-efficient attention
+    kernel). Reading, generating and `answer_logprobs` now leave that kernel out in float32 on a GPU,
+    and say so when the model loads;
+  - `learning_curve` split the eval items differently for every draw, so the spread across draws
+    mixed in which items measured; now they are split once;
+  - a probe saved with the model's path in the Hugging Face cache refused the same model loaded by
+    its repo name, and a probe given only the model id (`identity="org/name"`) refused that model;
+    identities now compare the repo, and only what both sides say.
 - **Probes toward any target, and the shape of representations** (`structure.py`): `Target`
   (categories, a number, an order, a cycle, a layout), `read_target` (centroid, linear, through the
   shape, or any model with fit/predict; with a shuffled-target control) and `target_shape`

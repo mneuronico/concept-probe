@@ -350,7 +350,9 @@ def learning_curve(
 
     For each size ``n``, ``n_repeats`` times: ``n`` training items of each pole drawn at random (the
     same pairs of both poles when ``paired``), directions fitted, and :func:`evaluate_reading` on
-    ``eval_sets`` (the layer chosen on part of the primary set, or ``layer``). The control, ``n_null``
+    ``eval_sets`` (the layer chosen on part of the primary set, or ``layer``; the primary set is split
+    once, the same way for every draw, so the spread across draws is that of the training items
+    drawn). The control, ``n_null``
     times per size: the ``2n`` items of a draw split into two random groups, fitted and evaluated
     the same way, which says what d a probe of that size reaches with no concept at all. Each draw
     also gives the cosine between its direction and the one fitted on every training item, at the
@@ -369,8 +371,10 @@ def learning_curve(
     rows: List[Dict[str, Any]] = []
 
     def evaluate(dirs: np.ndarray, kind: str, n: int, rep: int) -> None:
+        # The same seed for every draw: the eval items are split the same way each time, so the
+        # spread across draws comes from the training items drawn, not from which items measure.
         ev = evaluate_reading(dirs, eval_sets, layer=layer, selection_split=selection_split, n_random=0,
-                              n_bootstrap=0, n_permutations=0, seed=int(rng.integers(1 << 31)))
+                              n_bootstrap=0, n_permutations=0, seed=seed)
         v = dirs[ev.layer]
         row = {"n": int(n), "kind": kind, "repeat": rep, "layer": int(ev.layer), "d": ev.main.d, "auroc": ev.main.auroc,
                "cos_full": float(v @ full[ev.layer] / (np.linalg.norm(v) * np.linalg.norm(full[ev.layer]) + 1e-12))}

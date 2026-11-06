@@ -27,7 +27,7 @@ from .inputs import (
     token_char_offsets,
 )
 from .interventions import active_interventions, edited_outputs
-from .modeling import _resolve_attr_path, attention_mask_from_ids, get_transformer_layers, identity_of
+from .modeling import _resolve_attr_path, get_transformer_layers, identity_of, safe_attention
 from .record import Choice, announce
 from .settings import default_rep_cache_dir, settings
 from .utils import resolve_layer_index
@@ -328,7 +328,7 @@ def _forward_batch(model, ids_list: Sequence[torch.Tensor], pad_id: int) -> Tupl
 
     handle = _get_final_norm_module(model).register_forward_pre_hook(capture)
     try:
-        with edited_outputs(model) as edited:
+        with edited_outputs(model) as edited, safe_attention(model):
             out = model(input_ids=input_ids.to(model.device), attention_mask=attn.to(model.device),
                         output_hidden_states=True, use_cache=False, return_dict=True, **_forward_kwargs(model))
     finally:
@@ -359,7 +359,9 @@ class RepCache:
 
     ``dtype="float32"`` stores what reading computed, so a cached read equals a fresh one;
     ``"float16"`` halves the size and rounds to float16, falling back to float32 for an entry with
-    a value float16 cannot hold.
+    a value float16 cannot hold. The rounding is not always negligible: models with large
+    activations (Gemma 3's reach tens of thousands, rounded by whole units) can read differently;
+    with Gemma 3 1B it moved a probe's d by about 1% (2.70 read, 2.73 from float16).
     """
 
     def __init__(self, root: str, identity: Dict[str, Any], dtype: str = "float32"):

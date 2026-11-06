@@ -3,14 +3,15 @@ import json
 import os
 import re
 import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import torch
 import transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-from .record import Choice
+from .record import Choice, announce
 from .utils import torch_dtype_from_str
 
 
@@ -358,7 +359,7 @@ def identity_from_config(model_cfg: Dict[str, Any]) -> Dict[str, Any]:
     """The identity a saved config describes (for runs saved before identities were recorded)."""
     quant = upgrade_saved_config({"model": dict(model_cfg)})["model"].get("quantization")
     return {
-        "model_id": model_cfg.get("model_id"),
+        "model_id": None if model_cfg.get("model_id") is None else _repo_id_from_path(model_cfg["model_id"]),
         "dtype": _config_dtype_name(model_cfg.get("dtype")),
         "quantization": quantization_identity(quant),
         "chat_template": model_cfg.get("chat_template") or None,
@@ -368,15 +369,63 @@ def identity_from_config(model_cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 def identity_mismatches(a: Dict[str, Any], b: Dict[str, Any]) -> List[str]:
     """The identity settings (:data:`IDENTITY_KEYS`) on which ``a`` and ``b`` differ, as text.
-    A dtype that one side does not know (an old run saved with ``"auto"``) is not compared."""
+    A setting that one side does not give (an identity given as the model id alone) is not
+    compared, nor a dtype one side does not know (an old run saved with ``"auto"``); and a model
+    given by its snapshot in the Hugging Face cache is the same as the repo it comes from (runs
+    saved by earlier versions recorded the path)."""
     out = []
     for key in IDENTITY_KEYS:
+        if key not in a or key not in b:
+            continue
         va, vb = a.get(key), b.get(key)
         if key == "dtype" and (va is None or vb is None):
             continue
+        if key == "model_id" and va is not None and vb is not None:
+            va, vb = _repo_id_from_path(va), _repo_id_from_path(vb)
         if va != vb:
             out.append(f"{key}: {va!r} vs {vb!r}")
     return out
+
+
+# ---------------------------------------------------------------------------------------- attention
+def _avoids_efficient_attention(model: Any) -> bool:
+    """Whether the model runs where PyTorch's memory-efficient attention kernel is not trusted: in
+    float32, on a GPU, through ``sdpa``."""
+    config = getattr(model, "config", None)
+    device = getattr(model, "device", None)
+    return (getattr(model, "dtype", None) == torch.float32 and getattr(device, "type", None) == "cuda"
+            and getattr(config, "_attn_implementation", None) == "sdpa")
+
+
+def attention_choice(model: Any) -> Optional[Choice]:
+    """The choice :func:`safe_attention` makes for ``model``, or None when it changes nothing."""
+    if not _avoids_efficient_attention(model):
+        return None
+    return Choice("attention kernel", "any sdpa kernel", "sdpa without the memory-efficient kernel",
+                  "in float32 on a GPU that kernel gave wrong hidden states for one row of a padded batch "
+                  "(Gemma 3 1B, torch 2.7) while the others were exact")
+
+
+@contextmanager
+def safe_attention(model: Any) -> Iterator[None]:
+    """Run the model's forward passes with attention kernels that give the same result in a batch as
+    alone. In float32 on a GPU, PyTorch's memory-efficient kernel is left out (the exact one runs
+    instead; flash attention does not take float32): with it, Gemma 3 1B read one text of a padded
+    batch wrong at every layer, silently. Announced once per model; elsewhere it does nothing."""
+    choice = attention_choice(model)
+    if choice is None:
+        yield
+        return
+    if not getattr(model, "_concept_probe_attention_announced", False):
+        announce([choice])
+        try:
+            setattr(model, "_concept_probe_attention_announced", True)
+        except Exception:
+            pass
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    with sdpa_kernel([SDPBackend.MATH, SDPBackend.FLASH_ATTENTION]):
+        yield
 
 
 # ------------------------------------------------------------------------------------------- bundle
@@ -439,6 +488,10 @@ class ModelBundle:
             pass
         identity = identity_of(model, tokenizer, model_id)
         identity["dtype"] = _dtype_name(dtype)  # the compute dtype, also for quantized models
+        attention = attention_choice(model)
+        if attention is not None:  # said here, with the other choices of loading, and not again
+            choices.append(attention)
+            setattr(model, "_concept_probe_attention_announced", True)
         return cls(model_id=model_id, tokenizer=tokenizer, model=model, identity=identity, choices=choices)
 
     @classmethod

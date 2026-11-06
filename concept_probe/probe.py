@@ -1533,6 +1533,8 @@ class ConceptProbe:
             if mismatched and not allow_model_mismatch:
                 raise ValueError("The model differs from the one this probe belongs to (probe vs model: "
                                  + "; ".join(mismatched) + "); pass allow_model_mismatch=True to use it anyway.")
+            if not mismatched:  # a probe given only the model id now knows the rest of its model
+                self.identity = {**mine, **self.identity}
         else:
             self.identity = mine
         self.model_bundle = bundle

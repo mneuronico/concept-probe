@@ -22,7 +22,7 @@ import torch
 
 from .inputs import Encoded, PromptLike, _decode_tokens, _normalize_messages
 from .interventions import Intervention, intervene
-from .modeling import apply_chat, get_transformer_layers
+from .modeling import apply_chat, get_transformer_layers, safe_attention
 from .reading import _forward_batch, check_finite_hidden_states
 from .settings import settings
 from .utils import ensure_dir, json_dump, now_tag, set_seed
@@ -399,7 +399,7 @@ def generate(
         watcher = _Nothing() if on_token is None else _Watcher(model, scorers, on_token, rows, eos_ids)
         keeper = _Nothing() if keep_logits is None else _LogitKeeper(model, keep_logits)
         sampling = {"do_sample": False, "temperature": None, "top_p": None, "top_k": None} if greedy else             {"do_sample": True, "temperature": temperature, "top_p": top_p}
-        with applied, watcher, keeper:
+        with applied, watcher, keeper, safe_attention(model):
             out = model.generate(input_ids=input_ids.to(model.device), attention_mask=attn.to(model.device),
                                  max_new_tokens=int(max_new_tokens), pad_token_id=pad, **sampling)
         out = out.detach().cpu()
@@ -497,7 +497,7 @@ def _continuation_logprobs(model, pairs: Sequence[Tuple[torch.Tensor, torch.Tens
         lo, hi = min(plens) - 1, max(lens) - 1  # the positions whose logits predict continuation tokens
         kwargs: Dict[str, Any] = {"logits_to_keep": torch.arange(lo, hi, device=model.device)} if keep_arg else {}
         applied = _Nothing() if intervention is None else intervene(model, intervention, prompt_lens=plens)
-        with applied:
+        with applied, safe_attention(model):
             logits = model(input_ids=input_ids.to(model.device), attention_mask=attn.to(model.device),
                            use_cache=False, **kwargs).logits
         offset = lo if keep_arg else 0
