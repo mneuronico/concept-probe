@@ -30,8 +30,9 @@ def _chat_template_kwargs(tokenizer) -> Dict[str, Any]:
 
     Some templates (Llama 3.2 and 3.3, among others) write today's date into every prompt
     through transformers' ``strftime_now``, so the same input tokenizes differently on different
-    days. We render them with a fixed date instead: ``model.chat_template_date`` (ISO
-    ``YYYY-MM-DD``, default 2024-07-26), or the real date when that setting is null.
+    days. We render them with a fixed date instead: the ``chat_template_date`` given to
+    ``ModelBundle.load`` or :func:`apply_tokenizer_overrides` (ISO ``YYYY-MM-DD``, default
+    2024-07-26), or the real date when it is None.
     """
     template = getattr(tokenizer, "chat_template", None)
     if not template or "strftime_now" not in str(template):
@@ -325,62 +326,11 @@ def identity_of(model: Any, tokenizer: Any, model_id: Optional[str] = None) -> D
     }
 
 
-def _config_dtype_name(value: Any) -> Optional[str]:
-    """A config's dtype as a dtype name; None for ``"auto"`` (unknown until a model is loaded)."""
-    if value in (None, "auto"):
-        return None
-    try:
-        return _dtype_name(torch_dtype_from_str(value))
-    except ValueError:
-        return str(value)
-
-
-def upgrade_saved_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """A run's saved config in today's terms: runs saved by earlier versions wrote
-    ``model.use_4bit`` (now ``model.quantization = "nf4"``), ``training.direction_normalization``
-    (now ``training.estimator``) and settings of the old per-generation score files. Returns a new
-    dict; today's configs come back unchanged."""
-    cfg = json.loads(json.dumps(cfg))
-    model = cfg.get("model", {})
-    if "use_4bit" in model:
-        if model.pop("use_4bit") and model.get("quantization") is None:
-            model["quantization"] = "nf4"
-        model.setdefault("quantization", None)
-    training = cfg.get("training", {})
-    if "direction_normalization" in training:
-        normalization = training.pop("direction_normalization") or "none"
-        training.setdefault("estimator", {"kind": "mean_diff", "normalization": normalization})
-    # Before scores were saved as one set of files per call: steering.do_steering (alphas decided),
-    # output.save_token_scores_npz (saving is on or off as a whole), and three settings of the logits.
-    cfg.get("steering", {}).pop("do_steering", None)
-    output = cfg.get("output", {})
-    output.pop("save_token_scores_npz", None)
-    keep, top_k = output.pop("save_generation_logits", None), output.pop("generation_logits_top_k", None)
-    output.pop("generation_logits_dtype", None)
-    if keep is not None and "generation_logits" not in output:
-        output["generation_logits"] = (int(top_k) if top_k else "all") if keep else None
-    return cfg
-
-
-def identity_from_config(model_cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """The identity a saved config describes (for runs saved before identities were recorded)."""
-    quant = upgrade_saved_config({"model": dict(model_cfg)})["model"].get("quantization")
-    return {
-        "model_id": None if model_cfg.get("model_id") is None else _repo_id_from_path(model_cfg["model_id"]),
-        "dtype": _config_dtype_name(model_cfg.get("dtype")),
-        "quantization": quantization_identity(quant),
-        "chat_template": model_cfg.get("chat_template") or None,
-        "chat_template_date": model_cfg.get("chat_template_date", DEFAULT_CHAT_TEMPLATE_DATE),
-    }
-
-
 def identity_mismatches(a: Dict[str, Any], b: Dict[str, Any]) -> List[str]:
     """The identity settings (:data:`IDENTITY_KEYS`) on which ``a`` and ``b`` differ, as text.
     A setting that one side does not give (an identity given as the model id alone) is not
-    compared, nor a model id or dtype one side does not know (a model loaded without its name, an
-    old run saved with ``"auto"``); and a model
-    given by its snapshot in the Hugging Face cache is the same as the repo it comes from (runs
-    saved by earlier versions recorded the path)."""
+    compared, nor a model id or dtype one side does not know (a model loaded without its name); and
+    a model given by its snapshot in the Hugging Face cache is the same as the repo it comes from."""
     out = []
     for key in IDENTITY_KEYS:
         if key not in a or key not in b:

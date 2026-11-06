@@ -1,13 +1,12 @@
 """Reference outputs, on a tiny deterministic model (tests/tiny_model.py).
 
-``reference/reference_outputs.json`` holds what the library returned before its redesign
-(docs/DESIGN.md): the training of a probe in texts mode, with a user role, with variance-normalized
+``reference/reference_outputs.json`` holds what an earlier version of the library returned:
+the training of a probe in texts mode, with a user role, with variance-normalized
 directions, and on completions generated under a system prompt per pole (shared and opposed
 questions); scoring texts token by token; steering and scoring the completions; reading texts and
 completions. These tests compute the same things with today's layers (``read_texts``,
 ``generate``, ``ConceptProbe.fit`` with eval sets, ``evaluate_steering``) and check that the numbers
-are the same, up to rounding (decision D8). What was meant to change (decisions D1 and D2) changed
-before this reference was taken.
+are the same, up to rounding (reading in batches changes the last digits in half precision).
 
 When a change is meant to alter these outputs, regenerate the reference and commit it together with
 a note of what changed and why:
@@ -117,9 +116,9 @@ def _text_set(name, pos, neg, **read):
 
 
 def _train_on_texts(name, estimator="mean_diff", **read):
-    P = read_texts(MODEL, TOK, TRAIN_POS, norms=True, cache=False, **read)
-    N = read_texts(MODEL, TOK, TRAIN_NEG, norms=True, cache=False, **read)
-    return ConceptProbe.fit(P, N, eval=_text_set("eval", EVAL_POS, EVAL_NEG, **read), estimator=estimator,
+    P = read_texts(MODEL, TOK, TRAIN_POS, cache=False, **read)
+    N = read_texts(MODEL, TOK, TRAIN_NEG, cache=False, **read)
+    return ConceptProbe.fit(P, N, eval_sets=_text_set("eval", EVAL_POS, EVAL_NEG, **read), estimator=estimator,
                             name=name, **FIT), (P, N), None
 
 
@@ -146,15 +145,15 @@ def _generated_set(name, gens_pos, gens_neg, system):
 def _train_on_generations(name, questions_pos, questions_neg):
     gen = dict(max_new_tokens=10, batch_size=4, save=False)
     P = read_encoded(MODEL, TOK, generate(MODEL, TOK, questions_pos, system=POS_SYSTEM, **gen).encodings(),
-                     norms=True, cache=False)
+                     cache=False)
     N = read_encoded(MODEL, TOK, generate(MODEL, TOK, questions_neg, system=NEG_SYSTEM, **gen).encodings(),
-                     norms=True, cache=False)
+                     cache=False)
     gp = generate(MODEL, TOK, EVAL_QUESTIONS, system=POS_SYSTEM, **gen)
     gn = generate(MODEL, TOK, EVAL_QUESTIONS, system=NEG_SYSTEM, **gen)
     main, both = _generated_set("eval", gp, gn, None)
     with_system, _ = _generated_set("eval_with_system_prompt", gp, gn, "as generated")
     texts = _text_set("texts", EVAL_POS, EVAL_NEG)
-    probe = ConceptProbe.fit(P, N, eval=[main, with_system, texts], name=name, **FIT)
+    probe = ConceptProbe.fit(P, N, eval_sets=[main, with_system, texts], name=name, **FIT)
     return probe, (P, N), both
 
 
@@ -183,14 +182,14 @@ def _summary(probe, train_reps, eval_questions):
     cal = probe.calibrations[0]
     out = {
         "best_layer": probe.layer, "best_d": main.d, "best_p": main.p, "best_d_ci95": main.d_ci95,
-        "selection": ev.selection, "best_d_selection": ev.d_selection, "best_d_all_eval": float(main.d_curve[probe.layer]),
+        "selection": ev.selection, "best_d_selection": ev.d_selection, "best_d_all_eval": float(main.d_by_layer[probe.layer]),
         "n_eval_selection": {"pos": len(ev.selection_idx[0]), "neg": len(ev.selection_idx[1])},
-        "sweep_max_d": ev.sweep_max_d, "sweep_max_d_perm_p": ev.sweep_max_d_perm_p,
+        "sweep_max_d": ev.max_d, "sweep_max_d_perm_p": ev.max_d_permutation_p,
         "sigma_best_layer": float(cal.scale[probe.layer]), "n_train_pos": len(train_reps[0].data),
         "n_train_neg": len(train_reps[1].data), "n_eval_pos": main.n_pos, "n_eval_neg": main.n_neg,
         "eval_paired": main.paired, "score_center": cal.center, "score_scale": cal.scale,
         "token_center": cal.token_center, "token_scale": cal.token_scale, "concept_vectors": probe.directions,
-        "sweep_d": probe.sweep_d, "sweep_p": probe.sweep_p, "resid_norm": probe.resid_norm,
+        "sweep_d": probe.d_by_layer, "sweep_p": probe.p_by_layer, "resid_norm": probe.resid_norm,
         "train_pos_reps": train_reps[0].data, "train_neg_reps": train_reps[1].data,
         "eval_pos_scores_mat": main.pos_scores, "eval_neg_scores_mat": main.neg_scores,
     }
@@ -198,7 +197,7 @@ def _summary(probe, train_reps, eval_questions):
     out["transfer_eval"] = None if texts is None else {
         "n_pos": texts.n_pos, "n_neg": texts.n_neg, "d_at_best_layer": texts.d, "p_at_best_layer": texts.p,
         "d_ci95_at_best_layer": texts.d_ci95}
-    out["transfer_sweep_d"] = np.full(probe.num_layers, np.nan) if texts is None else texts.d_curve
+    out["transfer_sweep_d"] = np.full(probe.num_layers, np.nan) if texts is None else texts.d_by_layer
     if eval_questions is not None:
         out["eval_question_idx"] = eval_questions
     return out
@@ -245,7 +244,7 @@ def test_steering_and_scoring_the_completions(probes):
     run = dict(n_bootstrap=50, max_new_tokens=10, save=False)
     calls = {
         "raw": (shared, dict(doses=[4.0, -4.0], unit="raw", n_random=0)),
-        "sigma_window": (shared, dict(doses=[2.0], unit="sigma", window=1, distribute=True, n_random=0)),
+        "sigma_window": (shared, dict(doses=[2.0], unit="sd", window=1, distribute=True, n_random=0)),
         "resid_norm_list": (shared, dict(doses=[0.3], unit="resid_norm", layers=[1, 2], n_random=0)),
         "random_controls": (shared, dict(doses=[4.0], unit="raw", n_random=2)),
     }
@@ -279,7 +278,7 @@ def test_several_probes_read_the_same_completions(probes):
 def test_reading_texts_and_completions():
     out = {
         "text_reps": {k: v.data for k, v in read_texts(MODEL, TOK, EVAL_POS[:3], ["text_mean", "text_last",
-                                                                                 "sequence_last_k"], last_k=2,
+                                                                                 "through_text_last_k"], last_k=2,
                                                        cache=False).items()},
         "text_reps_user": read_texts(MODEL, TOK, EVAL_NEG[:2], role="user", system="x y z", cache=False).data,
         "text_reps_assistant": read_texts(MODEL, TOK, EVAL_NEG[:2], role="assistant", prompt="say", cache=False).data,
@@ -288,7 +287,7 @@ def test_reading_texts_and_completions():
     }
     stored = _stored("extract_reps_and_token_scores")
     old_names = {"text_mean": "assistant_all_mean", "text_last": "assistant_last",
-                 "sequence_last_k": "sequence_last_k_mean"}
+                 "through_text_last_k": "sequence_last_k_mean"}
     expected = {k: v for k, v in stored.items() if k != "token_scores"}
     expected["text_reps"] = {new: stored["text_reps"][old] for new, old in old_names.items()}
     _assert_close(json.loads(json.dumps(_jsonable(out))), expected, "reading")

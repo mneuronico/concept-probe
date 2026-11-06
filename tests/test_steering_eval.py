@@ -1,4 +1,4 @@
-"""Evaluating steering (layer 6c): the dose sweep, its random controls, the measures of effect and
+"""Evaluating steering: the dose sweep, its random controls, the measures of effect and
 coherence, and the largest coherent dose."""
 import json
 import os
@@ -35,8 +35,8 @@ def test_a_sweep_measures_each_dose_against_dose_zero_with_random_controls(probe
     assert zero["effects"]["concept"]["change"] == 0.0 and zero["coherence"]["controls"]["coherent"] == []
     effect = up["effects"]["concept"]
     assert effect["change"] > 0 and effect["ci95"][0] > 0 and len(effect["controls"]) == 4
-    assert effect["control_p95_abs"] == pytest.approx(np.percentile(np.abs(effect["controls"]), 95))
-    assert effect["beyond_controls"] is (abs(effect["change"]) > effect["control_p95_abs"])
+    assert effect["null_abs_change95"] == pytest.approx(np.percentile(np.abs(effect["controls"]), 95))
+    assert effect["beyond_controls"] is (abs(effect["change"]) > effect["null_abs_change95"])
     assert up["effects"]["p_share"]["change"] > 0 and ev.row(-3.0)["effects"]["concept"]["change"] < 0
     # each completion carries its measures
     it = ev.scores[0]
@@ -44,7 +44,7 @@ def test_a_sweep_measures_each_dose_against_dose_zero_with_random_controls(probe
 
 
 def test_a_control_is_the_same_random_direction_at_every_dose(probe):
-    ev = evaluate_steering(probe, QUESTIONS[:2], [2.0, 4.0], n_random=2, random_seed=7, max_new_tokens=4)
+    ev = evaluate_steering(probe, QUESTIONS[:2], [2.0, 4.0], n_random=2, control_seed=7, max_new_tokens=4)
     controls = [it.info["intervention"] for it in ev.scores if it.info["control"] == 1]
     assert {tuple(c["control_seed"]) for c in controls} == {(7, 1)}
     by_dose = {it.info["dose"]: it.info["intervention"] for it in ev.scores if it.info["control"] == 1}
@@ -82,7 +82,7 @@ def test_coherence_rule_and_the_largest_coherent_dose():
 
 def test_a_custom_rule_decides_coherence(probe):
     ev = evaluate_steering(probe, QUESTIONS[:2], [3.0], n_random=1, max_new_tokens=4,
-                           coherence=lambda at_dose, at_zero: at_dose["n_tokens"] > 100)
+                           coherence_rule=lambda at_dose, at_zero: at_dose["n_tokens"] > 100)
     assert ev.row(3.0)["coherence"]["coherent"] is False and ev.largest_coherent_dose["positive"] is None
 
 
@@ -102,7 +102,7 @@ def test_measure_names_must_not_clash(probe):
 def test_the_evaluation_is_saved_with_its_plot(probe, tmp_path):
     ev = evaluate_steering(probe, QUESTIONS[:2], [2.0, -2.0], n_random=2, max_new_tokens=4, save=True,
                            out_dir=str(tmp_path), html=False)
-    assert ev.dir == str(tmp_path)
+    assert ev.out_dir == str(tmp_path)
     assert sorted(os.listdir(tmp_path)) == ["dose_response.png", "scores.jsonl", "scores.npz", "settings.json",
                                             "steering.json"]
     saved = json.load(open(tmp_path / "steering.json", encoding="utf-8"))
@@ -125,7 +125,7 @@ def test_a_judge_is_one_more_measure(probe, monkeypatch):
     monkeypatch.setattr(judges, "_post_json", fake_post)
     judge = judges.APIJudge("openrouter", "some/model", api_key="k", texts_per_request=4)
     ev = evaluate_steering(probe, QUESTIONS[:3], [2.0], n_random=1, max_new_tokens=4,
-                           measures={"coherence": judge.measure(judges.COHERENCE)})
+                           measures={"coherence": judge.as_measure(judges.COHERENCE)})
     assert sum(sent) == len(ev.scores) == 3 * 3 and max(sent) == 4  # every completion, at most 4 per request
     assert [it.info["coherence"] for it in ev.scores][:3] == [1.0, 0.5, 0.0]
     assert ev.measures["coherence"] == "function of the texts"
@@ -155,14 +155,14 @@ def test_measures_can_be_added_after_the_sweep_by_an_agent(probe, tmp_path):
     judge = AgentJudge(str(tmp_path / "tasks"))
     rubric = Rubric("has_p", "Does the text contain the letter p?", {"yes": 1.0, "no": 0.0})
     with pytest.raises(AnswersPending) as pending:
-        ev.add_measure("has_p", judge.measure(rubric))
-    task = pending.value.path
+        ev.add_measure("has_p", judge.as_measure(rubric))
+    task = pending.value.task_dir
     assert "answers.jsonl" in open(f"{task}/TASK.md", encoding="utf-8").read()
     rows = [json.loads(line) for line in open(f"{task}/items.jsonl", encoding="utf-8")]
     with open(f"{task}/answers.jsonl", "w", encoding="utf-8") as f:  # what the agent writes
         for r in rows:
             f.write(json.dumps({"id": r["id"], "answer": "yes" if "p" in r["text"] else "no"}) + "\n")
-    ev.add_measure("has_p", judge.measure(rubric))
+    ev.add_measure("has_p", judge.as_measure(rubric))
     assert ev.row(3.0)["effects"]["has_p"]["change"] >= 0
     reloaded = SteeringEvaluation.load(str(tmp_path / "sweep"))
     assert set(reloaded.measures) == {"concept", "correct", "has_p"} and reloaded.items == items
@@ -186,7 +186,7 @@ def _synthetic(doses, n_prompts=200, seed=0):
                                     {"dose": d, "control": None, "score": score, "correct": right,
                                      "perplexity": 2.0, "repetition": 0.0, "n_tokens": 5}))
     return SteeringEvaluation(Scores("generations", [], items), list(doses), {"score": "x", "correct": "x"}, [], {},
-                              {"n_random": 0}, rule=CoherenceRule())
+                              {"n_random": 0}, coherence_rule=CoherenceRule())
 
 
 def test_relate_does_not_depend_on_the_range_of_doses():

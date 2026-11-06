@@ -1,4 +1,4 @@
-"""Reading (layer 1): batches, readouts, the embedding layer and the representations cache.
+"""Reading: batches, readouts, the embedding layer and the representations cache.
 
 The tiny model (tests/tiny_model.py) is context-dependent and float64, so a batched read must equal
 reading one input at a time, and every readout can be checked against the hidden states directly.
@@ -13,7 +13,7 @@ import concept_probe
 from concept_probe import EmptySpanError, NonFiniteActivationsError, Readout, read_texts
 from concept_probe.inputs import encode_text
 from concept_probe.modeling import get_transformer_layers
-from concept_probe.reading import READ_MODES, RepCache, read_encoded, reps_from_hs_layers
+from concept_probe.reading import READ_MODES, _RepCache, read_encoded, reps_from_hs_layers
 from fakes import hidden_states_alone as forward_hidden_states_alone
 from fakes import CharChatTok
 from tiny_model import TinyCausalLM
@@ -104,16 +104,16 @@ def test_a_prompt_is_read_as_generation_feeds_it():
     from concept_probe import generate
 
     model, tok = TinyCausalLM(), CharChatTok()
-    enc = encode_text(tok, "ppx", generation=True)
+    enc = encode_text(tok, "ppx", add_generation_prompt=True)
     assert tok.decode(enc.input_ids.tolist()) == "^<u>ppx|<a>"
     assert tok.decode(enc.input_ids[enc.start:enc.end].tolist()) == "ppx"
-    whole = read_texts(model, tok, ["ppx"], Readout("input", "tokens"), generation=True, cache=False)
+    whole = read_texts(model, tok, ["ppx"], Readout("input", "tokens"), add_generation_prompt=True, cache=False)
     assert whole.positions.tolist() == list(range(len(enc.input_ids)))  # up to the token that predicts the reply
     assert Readout("input", "last").name == "input:last"
     gens = generate(model, tok, ["ppx"], max_new_tokens=1, save=False)
     assert gens[0].token_ids[:gens[0].prompt_len].tolist() == enc.input_ids.tolist()
     with pytest.raises(ValueError, match="do not apply"):
-        encode_text(tok, "ppx", role="assistant", prompt="q", generation=True)
+        encode_text(tok, "ppx", role="assistant", prompt="q", add_generation_prompt=True)
 
 
 def test_position_readouts_count_within_the_text():
@@ -163,15 +163,15 @@ def test_the_embedding_layer_is_asked_for_by_name():
 
 def test_readout_names_round_trip_and_bad_combinations_raise():
     for mode in READ_MODES:
-        assert Readout.parse(mode, 3).name == mode
+        assert Readout._parse(mode, 3).name == mode
     with pytest.raises(ValueError, match="at most one"):
         Readout(last_k=2, position=1)
     with pytest.raises(ValueError, match="span='text'"):
-        Readout(span="sequence", substring="x")
+        Readout(span="through_text", substring="x")
     with pytest.raises(ValueError, match="Unknown readout"):
-        Readout.parse("text_median")
-    with pytest.raises(ValueError, match="now called 'text_mean'"):  # an earlier version's name
-        Readout.parse("assistant_all_mean")
+        Readout._parse("text_median")
+    with pytest.raises(ValueError, match="Unknown readout"):
+        Readout._parse("assistant_all_mean")
 
 
 # ----------------------------------------------------------------------------------------- cache
@@ -192,9 +192,9 @@ def _entries(cache_dir):
 def test_the_cache_returns_what_a_fresh_read_returns(tmp_path):
     model, tok = _named(), CharChatTok()
     first = read_texts(model, tok, TEXTS, cache=str(tmp_path))
-    assert first.from_cache == 0 and _entries(first.cache_dir) == len(TEXTS)
+    assert first.n_from_cache == 0 and _entries(first.cache_dir) == len(TEXTS)
     again = read_texts(model, tok, TEXTS, cache=str(tmp_path))
-    assert again.from_cache == len(TEXTS)
+    assert again.n_from_cache == len(TEXTS)
     np.testing.assert_array_equal(again.data, first.data)
     assert any(c.setting == "representations cache" for c in first.choices)
 
@@ -202,10 +202,10 @@ def test_the_cache_returns_what_a_fresh_read_returns(tmp_path):
 def test_cache_entries_are_per_model_identity_and_readout(tmp_path):
     tok = CharChatTok()
     read_texts(_named(), tok, TEXTS, cache=str(tmp_path))
-    assert read_texts(_named(), tok, TEXTS, "text_last", cache=str(tmp_path)).from_cache == 0
+    assert read_texts(_named(), tok, TEXTS, "text_last", cache=str(tmp_path)).n_from_cache == 0
     other = read_texts(_named(seed=1, name="tiny-other"), tok, TEXTS, cache=str(tmp_path))
-    assert other.from_cache == 0 and other.cache_dir != read_texts(_named(), tok, TEXTS, cache=str(tmp_path)).cache_dir
-    assert read_texts(_named(), tok, TEXTS, role="user", cache=str(tmp_path)).from_cache == 0  # other token ids
+    assert other.n_from_cache == 0 and other.cache_dir != read_texts(_named(), tok, TEXTS, cache=str(tmp_path)).cache_dir
+    assert read_texts(_named(), tok, TEXTS, role="user", cache=str(tmp_path)).n_from_cache == 0  # other token ids
 
 
 def test_float16_cache_rounds_consistently_and_falls_back_when_values_do_not_fit(tmp_path):
@@ -215,7 +215,7 @@ def test_float16_cache_rounds_consistently_and_falls_back_when_values_do_not_fit
     again = read_texts(model, tok, TEXTS[:2], cache=str(tmp_path), cache_dtype="float16")
     np.testing.assert_array_equal(first.data, again.data)  # a fresh read returns what is stored
     np.testing.assert_allclose(first.data, exact, rtol=2e-3)
-    store = RepCache(str(tmp_path / "big"), {"model_id": "x"}, dtype="float16")
+    store = _RepCache(str(tmp_path / "big"), {"model_id": "x"}, dtype="float16")
     kept = store.put("k", {"reps": np.array([[7e4]], dtype=np.float32)})
     assert kept["reps"][0, 0] == np.float32(7e4) and store.fallbacks == ["k"]
     store.close()

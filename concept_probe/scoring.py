@@ -1,4 +1,4 @@
-"""Scoring texts and generations with probes, in memory, and saving the scores (layers 5 and 7).
+"""Scoring texts and generations with probes, in memory, and saving the scores.
 
 :func:`score_inputs` reads each input once (in batches) and projects every token on each probe's
 directions; :class:`Scores` holds the result of one call (one :class:`ScoredItem` per text or
@@ -13,7 +13,6 @@ plus ``settings.json`` with what the call used. :meth:`Scores.load` reads them b
 """
 import json
 import os
-import shutil
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
@@ -23,7 +22,7 @@ import torch
 from .generation import TokenScorer, TokenStep, _project_tokens, generate
 from .interventions import Intervention
 from .inputs import _decode_tokens
-from .utils import ensure_dir, json_dump, now_tag, set_seed
+from .utils import ensure_dir, json_dump, set_seed
 from .visuals import render_heatmaps, segment_token_scores
 
 SCORES_NPZ, SCORES_JSONL, HEATMAPS_HTML, SETTINGS_JSON = "scores.npz", "scores.jsonl", "heatmaps.html", "settings.json"
@@ -89,7 +88,7 @@ class Scores:
     items: List[ScoredItem]
     settings: Dict[str, Any] = field(default_factory=dict)
     z_missing: Dict[str, Optional[str]] = field(default_factory=dict)
-    dir: Optional[str] = None
+    out_dir: Optional[str] = None
 
     def per_text(self, how: str = "mean", probe: Optional[str] = None, *, z: bool = False) -> np.ndarray:
         """One number per item from its own tokens' scores (the text, or the completion): their
@@ -131,10 +130,6 @@ class Scores:
         """``info[key]`` of every item (e.g. ``"alpha"`` or ``"prompt"``), to group or filter them."""
         return [it.info.get(key) for it in self.items]
 
-    def records(self) -> List[Dict[str, Any]]:
-        """The lines of ``scores.jsonl``."""
-        return [it.record() for it in self.items]
-
     # ------------------------------------------------------------------------------ saving
     def save(self, out_dir: str, *, html: bool = True, segments: bool = False) -> str:
         """Write the scores to ``out_dir``. ``segments`` adds to each line the mean score of each
@@ -175,7 +170,7 @@ class Scores:
                                                           "z_missing": self.z_missing, "settings": self.settings})
         if html and self.items:
             self.heatmaps(os.path.join(out_dir, HEATMAPS_HTML))
-        self.dir = out_dir
+        self.out_dir = out_dir
         return out_dir
 
     def heatmaps(self, path: str, title: Optional[str] = None) -> str:
@@ -193,11 +188,11 @@ class Scores:
         return path
 
     @classmethod
-    def load(cls, path: str) -> "Scores":
+    def load(cls, out_dir: str) -> "Scores":
         """Scores saved by :meth:`save`."""
-        meta = json.loads(open(os.path.join(path, SETTINGS_JSON), encoding="utf-8").read())
-        lines = [json.loads(l) for l in open(os.path.join(path, SCORES_JSONL), encoding="utf-8") if l.strip()]
-        data = np.load(os.path.join(path, SCORES_NPZ))
+        meta = json.loads(open(os.path.join(out_dir, SETTINGS_JSON), encoding="utf-8").read())
+        lines = [json.loads(l) for l in open(os.path.join(out_dir, SCORES_JSONL), encoding="utf-8") if l.strip()]
+        data = np.load(os.path.join(out_dir, SCORES_NPZ))
         probes = [str(p) for p in data["probe_names"]]
         offsets, ids = data["offsets"], data["token_ids"]
         has_logits = "logits_offsets" in data.files
@@ -224,7 +219,7 @@ class Scores:
                                if k.startswith("logits_") and k != "logits_offsets"}
             items.append(item)
         return cls(kind=meta["kind"], probes=probes, items=items, settings=meta.get("settings", {}),
-                   z_missing=meta.get("z_missing", {}), dir=path)
+                   z_missing=meta.get("z_missing", {}), out_dir=out_dir)
 
 
 def _plain(x: Any) -> Any:
@@ -269,7 +264,7 @@ def item_z(scorer: TokenScorer, span_per_layer: np.ndarray) -> Optional[float]:
     span = np.asarray(span_per_layer, dtype=np.float64)
     if cal is None or (cal.context.readout or "text_mean") != "text_mean" or span.shape[0] == 0:
         return None
-    z = cal.items_z(span.mean(axis=0)[None, :], scorer.layers, scorer.aggregate)
+    z = cal._items_z(span.mean(axis=0)[None, :], scorer.layers, scorer.aggregate)
     return None if z is None else float(z[0])
 
 
@@ -289,11 +284,11 @@ def score_inputs(model, tokenizer, inputs: Sequence[ScoreInput], scorers: Sequen
                           score_mean_z={}, info=dict(x.info), logits=x.logits)
         for s in scorers:
             per_layer = per_probe[s.name]
-            agg = s.combine(per_layer).astype(np.float32)
+            agg = s._combine(per_layer).astype(np.float32)
             item.layers[s.name] = list(s.layers)
             item.scores[s.name] = per_layer
             item.token_scores[s.name] = agg
-            item.token_z[s.name] = s.token_z(per_layer)
+            item.token_z[s.name] = s._token_z(per_layer)
             item.score_mean[s.name] = float(np.mean(agg[lo:hi])) if hi > lo else None
             item.score_mean_z[s.name] = item_z(s, per_layer[lo:hi])
         items.append(item)
@@ -324,10 +319,10 @@ def generate_and_score(
     batch_size: int = 16,
     read_batch_size: int = 16,
     on_token: Optional[Callable[[TokenStep], Any]] = None,
-    watch: Sequence[Any] = (),
+    probes: Sequence[Any] = (),
     keep_logits: Any = None,
-    warn: Optional[Callable[[str], None]] = None,
     status: Optional[Callable[[str], None]] = None,
+    progress: Optional[Callable[[int, int], None]] = None,
 ) -> List[ScoredItem]:
     """Generate every prompt under each condition (in batches) and score every completion, read
     again without any intervention. Items come prompt by prompt, each prompt's conditions in order;
@@ -340,10 +335,11 @@ def generate_and_score(
     for c, condition in enumerate(conditions):
         gens = generate(model, tokenizer, prompts, system=system, max_new_tokens=max_new_tokens, greedy=greedy,
                         temperature=temperature, top_p=top_p, batch_size=batch_size,
-                        intervention=condition.intervention, on_token=on_token, watch=watch if on_token else (),
-                        keep_logits=keep_logits, save=False, warn=warn)
+                        intervention=condition.intervention, on_token=on_token, probes=probes if on_token else (),
+                        keep_logits=keep_logits, save=False)
         generated.extend((g.index, c, g, condition) for g in gens)
-        status(f"Generated condition {c + 1}/{len(conditions)}")
+        if progress is not None:
+            progress(c + 1, len(conditions))
     generated.sort(key=lambda x: (x[0], x[1]))
     inputs = [ScoreInput(torch.as_tensor(g.token_ids), (g.prompt_len, g.completion_end), g.text, g.index,
                          dict(condition.info, prompt=g.prompt, prompt_len=g.prompt_len, completion_end=g.completion_end,
@@ -352,23 +348,3 @@ def generate_and_score(
               for _, _, g, condition in generated]
     status(f"Scoring {len(inputs)} completions")
     return score_inputs(model, tokenizer, inputs, scorers, batch_size=read_batch_size)
-
-
-def batch_dir(base: str, batch_subdir: Optional[str], overwrite: bool) -> str:
-    """The folder of one call's scores: ``base/batch_subdir`` (a new timestamped name when None).
-
-    A folder that already holds files raises unless ``overwrite``, which deletes them and the
-    analysis folder: an earlier batch's files, such as its coherence ratings, would otherwise be
-    read together with the new ones.
-    """
-    out = base if batch_subdir == "" else os.path.join(base, batch_subdir or f"batch_{now_tag()}")
-    if os.path.isdir(out):
-        existing = [f for f in os.listdir(out) if os.path.isfile(os.path.join(out, f))]
-        if existing and not overwrite:
-            raise FileExistsError(f"{out} already holds a scoring batch ({len(existing)} files); pass another "
-                                  "batch_subdir, or overwrite=True to replace it.")
-        for f in existing:
-            os.remove(os.path.join(out, f))
-        shutil.rmtree(os.path.join(out, "analysis"), ignore_errors=True)
-    ensure_dir(out)
-    return out

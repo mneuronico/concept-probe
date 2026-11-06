@@ -1,4 +1,4 @@
-"""Evaluating steering (layer 6c of docs/DESIGN.md): a dose sweep with random controls and
+"""Evaluating steering: a dose sweep with random controls and
 measures you choose, and the largest dose that keeps the text coherent.
 
 :func:`evaluate_steering` generates every prompt at each dose of an intervention (a probe's
@@ -32,7 +32,7 @@ import torch
 
 from .generation import _continuation_logprobs, _pad_id
 from .interventions import Add, Intervention
-from .record import Choice, announce
+from .record import Choice, announce, progress_line
 from .scoring import Condition, Scores, generate_and_score
 from .settings import settings
 from .utils import ensure_dir, json_dump, now_tag
@@ -116,7 +116,7 @@ class CoherenceRule:
     """When a dose counts as coherent, against dose 0: the median perplexity of its completions
     under the unsteered model stays within ``perplexity_ratio`` times that of dose 0, and their mean
     repetition rate rises by at most ``repetition_increase``. The default numbers are a heuristic
-    (the ones that separated readable from broken text in one model of the authors' workshop), not a
+    (the ones that separated readable from broken text in one model the authors tried), not a
     standard: look at completions near the limit, and change them, or pass any function
     ``rule(at_dose, at_zero) -> bool``; both dicts have ``perplexity`` (median), ``repetition`` and
     ``n_tokens`` (means) and the mean of every measure."""
@@ -132,7 +132,7 @@ class CoherenceRule:
         return bool(lo * base <= ppl <= hi * base
                     and at_dose["repetition"] <= at_zero["repetition"] + self.repetition_increase)
 
-    def describe(self) -> Dict[str, Any]:
+    def to_dict(self) -> Dict[str, Any]:
         return {"rule": "perplexity and repetition against dose 0", "perplexity_ratio": list(self.perplexity_ratio),
                 "repetition_increase": self.repetition_increase}
 
@@ -206,7 +206,7 @@ def _table(items: List[Any], doses: List[float], n_random: int, names: List[str]
             row["effects"][name] = {
                 "mean": stats[name], "change": mean_change,
                 "ci95": None if d == 0.0 else _bootstrap_ci(delta, n_bootstrap, rng),
-                "n_prompts": int(np.isfinite(delta).sum()), "controls": control_means, "control_p95_abs": p95,
+                "n_prompts": int(np.isfinite(delta).sum()), "controls": control_means, "null_abs_change95": p95,
                 "beyond_controls": None if p95 is None else bool(abs(mean_change) > p95)}
         table.append(row)
     return table
@@ -231,8 +231,8 @@ class SteeringEvaluation:
     largest_coherent_dose: Dict[str, Optional[float]]
     settings: Dict[str, Any] = field(default_factory=dict)
     items: Optional[List[Any]] = None
-    dir: Optional[str] = None
-    rule: Callable[[Dict[str, float], Dict[str, float]], bool] = field(default_factory=CoherenceRule, repr=False)
+    out_dir: Optional[str] = None
+    coherence_rule: Callable[[Dict[str, float], Dict[str, float]], bool] = field(default_factory=CoherenceRule, repr=False)
 
     def row(self, dose: float) -> Dict[str, Any]:
         """The row of ``dose``: ``coherence`` (the steering's median perplexity, mean repetition and
@@ -246,8 +246,8 @@ class SteeringEvaluation:
 
     def _refresh(self) -> None:
         self.table = _table(self.scores.items, self.doses, int(self.settings.get("n_random", 0)), list(self.measures),
-                            self.rule, int(self.settings.get("n_bootstrap", 1000)),
-                            int(self.settings.get("random_seed", 0)))
+                            self.coherence_rule, int(self.settings.get("n_bootstrap", 1000)),
+                            int(self.settings.get("control_seed", 0)))
         self.largest_coherent_dose = _largest_coherent(self.table)
 
     def add_measure(self, name: str, measure: Any, *, kind: str = "function of the texts") -> "SteeringEvaluation":
@@ -275,21 +275,21 @@ class SteeringEvaluation:
             it.info[name] = float(v)
         self.measures[name] = kind
         self._refresh()
-        if self.dir is not None:
-            self.save(self.dir)
+        if self.out_dir is not None:
+            self.save(self.out_dir)
         return self
 
-    def relate(self, predictor: str, outcome: str, *, controls: bool = False) -> Dict[str, Any]:
+    def relate(self, predictor: str, outcome: str, *, include_random_controls: bool = False) -> Dict[str, Any]:
         """Whether ``predictor`` (a measure, e.g. a probe's score) predicts ``outcome`` (another, e.g.
         ``exact_match``) across completions, with the dose as a covariate: a GEE with each prompt as a
         cluster (it recurs at every dose), logistic when the outcome is 0/1 and linear otherwise,
         with robust standard errors corrected for few clusters. The predictor is in SDs within a dose,
-        since steering itself moves it. Random controls are left out unless ``controls``. Needs
+        since steering itself moves it. Random controls are left out unless ``include_random_controls``. Needs
         statsmodels."""
         for name in (predictor, outcome):
             if name not in self.measures and name not in ("perplexity", "repetition", "n_tokens"):
                 raise KeyError(f"no measure called {name!r}; the measures are {list(self.measures)}")
-        rows = [it for it in self.scores if controls or it.info["control"] is None]
+        rows = [it for it in self.scores if include_random_controls or it.info["control"] is None]
         x = np.array([it.info[predictor] for it in rows], dtype=np.float64)
         y = np.array([it.info[outcome] for it in rows], dtype=np.float64)
         dose = np.array([it.info["dose"] for it in rows], dtype=np.float64)
@@ -349,33 +349,33 @@ class SteeringEvaluation:
             "doses": self.doses, "measures": self.measures, "largest_coherent_dose": self.largest_coherent_dose,
             "table": self.table, "settings": self.settings, "items": items})
         self.plot(os.path.join(out_dir, "dose_response.png"))
-        self.dir = out_dir
+        self.out_dir = out_dir
         return out_dir
 
     @classmethod
-    def load(cls, path: str, rule: Optional[Callable] = None) -> "SteeringEvaluation":
-        """An evaluation saved by :meth:`save`, to add measures to it or relate them. ``rule`` is the
-        coherence rule (by default the one saved, when it was a :class:`CoherenceRule`)."""
-        data = json.loads(open(os.path.join(path, "steering.json"), encoding="utf-8").read())
+    def load(cls, out_dir: str, coherence_rule: Optional[Callable] = None) -> "SteeringEvaluation":
+        """An evaluation saved by :meth:`save`, to add measures to it or relate them. ``coherence_rule`` is the
+        rule that judges coherence (by default the one saved, when it was a :class:`CoherenceRule`)."""
+        data = json.loads(open(os.path.join(out_dir, "steering.json"), encoding="utf-8").read())
         saved = data["settings"].get("coherence_rule")
-        if rule is None:
+        if coherence_rule is None:
             if isinstance(saved, dict) and "perplexity_ratio" in saved:
-                rule = CoherenceRule(tuple(saved["perplexity_ratio"]), saved["repetition_increase"])
+                coherence_rule = CoherenceRule(tuple(saved["perplexity_ratio"]), saved["repetition_increase"])
             else:
                 import warnings
 
                 warnings.warn(f"the evaluation was judged with its own coherence rule ({saved}), which cannot be "
-                              "loaded; measures added now use the default CoherenceRule unless rule= is given",
+                              "loaded; measures added now use the default CoherenceRule unless coherence_rule= is given",
                               stacklevel=2)
-                rule = CoherenceRule()
-        ev = cls(Scores.load(path), [float(d) for d in data["doses"]], dict(data["measures"]), data["table"],
-                 data["largest_coherent_dose"], data["settings"], data.get("items"), path, rule)
+                coherence_rule = CoherenceRule()
+        ev = cls(Scores.load(out_dir), [float(d) for d in data["doses"]], dict(data["measures"]), data["table"],
+                 data["largest_coherent_dose"], data["settings"], data.get("items"), out_dir, coherence_rule)
         return ev
 
-    def plot(self, path: str) -> bool:
+    def plot(self, out_dir: str) -> bool:
         from .visuals import plot_dose_response
 
-        return plot_dose_response(self, path)
+        return plot_dose_response(self, out_dir)
 
 
 # ----------------------------------------------------------------------------------------- the sweep
@@ -399,7 +399,7 @@ def _prompt_norms(model, tokenizer, prompts: Sequence[Any], system: Optional[str
     """The mean residual norm per layer of the prompts' tokens, read as generation feeds them."""
     from .reading import read_texts
 
-    reps = read_texts(model, tokenizer, list(prompts), "text_mean", system=system, generation=True, norms=True,
+    reps = read_texts(model, tokenizer, list(prompts), "text_mean", system=system, add_generation_prompt=True,
                       batch_size=batch_size, cache=False, console=False)
     return np.asarray(reps.norms, dtype=np.float64).mean(axis=0)
 
@@ -410,7 +410,7 @@ def _resolve_steer(steer: Any, unit: str, layers: Any, window: Optional[int], di
     if _is_probe(steer):
         steer_layers = steer.steer_layer_list(layers, window)
         if norms is None:
-            steer._check_alpha_unit(unit)
+            steer._check_unit(unit)
             return (lambda d: steer.steering(d, unit, layers=steer_layers, distribute=distribute, positions=positions),
                     f"{steer.name} ({unit})")
         share = 1.0 / len(steer_layers) if distribute else 1.0
@@ -443,8 +443,8 @@ def evaluate_steering(
     probes: Sequence[Any] = (),
     measures: Optional[Dict[str, Any]] = None,
     n_random: int = 10,
-    random_seed: int = 0,
-    coherence: Callable[[Dict[str, float], Dict[str, float]], bool] = CoherenceRule(),
+    control_seed: int = 0,
+    coherence_rule: Callable[[Dict[str, float], Dict[str, float]], bool] = CoherenceRule(),
     system: Optional[str] = None,
     max_new_tokens: int = 48,
     greedy: bool = True,
@@ -478,9 +478,9 @@ def evaluate_steering(
     items (``name (eval SD)``); and each ``measures[name]``: ``texts -> numbers`` (a classifier, a judge's
     ``measure(rubric)``) or ``(texts, items) -> numbers`` (:func:`exact_match`). Measures of
     coherence: perplexity under the model without the intervention, repetition and length, judged by
-    ``coherence`` (:class:`CoherenceRule` by default).
+    ``coherence_rule`` (:class:`CoherenceRule` by default).
 
-    ``n_random`` random controls at each non-zero dose (``random_seed`` seeds them) give, per measure,
+    ``n_random`` random controls at each non-zero dose (``control_seed`` seeds them) give, per measure,
     the 95th percentile of the absolute change a direction of the same length produces. The result
     (see :class:`SteeringEvaluation`) is saved by default to ``out_dir``, or to ``steering/<time>``
     under the probe's run folder or the session's ``output_root``.
@@ -495,7 +495,7 @@ def evaluate_steering(
     if steer_probe is not None and unit == "resid_norm" and steer_probe.resid_norm is None:
         norms = _prompt_norms(model, tokenizer, prompts, system, read_batch_size)
         run_choices.append(Choice("resid_norm", "the norms of the probe's training texts", "measured on the prompts",
-                                  "the probe was fitted without them (read its texts with norms=True to keep them)"))
+                                  "the probe has none (it was built from directions)"))
     make, label = _resolve_steer(steer, unit, layers, window, distribute, positions, norms)
     if model is None or tokenizer is None:
         raise ValueError("evaluate_steering needs the model and its tokenizer (or a probe that has them).")
@@ -541,13 +541,13 @@ def evaluate_steering(
                 raise ValueError("random controls need an Add intervention; pass n_random=0 for others")
             for k in range(int(n_random)):
                 conditions.append(Condition({"dose": d, "dose_index": j, "control": k},
-                                            intervention.random_like([int(random_seed), k])))
+                                            intervention.random_like([int(control_seed), k])))
     status(f"Steering evaluation: {len(prompts)} prompts x {len(conditions)} conditions "
            f"({len(doses)} doses, {n_random} random controls at each non-zero one)")
     completions = generate_and_score(model, tokenizer, prompts, conditions, scorers, system=system,
                                      max_new_tokens=max_new_tokens, greedy=greedy, temperature=temperature,
                                      top_p=top_p, seed=seed, batch_size=batch_size, read_batch_size=read_batch_size,
-                                     status=status)
+                                     status=status, progress=progress_line("Generated condition", show))
 
     status("Measuring perplexity under the model without the intervention")
     pairs = [(torch.as_tensor(it.token_ids[:it.span[0]]), torch.as_tensor(it.token_ids[it.span[0]:it.span[1]]))
@@ -572,24 +572,24 @@ def evaluate_steering(
     run_settings = {
         "steer": label, "unit": unit if steer_probe is not None else None, "doses": doses, "n_random": int(n_random),
         "choices": [c.to_dict() for c in run_choices],
-        "random_seed": int(random_seed), "n_bootstrap": int(n_bootstrap), "n_prompts": len(prompts), "system": system,
+        "control_seed": int(control_seed), "n_bootstrap": int(n_bootstrap), "n_prompts": len(prompts), "system": system,
         "generation": {"greedy": bool(greedy), "max_new_tokens": int(max_new_tokens),
                        "temperature": None if greedy else temperature, "top_p": None if greedy else top_p,
                        "seed": None if greedy else seed, "batch_size": int(batch_size)},
-        "coherence_rule": coherence.describe() if hasattr(coherence, "describe") else getattr(
-            coherence, "__name__", "a function"),
-        "intervention_at_dose_1": make(1.0).describe(),
+        "coherence_rule": coherence_rule.to_dict() if hasattr(coherence_rule, "to_dict") else getattr(
+            coherence_rule, "__name__", "a function"),
+        "intervention_at_dose_1": make(1.0).to_dict(),
     }
     scores = Scores("generations", [s.name for s in scorers], completions, run_settings,
                     {s.name: "probes are measured in raw scores and in SDs of their eval items" for s in scorers})
     result = SteeringEvaluation(scores, doses, kinds, [], {}, run_settings, None if items is None else list(items),
-                                None, coherence)
+                                None, coherence_rule)
     result._refresh()
     for name, fn in measures.items():
         result.add_measure(name, fn)
     if settings().save if save is None else save:
         if out_dir is None:
-            root = steer_probe.run_dir if steer_probe is not None and steer_probe.run_dir else settings().output_root
+            root = steer_probe.out_dir if steer_probe is not None and steer_probe.out_dir else settings().output_root
             out_dir = os.path.join(root, "steering", now_tag())
         ensure_dir(out_dir)
         result.save(out_dir, html=html)

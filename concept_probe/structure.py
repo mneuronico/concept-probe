@@ -29,7 +29,6 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 
-from .inputs import upgrade_readout_name
 from .settings import settings
 from .utils import ensure_dir, json_dump, now_tag
 
@@ -56,20 +55,20 @@ class Target:
     places: Optional[np.ndarray] = None
 
     @property
-    def by_class(self) -> bool:
+    def _by_class(self) -> bool:
         return self.classes is not None
 
     @property
-    def structured(self) -> bool:
+    def _structured(self) -> bool:
         """Whether the classes' places say something beyond which class is which (an order, a cycle,
         a layout), so that their shape can be tested."""
         return self.kind in ("order", "cycle", "layout")
 
-    def subset(self, idx: np.ndarray) -> "Target":
+    def _subset(self, idx: np.ndarray) -> "Target":
         return Target(self.kind, self.values[idx], None if self.labels is None else self.labels[idx],
                       self.classes, self.places)
 
-    def with_places(self, places: np.ndarray) -> "Target":
+    def _with_places(self, places: np.ndarray) -> "Target":
         """The same items, with the classes moved to ``places`` (a shuffled control)."""
         index = {c: i for i, c in enumerate(self.classes)}
         values = places[[index[l] for l in self.labels]]
@@ -214,10 +213,10 @@ def _ridge(X: np.ndarray, Y: np.ndarray, alpha: float, rank: Optional[int]) -> _
     return _LinearMap(mu, W, ymu)
 
 
-def _fit_map(model: Any, X: np.ndarray, target: Target, alpha: float, rank: Optional[int]) -> _Map:
+def _fit_map(decoder: Any, X: np.ndarray, target: Target, alpha: float, rank: Optional[int]) -> _Map:
     X = np.asarray(X, dtype=np.float64)
-    if model == "shape":
-        if not target.structured:
+    if decoder == "shape":
+        if not target._structured:
             raise ValueError("the 'shape' map needs an order, a cycle or a layout")
         cents = np.stack([X[target.labels == c].mean(axis=0) for c in target.classes])
         mu = cents.mean(axis=0)
@@ -226,26 +225,26 @@ def _fit_map(model: Any, X: np.ndarray, target: Target, alpha: float, rank: Opti
         A = np.c_[(cents - mu) @ V.T, np.ones(len(cents))]
         W, *_ = np.linalg.lstsq(A, target.places, rcond=None)
         return _ShapeMap(mu, V, W)
-    if model == "centroid":
-        if not target.by_class:
+    if decoder == "centroid":
+        if not target._by_class:
             raise ValueError("the 'centroid' map needs a target defined by classes; use 'linear' for numbers")
         present = [c for c in target.classes if np.any(target.labels == c)]
         cents = np.stack([X[target.labels == c].mean(axis=0) for c in present])
         return _CentroidMap(cents, target.places[[target.classes.index(c) for c in present]])
-    if model == "linear":
+    if decoder == "linear":
         return _ridge(X, target.values, alpha, rank)
-    if not (hasattr(model, "fit") and hasattr(model, "predict")):
-        raise ValueError("model must be 'centroid', 'linear', 'shape' or an object with fit(X, Y) and predict(X)")
+    if not (hasattr(decoder, "fit") and hasattr(decoder, "predict")):
+        raise ValueError("decoder must be 'centroid', 'linear', 'shape' or an object with fit(X, Y) and predict(X)")
     from copy import deepcopy
 
-    m = deepcopy(model)
+    m = deepcopy(decoder)
     m.fit(X, target.values if target.values.shape[1] > 1 else target.values[:, 0])
     return _ModelMap(m)
 
 
 def _score(pred: np.ndarray, target: Target) -> float:
     """Accuracy (nearest place is the item's own class) for class targets; R² for numbers."""
-    if target.by_class:
+    if target._by_class:
         nearest = np.argmin(((pred[:, None, :] - target.places[None]) ** 2).sum(-1), axis=1)
         own = np.array([target.classes.index(l) for l in target.labels])
         return float((nearest == own).mean())
@@ -261,7 +260,7 @@ def _rank_corr(pred: np.ndarray, target: Target) -> float:
 def _split(target: Target, frac: float, rng: np.random.Generator):
     """Items to fit and to test on, splitting each class (or all items) at ``frac``."""
     n = len(target.values)
-    if not target.by_class:
+    if not target._by_class:
         perm = rng.permutation(n)
         k = int(round(n * frac))
         return perm[:k], perm[k:]
@@ -276,14 +275,14 @@ def _split(target: Target, frac: float, rng: np.random.Generator):
 
 @dataclass
 class TargetReading:
-    """What :func:`read_target` measured, per layer: ``score`` (accuracy for class targets, R² for
-    numbers) on the test items, and ``null_p95`` (the 95th percentile of the same with the target
+    """What :func:`read_target` measured, per layer: ``score_by_layer`` (accuracy for class targets, R² for
+    numbers) on the test items, and ``null_score95_by_layer`` (the 95th percentile of the same with the target
     shuffled, as ``shuffle`` says); the best layer and its numbers; ``chance`` for class targets."""
 
     target_kind: str
-    model: str
-    score: np.ndarray
-    null_p95: np.ndarray
+    decoder: str
+    score_by_layer: np.ndarray
+    null_score95_by_layer: np.ndarray
     best_layer: int
     best_score: float
     shuffle: str
@@ -299,8 +298,8 @@ class TargetReading:
         return self.maps[layer].predict(_reps(reps)[:, layer, :])
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"target": self.target_kind, "model": self.model, "score": self.score.tolist(),
-                "null_p95": self.null_p95.tolist(), "best_layer": self.best_layer, "best_score": self.best_score,
+        return {"target": self.target_kind, "decoder": self.decoder, "score_by_layer": self.score_by_layer.tolist(),
+                "null_score95_by_layer": self.null_score95_by_layer.tolist(), "best_layer": self.best_layer, "best_score": self.best_score,
                 "shuffle": self.shuffle, "n_fit": self.n_fit, "n_test": self.n_test, "chance": self.chance,
                 "rank_correlation": None if self.rank_correlation is None else self.rank_correlation.tolist()}
 
@@ -309,7 +308,7 @@ def read_target(
     reps: Any,
     target: Target,
     *,
-    model: Any = "linear",
+    decoder: Any = "linear",
     test: Optional[Any] = None,
     split: float = 0.5,
     rank: Optional[int] = None,
@@ -321,9 +320,8 @@ def read_target(
 ) -> TargetReading:
     """Whether ``target`` can be read from ``reps`` ``(items, layers, dim)``, at each layer.
 
-    The map (``model``: ``"linear"``, ``"centroid"``, ``"shape"`` or an object with
-    ``fit``/``predict``) is
-    fitted on ``split`` of each class's items and tested on the rest, or fitted on all of ``reps``
+    The map (``decoder``: ``"linear"``, ``"centroid"``, ``"shape"`` or an object with
+    ``fit``/``predict``, such as a scikit-learn model) is fitted on ``split`` of each class's items and tested on the rest, or fitted on all of ``reps``
     and tested on ``test = (reps, target)``. A class target is read as the class whose place is
     nearest to the prediction (accuracy); a number, by R² and by its rank correlation (the order,
     whatever the scale). ``"shape"`` reads through the shape: the plane (or line) of the fitting
@@ -341,25 +339,25 @@ def read_target(
     rng = np.random.default_rng(seed)
     if test is None:
         fit_idx, test_idx = _split(target, split, rng)
-        Xf, Xt, tf, tt = X[fit_idx], X[test_idx], target.subset(fit_idx), target.subset(test_idx)
+        Xf, Xt, tf, tt = X[fit_idx], X[test_idx], target._subset(fit_idx), target._subset(test_idx)
     else:
         Xf, tf = X, target
         Xt, tt = _reps(test[0]), test[1]
     if len(Xt) == 0 or len(Xf) == 0:
         raise ValueError("no items to fit or to test on")
-    shuffle = shuffle or ("classes" if target.structured else "items")
+    shuffle = shuffle or ("classes" if target._structured else "items")
     if shuffle not in ("items", "classes"):
         raise ValueError(f"shuffle must be 'items' or 'classes'; got {shuffle!r}")
-    if shuffle == "classes" and not target.by_class:
+    if shuffle == "classes" and not target._by_class:
         raise ValueError("shuffling between classes needs a target defined by classes")
     perms = [rng.permutation(len(tf.values) if shuffle == "items" else len(target.classes)) for _ in range(n_shuffles)]
     chosen = list(range(X.shape[1])) if layers is None else [int(l) for l in layers]
     score = np.full(X.shape[1], np.nan)
     null = np.full(X.shape[1], np.nan)
-    rho = None if target.by_class else np.full(X.shape[1], np.nan)
+    rho = None if target._by_class else np.full(X.shape[1], np.nan)
     maps: Dict[int, Any] = {}
     for l in chosen:
-        f = _fit_map(model, Xf[:, l, :], tf, alpha, rank)
+        f = _fit_map(decoder, Xf[:, l, :], tf, alpha, rank)
         maps[l] = f
         pred = f.predict(Xt[:, l, :])
         score[l] = _score(pred, tt)
@@ -369,18 +367,18 @@ def read_target(
         for p in perms:
             if shuffle == "items":
                 ts = Target(tf.kind, tf.values[p], None if tf.labels is None else tf.labels[p], tf.classes, tf.places)
-                shuffled.append(_score(_fit_map(model, Xf[:, l, :], ts, alpha, rank).predict(Xt[:, l, :]), tt))
+                shuffled.append(_score(_fit_map(decoder, Xf[:, l, :], ts, alpha, rank).predict(Xt[:, l, :]), tt))
             else:
                 moved = target.places[p]
-                fs = _fit_map(model, Xf[:, l, :], tf.with_places(moved), alpha, rank)
-                shuffled.append(_score(fs.predict(Xt[:, l, :]), tt.with_places(moved)))
+                fs = _fit_map(decoder, Xf[:, l, :], tf._with_places(moved), alpha, rank)
+                shuffled.append(_score(fs.predict(Xt[:, l, :]), tt._with_places(moved)))
         null[l] = float(np.percentile(shuffled, 95)) if shuffled else np.nan
     best = int(np.nanargmax(score))
     chance = None
-    if target.by_class:
+    if target._by_class:
         counts = [int(np.sum(tt.labels == c)) for c in target.classes]
         chance = float(max(counts) / max(1, sum(counts)))
-    name = model if isinstance(model, str) else type(model).__name__
+    name = decoder if isinstance(decoder, str) else type(decoder).__name__
     return TargetReading(target.kind, name, score, null, best, float(score[best]), shuffle, len(Xf), len(Xt),
                          chance, rho, maps)
 
@@ -426,27 +424,29 @@ def _shape_fit(coords: np.ndarray, places: np.ndarray, fit: str) -> float:
 
 @dataclass
 class TargetShape:
-    """What :func:`target_shape` measured, per layer: ``similarity`` (Spearman correlation between
-    the centroids' distances and the places' distances), ``fit`` (R² of the places from the
-    centroids' own top ``dims`` directions, by ``fit_kind``), each with the 95th percentile of the
-    same with the classes' places shuffled, and ``share`` (how much of the centroids' spread those
-    directions keep). ``coords`` are the centroids in those directions, to draw them."""
+    """What :func:`target_shape` measured, per layer: ``rsa_correlation`` (Spearman correlation
+    between the centroids' distances and the places' distances, as in representational similarity
+    analysis), ``shape_r2`` (R² of the places from the centroids' own top ``dims`` directions, by a
+    ``transform``), each with the 95th percentile of the same with the classes' places shuffled
+    (``null_rsa_correlation95``, ``null_shape_r2_95``), and ``explained_variance_ratio`` (how much of
+    the centroids' spread those directions keep). ``coords`` are the centroids in those directions,
+    to draw them."""
 
     target_kind: str
     classes: List[Any]
     dims: int
-    fit_kind: str
-    similarity: np.ndarray
-    similarity_null_p95: np.ndarray
-    fit: np.ndarray
-    fit_null_p95: np.ndarray
-    share: np.ndarray
+    transform: str
+    rsa_correlation: np.ndarray
+    null_rsa_correlation95: np.ndarray
+    shape_r2: np.ndarray
+    null_shape_r2_95: np.ndarray
+    explained_variance_ratio: np.ndarray
     coords: np.ndarray
     n_shuffles: int
 
     @property
     def best_layer(self) -> int:
-        return int(np.nanargmax(self.fit))
+        return int(np.nanargmax(self.shape_r2))
 
     def plot(self, path: str, layer: Optional[int] = None, title: Optional[str] = None) -> bool:
         """Draw the centroids at ``layer`` (the best by default), joined in the target's order."""
@@ -456,9 +456,10 @@ class TargetShape:
 
     def to_dict(self) -> Dict[str, Any]:
         return {"target": self.target_kind, "classes": [str(c) for c in self.classes], "dims": self.dims,
-                "fit_kind": self.fit_kind, "similarity": self.similarity.tolist(),
-                "similarity_null_p95": self.similarity_null_p95.tolist(), "fit": self.fit.tolist(),
-                "fit_null_p95": self.fit_null_p95.tolist(), "share": self.share.tolist(),
+                "transform": self.transform, "rsa_correlation": self.rsa_correlation.tolist(),
+                "null_rsa_correlation95": self.null_rsa_correlation95.tolist(), "shape_r2": self.shape_r2.tolist(),
+                "null_shape_r2_95": self.null_shape_r2_95.tolist(),
+                "explained_variance_ratio": self.explained_variance_ratio.tolist(),
                 "best_layer": self.best_layer, "n_shuffles": self.n_shuffles}
 
 
@@ -467,7 +468,7 @@ def target_shape(
     target: Target,
     *,
     dims: Optional[int] = None,
-    fit: str = "similarity",
+    transform: str = "similarity",
     n_shuffles: int = 200,
     layers: Optional[Sequence[int]] = None,
     seed: int = 0,
@@ -475,18 +476,18 @@ def target_shape(
     """Whether the classes' centroids have the shape of ``target``'s places, at each layer.
 
     ``dims`` (by default the places' own: 1 for an order, 2 for a cycle) is how many of the
-    centroids' principal directions are compared with the places; ``fit`` is ``"similarity"``
+    centroids' principal directions are compared with the places; ``transform`` is ``"similarity"``
     (rotation or reflection, one scale and a shift: the shape itself) or ``"affine"`` (any linear
     map: an ellipse counts as a circle). The control shuffles which class gets which place,
     ``n_shuffles`` times. Needs an order, a cycle or a layout with at least three classes.
     """
-    if not target.structured:
+    if not target._structured:
         raise ValueError("a shape needs a target whose places mean something: order, cycle or layout "
                          "(categories are all equally far apart)")
     if len(target.classes) < 3:
         raise ValueError("a shape needs at least three classes")
-    if fit not in ("similarity", "affine"):
-        raise ValueError(f"fit must be 'similarity' or 'affine'; got {fit!r}")
+    if transform not in ("similarity", "affine"):
+        raise ValueError(f"transform must be 'similarity' or 'affine'; got {transform!r}")
     X = _reps(reps)
     present = [c for c in target.classes if np.any(target.labels == c)]
     if len(present) != len(target.classes):
@@ -509,12 +510,12 @@ def target_shape(
         share[l] = float((s[:k] ** 2).sum() / max((s ** 2).sum(), 1e-24))
         cent_d = _pdist(C)
         sim[l] = _spearman(cent_d, place_d)
-        fitv[l] = _shape_fit(top, target.places, fit)
+        fitv[l] = _shape_fit(top, target.places, transform)
         sim_null[l] = float(np.percentile([_spearman(cent_d, _pdist(target.places[p])) for p in perms], 95)) \
             if perms else np.nan
-        fit_null[l] = float(np.percentile([_shape_fit(top, target.places[p], fit) for p in perms], 95)) \
+        fit_null[l] = float(np.percentile([_shape_fit(top, target.places[p], transform) for p in perms], 95)) \
             if perms else np.nan
-    return TargetShape(target.kind, list(target.classes), dims, fit, sim, sim_null, fitv, fit_null, share, coords,
+    return TargetShape(target.kind, list(target.classes), dims, transform, sim, sim_null, fitv, fit_null, share, coords,
                        int(n_shuffles))
 
 
@@ -526,7 +527,7 @@ class TargetScores:
     ``coordinates`` are where the map puts it ``(items, k)``. ``position`` is the score along the
     target: for a cycle, the place on the circle in class steps from the first class (``2.98`` is
     just before the fourth class), continuous and in ``[0, n)``; for an order, the place on the line
-    in class steps; for a number, the value. ``nearest`` is the nearest class. ``fit`` says how well
+    in class steps; for a number, the value. ``nearest`` is the nearest class. ``radius`` says how well
     an item sits on the shape: for a cycle, its distance from the center (1 is on the circle).
     ``class_scores`` are the map's outputs per class, for categories.
     """
@@ -535,7 +536,7 @@ class TargetScores:
     coordinates: np.ndarray
     position: Optional[np.ndarray] = None
     nearest: Optional[List[Any]] = None
-    fit: Optional[np.ndarray] = None
+    radius: Optional[np.ndarray] = None
     class_scores: Optional[np.ndarray] = None
 
     def __len__(self) -> int:
@@ -546,7 +547,7 @@ class TargetScores:
             return None if x is None else np.asarray(x).tolist()
 
         return {"kind": self.kind, "coordinates": plain(self.coordinates), "position": plain(self.position),
-                "nearest": None if self.nearest is None else [str(c) for c in self.nearest], "fit": plain(self.fit),
+                "nearest": None if self.nearest is None else [str(c) for c in self.nearest], "radius": plain(self.radius),
                 "class_scores": plain(self.class_scores)}
 
 
@@ -558,7 +559,7 @@ class TargetProbe:
     ``"linear"`` for numbers, or any of :func:`read_target`'s), how well it read held-out items
     (``reading``) and, for a structured target, how well the centroids have its shape (``shape``).
 
-    - :meth:`score` gives each activation its :class:`TargetScores` (a place on the cycle, a value,
+    - :meth:`scores` gives each activation its :class:`TargetScores` (a place on the cycle, a value,
       the nearest class, how well it fits);
     - :meth:`read` and :meth:`score_tokens` read texts with the attached model and score them, whole
       or token by token;
@@ -585,7 +586,7 @@ class TargetProbe:
         self.centroids: Optional[np.ndarray] = None
         self.model: Any = None
         self.tokenizer: Any = None
-        self.dir: Optional[str] = None
+        self.out_dir: Optional[str] = None
 
     # ---- building
     @classmethod
@@ -594,7 +595,7 @@ class TargetProbe:
         reps: Any,
         target: Target,
         *,
-        model: Any = None,
+        decoder: Any = None,
         layer: Optional[int] = None,
         test: Optional[Any] = None,
         split: float = 0.5,
@@ -606,7 +607,7 @@ class TargetProbe:
         name: str = "target",
         identity: Optional[Dict[str, Any]] = None,
         save: Optional[bool] = None,
-        root_dir: Optional[str] = None,
+        output_root: Optional[str] = None,
     ) -> "TargetProbe":
         """Fit a probe toward ``target`` on ``reps`` ``(items, layers, dim)``.
 
@@ -619,32 +620,36 @@ class TargetProbe:
         structured target at that layer, against ``n_shape_shuffles`` shuffled orders. When the layer is
         chosen here, the held-out items that choose it also give its score, which is then the best of
         many and optimistic: that is warned and recorded; give ``layer``, or choose it on other items,
-        for an unbiased number. Saved by default to ``<root_dir or output_root>/<name>/<time>``.
+        for an unbiased number. Saved by default to ``<output_root or output_root>/<name>/<time>``.
         """
         X = _reps(reps)
-        if model is None:
-            model = "shape" if target.structured else ("centroid" if target.by_class else "linear")
-        reading = read_target(reps, target, model=model, test=test, split=split, rank=rank, alpha=alpha,
+        if decoder is None:
+            decoder = "shape" if target._structured else ("centroid" if target._by_class else "linear")
+        reading = read_target(reps, target, decoder=decoder, test=test, split=split, rank=rank, alpha=alpha,
                               n_shuffles=n_shuffles, layers=None if layer is None else [layer], seed=seed)
         ts = None
-        if target.structured and len(target.classes) >= 3:
+        if target._structured and len(target.classes) >= 3:
             ts = target_shape(reps, target, layers=None if layer is None else [layer], n_shuffles=int(n_shape_shuffles),
                               seed=seed)
         chosen_here = layer is None
         if layer is None:
-            best = np.nanmax(reading.score)
-            ties = np.flatnonzero(reading.score >= best - 1e-9)
-            tie_break = ts.fit[ties] if ts is not None else (reading.score - np.nan_to_num(reading.null_p95))[ties]
+            best = np.nanmax(reading.score_by_layer)
+            ties = np.flatnonzero(reading.score_by_layer >= best - 1e-9)
+            tie_break = (ts.shape_r2[ties] if ts is not None
+                         else (reading.score_by_layer - np.nan_to_num(reading.null_score95_by_layer))[ties])
             layer = int(ties[int(np.nanargmax(tie_break))])
-        mapping = _fit_map(model, X[:, layer, :], target, alpha, rank)
+        mapping = _fit_map(decoder, X[:, layer, :], target, alpha, rank)
         shape = None
         if ts is not None:
-            shape = {"layer": layer, "fit": float(ts.fit[layer]), "fit_null_p95": float(ts.fit_null_p95[layer]),
-                     "similarity": float(ts.similarity[layer]),
-                     "similarity_null_p95": float(ts.similarity_null_p95[layer]), "share": float(ts.share[layer])}
-        summary = {"layer": layer, "score": float(reading.score[layer]), "null_p95": float(reading.null_p95[layer]),
-                   "metric": "accuracy" if target.by_class else "R2", "shuffle": reading.shuffle,
-                   "chance": reading.chance, "n_fit": reading.n_fit, "n_test": reading.n_test, "model": reading.model,
+            shape = {"layer": layer, "shape_r2": float(ts.shape_r2[layer]),
+                     "null_shape_r2_95": float(ts.null_shape_r2_95[layer]),
+                     "rsa_correlation": float(ts.rsa_correlation[layer]),
+                     "null_rsa_correlation95": float(ts.null_rsa_correlation95[layer]),
+                     "explained_variance_ratio": float(ts.explained_variance_ratio[layer])}
+        summary = {"layer": layer, "score": float(reading.score_by_layer[layer]),
+                   "null_score95": float(reading.null_score95_by_layer[layer]),
+                   "metric": "accuracy" if target._by_class else "R2", "shuffle": reading.shuffle,
+                   "chance": reading.chance, "n_fit": reading.n_fit, "n_test": reading.n_test, "decoder": reading.decoder,
                    "layer_chosen_on": "the items that measure it" if chosen_here else "given"}
         if chosen_here and X.shape[1] > 1:
             import warnings
@@ -654,10 +659,10 @@ class TargetProbe:
         readout = getattr(getattr(reps, "readout", None), "name", None)
         probe = cls(target.kind, target.classes, target.places, layer, mapping, name=name, readout=readout,
                     identity=identity or getattr(reps, "identity", None), reading=summary, shape=shape)
-        if target.by_class:
+        if target._by_class:
             probe.centroids = np.stack([X[target.labels == c].mean(axis=0) for c in target.classes]).astype(np.float32)
         if settings().save if save is None else save:
-            probe.save(os.path.join(root_dir or settings().output_root, name, now_tag()))
+            probe.save(os.path.join(output_root or settings().output_root, name, now_tag()))
         return probe
 
     # ---- scoring
@@ -689,7 +694,7 @@ class TargetProbe:
         (read at the probe's layer) or ``(items, dim)`` (already at it)."""
         return self.mapping.predict(self._at_layer(reps))
 
-    def score(self, reps: Any) -> TargetScores:
+    def scores(self, reps: Any) -> TargetScores:
         """Each activation's :class:`TargetScores`."""
         C = self.coordinates(reps)
         out = TargetScores(self.kind, C)
@@ -700,7 +705,7 @@ class TargetProbe:
             n = len(self.classes)
             out.position = (np.arctan2(C[:, 1], C[:, 0]) % (2 * np.pi)) / (2 * np.pi / n)
             out.nearest = [self.classes[int(k)] for k in np.round(out.position).astype(int) % n]
-            out.fit = np.linalg.norm(C, axis=1)
+            out.radius = np.linalg.norm(C, axis=1)
         elif self.kind in ("order", "number"):
             out.position = C[:, 0]
         elif self.kind == "categories":
@@ -734,14 +739,14 @@ class TargetProbe:
              prompt: Optional[str] = None, batch_size: int = 16) -> TargetScores:
         """Read each text (as ``role``, ``system`` and ``prompt`` say, pooled as the probe's training
         representations were, by default the mean over the text's tokens) and score it."""
-        return self.score(self._read(texts, self.readout or "text_mean", role, system, prompt, batch_size))
+        return self.scores(self._read(texts, self.readout or "text_mean", role, system, prompt, batch_size))
 
     def score_tokens(self, texts: Sequence[Any], *, role: str = "raw", system: Optional[str] = None,
                      prompt: Optional[str] = None, batch_size: int = 16) -> List[TargetScores]:
         """Each text's tokens scored one by one (the text's own tokens): one :class:`TargetScores`
         per text, with a row per token."""
         reps = self._read(texts, "text_tokens", role, system, prompt, batch_size)
-        return [self.score(reps.data[reps.items == i, 0, :]) for i in range(len(texts))]
+        return [self.scores(reps.data[reps.items == i, 0, :]) for i in range(len(texts))]
 
     # ---- steering
     def _shape_map(self, layer: int) -> "_ShapeMap":
@@ -823,49 +828,49 @@ class TargetProbe:
                    label=f"{self.name}: from {source} to {to}")
 
     # ---- saving
-    def describe(self) -> Dict[str, Any]:
+    def to_dict(self) -> Dict[str, Any]:
         return {"name": self.name, "kind": self.kind, "classes": None if self.classes is None else
                 [str(c) for c in self.classes], "layer": self.layer, "map": self.mapping.kind, "readout": self.readout,
                 "identity": self.identity, "reading": self.reading, "shape": self.shape}
 
-    def save(self, path: str) -> str:
+    def save(self, out_dir: str) -> str:
         """``target_probe.json`` (what it is, its numbers) and ``target_probe.npz`` (the map) in
-        ``path``; a map made by another library's model is pickled to ``model.pkl``."""
+        ``out_dir``; a map made by another library's model is pickled to ``model.pkl``."""
         import pickle
 
-        ensure_dir(path)
-        meta = self.describe()
+        ensure_dir(out_dir)
+        meta = self.to_dict()
         meta["classes_raw"] = None if self.classes is None else list(self.classes)
-        json_dump(os.path.join(path, "target_probe.json"), meta)
+        json_dump(os.path.join(out_dir, "target_probe.json"), meta)
         arrays = {"places": np.zeros((0, 0)) if self.places is None else self.places,
                   "centroids": np.zeros((0, 0, 0)) if self.centroids is None else self.centroids}
         arrays.update({f"map_{k}": v for k, v in self.mapping.params().items()})
-        np.savez_compressed(os.path.join(path, "target_probe.npz"), **arrays)
+        np.savez_compressed(os.path.join(out_dir, "target_probe.npz"), **arrays)
         if isinstance(self.mapping, _ModelMap):
-            with open(os.path.join(path, "model.pkl"), "wb") as f:
+            with open(os.path.join(out_dir, "model.pkl"), "wb") as f:
                 pickle.dump(self.mapping.model, f)
-        self.dir = path
-        return path
+        self.out_dir = out_dir
+        return out_dir
 
     @classmethod
-    def load(cls, path: str, model: Any = None, tokenizer: Any = None) -> "TargetProbe":
+    def load(cls, out_dir: str, model: Any = None, tokenizer: Any = None) -> "TargetProbe":
         """A probe saved by :meth:`save` (attached to ``model`` when given)."""
         import pickle
 
-        meta = json.loads(open(os.path.join(path, "target_probe.json"), encoding="utf-8").read())
-        data = np.load(os.path.join(path, "target_probe.npz"))
+        meta = json.loads(open(os.path.join(out_dir, "target_probe.json"), encoding="utf-8").read())
+        data = np.load(os.path.join(out_dir, "target_probe.npz"))
         params = {k[len("map_"):]: data[k] for k in data.files if k.startswith("map_")}
         if meta["map"] == "model":
-            with open(os.path.join(path, "model.pkl"), "rb") as f:
+            with open(os.path.join(out_dir, "model.pkl"), "rb") as f:
                 mapping: _Map = _ModelMap(pickle.load(f))
         else:
             mapping = _map_from_params(meta["map"], params)
         places = data["places"] if data["places"].size else None
         probe = cls(meta["kind"], meta.get("classes_raw"), places, meta["layer"], mapping, name=meta["name"],
-                    readout=upgrade_readout_name(meta.get("readout")), identity=meta.get("identity"), reading=meta.get("reading"),
+                    readout=meta.get("readout"), identity=meta.get("identity"), reading=meta.get("reading"),
                     shape=meta.get("shape"))
         probe.centroids = data["centroids"] if data["centroids"].size else None
-        probe.dir = path
+        probe.out_dir = out_dir
         if model is not None:
             probe.attach(model, tokenizer)
         return probe

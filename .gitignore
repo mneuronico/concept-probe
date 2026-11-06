@@ -17,6 +17,7 @@ dist/
 
 outputs/
 outputs_multi/
+concept_probe_outputs/
 
 .DS_Store
 Thumbs.db

@@ -6,8 +6,11 @@ representations (:func:`read_texts`), fit directions and a probe on them (:func:
 in the model (:class:`Add`, :class:`Ablate`, :class:`Patch`, :class:`Rotate`), generate and score
 (:func:`generate`, :func:`answer_logprobs`), and evaluate steering against random controls
 (:func:`evaluate_steering`). Beyond two poles, :class:`Target` and :class:`TargetProbe`. The guides
-(:func:`guide`) say in what order, and what makes a probe look better than it is.
+(:func:`guide`) say in what order, and what makes a probe look better than it is;
+:func:`load_example` gives texts to try it with.
 """
+__version__ = "0.2.0"
+
 from .settings import configure
 from .record import Choice
 from .modeling import ModelBundle
@@ -26,8 +29,9 @@ from .generation import AnswerLogprobs, Generation, Generations, TokenStep, answ
 from .scoring import ScoredItem, Scores
 from .steering_eval import CoherenceRule, SteeringEvaluation, evaluate_steering, exact_match, repetition_rate
 from .judges import COHERENCE, AgentJudge, AnswersPending, APIJudge, Judge, LocalJudge, Rubric, rate_saved
-from .critique import Critique, critique_dataset, critique_task, read_critique
+from .critique import Critique, critique_dataset, critique_task, load_critique
 from .guide import guide
+from .example_data import ExampleDataset, load_example
 
 __all__ = [
     # session and loading
@@ -44,7 +48,7 @@ __all__ = [
     "Target", "TargetProbe", "TargetReading", "TargetScores", "TargetShape", "read_target", "target_shape",
     # datasets
     "audit_dataset", "DatasetAudit", "compare_poles", "surface_baseline", "text_features", "count_matches",
-    "distinctive_words", "formulaicity", "diversity", "Critique", "critique_task", "read_critique",
+    "distinctive_words", "formulaicity", "diversity", "Critique", "critique_task", "load_critique",
     "critique_dataset",
     # interventions, generation and scoring
     "Intervention", "Add", "Ablate", "Patch", "Rotate", "Edit", "Compose", "Where", "intervene",
@@ -52,6 +56,6 @@ __all__ = [
     # evaluating steering, and judges
     "evaluate_steering", "SteeringEvaluation", "CoherenceRule", "exact_match", "repetition_rate",
     "Rubric", "COHERENCE", "Judge", "APIJudge", "LocalJudge", "AgentJudge", "AnswersPending", "rate_saved",
-    # guides
-    "guide",
+    # guides and an example dataset
+    "guide", "load_example", "ExampleDataset",
 ]

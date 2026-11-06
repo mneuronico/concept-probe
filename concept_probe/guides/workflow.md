@@ -12,10 +12,9 @@ docstrings have the details.
 2. **Write or audit the data before training** (see the `datasets` guide). A probe learns whatever
    separates the two sets of texts, including length, topic or a repeated phrasing.
 3. **Read** the texts (`read_texts`): exactly as the probe will read them later (role, system
-   prompt, which tokens). `preview_input` shows what the model sees. Read the training texts with
-   `norms=True`, so steering doses can be in residual-stream norms.
+   prompt, which tokens). `preview_input` shows what the model sees.
 4. **Fit and evaluate the probe on held-out items, against controls** (`ConceptProbe.fit(pos, neg,
-   eval=[EvalSet(...), ...])`): the layer is chosen on part of the first eval set and measured on
+   eval_sets=[EvalSet(...), ...])`): the layer is chosen on part of the first eval set and measured on
    the rest; every d comes next to what random directions give on the same items (`null_d95`), with
    a refit on shuffled labels. Pass minimal pairs as `paired=True`. Add eval sets from other sources
    (out of distribution), and read each probe on the others' sets (`cross_reading`).

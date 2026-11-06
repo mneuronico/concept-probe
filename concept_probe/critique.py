@@ -13,7 +13,7 @@ what nobody thought of. A critique asks, about a sample of each pole:
 Two ways to get it, with the same instructions:
 
 - :func:`critique_task` writes the task to a folder (``TASK.md``, the sample, and the exact format of
-  ``critique.json``) for an agent (or a subagent, or a person) to answer, and :func:`read_critique`
+  ``critique.json``) for an agent (or a subagent, or a person) to answer, and :func:`load_critique`
   reads and checks the answer;
 - :func:`critique_dataset` asks a judge directly (:class:`~concept_probe.judges.APIJudge`, which sends
   the sample out, or :class:`~concept_probe.judges.LocalJudge`).
@@ -153,13 +153,13 @@ def _parse(data: Any, ids: Sequence[str]) -> Critique:
     return Critique(out["differences"], out["formulaic"], out["mislabeled"], [str(x) for x in out["suggestions"]])
 
 
-def critique_task(pos: Sequence[str], neg: Sequence[str], folder: str, *, concept: str = "the concept of the poles",
+def critique_task(pos: Sequence[str], neg: Sequence[str], out_dir: str, *, concept: str = "the concept of the poles",
                   paired: bool = False, n: int = 40, seed: int = 0) -> str:
-    """Write a critique task to ``folder`` for an agent (or anyone) to answer: ``TASK.md`` (what to
+    """Write a critique task to ``out_dir`` for an agent (or anyone) to answer: ``TASK.md`` (what to
     do and the exact format of the answer), ``sample.json`` (``n`` items of each pole, or ``n``
     pairs) and where to write ``critique.json``. Returns the folder; read the answer with
-    :func:`read_critique`."""
-    path = Path(folder)
+    :func:`load_critique`."""
+    path = Path(out_dir)
     path.mkdir(parents=True, exist_ok=True)
     sample = _sample(pos, neg, n, paired, seed)
     n_pos = len(sample.get("pairs", sample.get("pos", [])))
@@ -170,7 +170,7 @@ def critique_task(pos: Sequence[str], neg: Sequence[str], folder: str, *, concep
     task = (f"# Critique task\n\n{_instructions(concept, paired, n_pos, n_neg)}\n## Files\n\n"
             f"- Input: `sample.json` in this folder: {layout}.\n"
             "- Output: write the JSON object to `critique.json` in this folder (only the object, UTF-8).\n\n"
-            "The code that asked for the critique reads it with `read_critique` and checks it against the format\n"
+            "The code that asked for the critique reads it with `load_critique` and checks it against the format\n"
             "(names, poles, ids of the sample, regular expressions that compile); anything wrong is reported so\n"
             "the file can be fixed.\n")
     (path / "TASK.md").write_text(task, encoding="utf-8")
@@ -185,15 +185,15 @@ def _ids(sample: Dict[str, Any]) -> List[str]:
     return [x["id"] for k in ("pos", "neg") for x in sample[k]]
 
 
-def read_critique(folder: str) -> Critique:
+def load_critique(out_dir: str) -> Critique:
     """The critique an agent wrote for :func:`critique_task`, checked against the format."""
-    path = Path(folder)
+    path = Path(out_dir)
     answer = path / "critique.json"
     if not answer.exists():
-        raise FileNotFoundError(f"No critique.json in {folder} yet: answer {path / 'TASK.md'} first")
+        raise FileNotFoundError(f"No critique.json in {out_dir} yet: answer {path / 'TASK.md'} first")
     sample = json.loads((path / "sample.json").read_text(encoding="utf-8"))
     critique = _parse(json.loads(answer.read_text(encoding="utf-8")), _ids(sample))
-    critique.source = {"by": "agent", "folder": str(path)}
+    critique.source = {"by": "agent", "out_dir": str(path)}
     return critique
 
 
@@ -201,12 +201,12 @@ def critique_dataset(pos: Sequence[str], neg: Sequence[str], judge: Any, *, conc
                      paired: bool = False, n: int = 40, seed: int = 0) -> Critique:
     """Ask ``judge`` (an :class:`~concept_probe.judges.APIJudge`, which sends the sample out, or a
     :class:`~concept_probe.judges.LocalJudge`) for the critique directly, with the instructions of
-    :func:`critique_task`. For an agent, use :func:`critique_task` and :func:`read_critique`."""
+    :func:`critique_task`. For an agent, use :func:`critique_task` and :func:`load_critique`."""
     sample = _sample(pos, neg, n, paired, seed)
     n_pos = len(sample.get("pairs", sample.get("pos", [])))
     n_neg = len(sample.get("pairs", sample.get("neg", [])))
     reply = judge.complete(_instructions(concept, paired, n_pos, n_neg),
                            "The sample:\n" + json.dumps(sample, ensure_ascii=False))
     critique = _parse(reply, _ids(sample))
-    critique.source = {"by": judge.describe()}
+    critique.source = {"by": judge.to_dict()}
     return critique

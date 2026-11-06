@@ -1,4 +1,4 @@
-"""Encoding (layer 1): the token span of every message (entry 28) and the character offsets of a
+"""Encoding: the token span of every message and the character offsets of a
 text's tokens, which readouts at a word use."""
 import pytest
 
@@ -39,7 +39,7 @@ def test_spans_are_none_when_they_cannot_be_located():
 
 def test_preview_input_lists_the_messages():
     tok = CharChatTok()
-    gen = preview_input(tok, "hello", system="S", generation=True)
+    gen = preview_input(tok, "hello", system="S", add_generation_prompt=True)
     assert [(m["role"], m["text"]) for m in gen["message_spans"]] == [("system", "S"), ("user", "hello")]
     user = preview_input(tok, "hello", role="user", system="S")
     assert [m["text"] for m in user["message_spans"]] == ["S", "hello"]

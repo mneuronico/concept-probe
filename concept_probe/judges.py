@@ -90,7 +90,7 @@ class Judge:
         return np.array([np.nan if a is None else rubric.answers[a] for a in self.rate(texts, rubric)],
                         dtype=np.float64)
 
-    def measure(self, rubric: Rubric) -> Callable[[List[str]], np.ndarray]:
+    def as_measure(self, rubric: Rubric) -> Callable[[List[str]], np.ndarray]:
         """A measure for :func:`concept_probe.evaluate_steering`: ``texts -> numbers``."""
 
         def judged(texts: List[str]) -> np.ndarray:
@@ -99,7 +99,7 @@ class Judge:
         judged.__name__ = f"judge_{rubric.name}"
         return judged
 
-    def describe(self) -> Dict[str, Any]:
+    def to_dict(self) -> Dict[str, Any]:
         raise NotImplementedError
 
     def complete(self, system: str, user: str) -> str:
@@ -193,7 +193,7 @@ class APIJudge(Judge):
         self.texts_per_request, self.temperature = int(texts_per_request), float(temperature)
         self.max_tokens, self.timeout, self.retries = int(max_tokens), float(timeout), int(retries)
 
-    def describe(self) -> Dict[str, Any]:
+    def to_dict(self) -> Dict[str, Any]:
         return {"judge": "api", "provider": self.provider, "model": self.model, "base_url": self.base_url,
                 "temperature": self.temperature}
 
@@ -283,7 +283,7 @@ class LocalJudge(Judge):
         self.model, self.tokenizer, self.system, self.batch_size = model, tokenizer, system, int(batch_size)
         self.name = name or getattr(getattr(model, "config", None), "_name_or_path", None) or type(model).__name__
 
-    def describe(self) -> Dict[str, Any]:
+    def to_dict(self) -> Dict[str, Any]:
         return {"judge": "local", "model": self.name, "system": self.system}
 
     def probabilities(self, texts: Sequence[str], rubric: Rubric) -> np.ndarray:
@@ -312,11 +312,11 @@ class LocalJudge(Judge):
 
 # ----------------------------------------------------------------------------------- agent judges
 class AnswersPending(RuntimeError):
-    """The task was written and nobody has answered it yet: ``path`` is its folder."""
+    """The task was written and nobody has answered it yet: ``task_dir`` is its folder."""
 
-    def __init__(self, path: str, message: str):
+    def __init__(self, task_dir: str, message: str):
         super().__init__(message)
-        self.path = path
+        self.task_dir = task_dir
 
 
 def _task_id(*parts: Any) -> str:
@@ -329,7 +329,7 @@ class AgentJudge(Judge):
     """A judge that is whoever answers a task written to a folder: an agent such as Claude Code
     (or a subagent it delegates to), another program, or a person. No API, no model loaded here.
 
-    :meth:`rate` writes ``<folder>/<rubric name>-<id>/`` with ``TASK.md`` (what to do, how to read
+    :meth:`rate` writes ``<out_dir>/<rubric name>-<id>/`` with ``TASK.md`` (what to do, how to read
     the input, the exact format of the answer and where to save it) and ``items.jsonl`` (one text
     per line, with its id), and raises :class:`AnswersPending` with that folder. Once
     ``answers.jsonl`` is written there, calling :meth:`rate` again with the same texts reads it,
@@ -337,14 +337,14 @@ class AgentJudge(Judge):
     the rubric, so a different request never reads another's answers. :meth:`request` only writes.
     """
 
-    def __init__(self, folder: str):
-        self.folder = str(folder)
+    def __init__(self, out_dir: str):
+        self.out_dir = str(out_dir)
 
-    def describe(self) -> Dict[str, Any]:
-        return {"judge": "agent", "folder": self.folder}
+    def to_dict(self) -> Dict[str, Any]:
+        return {"judge": "agent", "out_dir": self.out_dir}
 
     def task_dir(self, texts: Sequence[str], rubric: Rubric) -> Path:
-        return Path(self.folder) / f"{rubric.name}-{_task_id(rubric.to_dict(), [str(t) for t in texts])}"
+        return Path(self.out_dir) / f"{rubric.name}-{_task_id(rubric.to_dict(), [str(t) for t in texts])}"
 
     def request(self, texts: Sequence[str], rubric: Rubric) -> str:
         """Write the task (if it is not there yet) and return its folder."""
@@ -417,19 +417,19 @@ allowed is reported, so it can be fixed in the file.
 
 
 # --------------------------------------------------------------------------------- saved batches
-def rate_saved(batch_dir: str, judge: Judge, rubric: Rubric = COHERENCE) -> List[Dict[str, Any]]:
+def rate_saved(out_dir: str, judge: Judge, rubric: Rubric = COHERENCE) -> List[Dict[str, Any]]:
     """Rate the texts of a saved batch of scores (its ``scores.jsonl``) and save the answers to
-    ``<batch_dir>/<rubric name>_rating.json``: one entry per text with its ``index`` in the scores,
+    ``<out_dir>/<rubric name>_rating.json``: one entry per text with its ``index`` in the scores,
     the answer, its number, the judge and when it rated. The eval analysis reads the coherence
     ratings (``coherence_rating.json``) from there."""
-    path = Path(batch_dir).resolve()
+    path = Path(out_dir).resolve()
     lines_path = path / "scores.jsonl"
     if not lines_path.exists():
-        raise FileNotFoundError(f"No scores.jsonl in {batch_dir}")
+        raise FileNotFoundError(f"No scores.jsonl in {out_dir}")
     texts = [json.loads(l)["text"] for l in lines_path.read_text(encoding="utf-8").splitlines() if l.strip()]
     answers = judge.rate(texts, rubric)
     rated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    out = [{"index": i, "rating": a, "value": None if a is None else rubric.answers[a], "judge": judge.describe(), "rated_at": rated_at}
+    out = [{"index": i, "rating": a, "value": None if a is None else rubric.answers[a], "judge": judge.to_dict(), "rated_at": rated_at}
            for i, a in enumerate(answers)]
     (path / f"{rubric.name}_rating.json").write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
     return out

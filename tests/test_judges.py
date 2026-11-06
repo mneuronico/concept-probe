@@ -44,7 +44,7 @@ def test_openai_style_providers_get_the_rubric_and_the_texts(provider, url, monk
     system = payload["messages"][0]["content"]
     assert "Is this text friendly?" in system and "yes, no" in system and "friendly. no" in system
     assert json.loads(payload["messages"][1]["content"]) == [{"id": 0, "text": "a"}, {"id": 1, "text": "b"}]
-    assert "secret" not in json.dumps(judge.describe())
+    assert "secret" not in json.dumps(judge.to_dict())
 
 
 def test_anthropic_uses_its_own_api(monkeypatch):
@@ -142,7 +142,7 @@ def test_a_local_judge_reads_the_probability_of_each_answer():
     np.testing.assert_allclose(probs, direct)
     np.testing.assert_allclose(judge.score(texts, rubric), probs[:, 0])  # the expected value of 1 and 0
     assert judge.rate(texts, rubric) == [["p", "n"][k] for k in probs.argmax(axis=1)]
-    assert judge.describe() == {"judge": "local", "model": "tiny", "system": None}
+    assert judge.to_dict() == {"judge": "local", "model": "tiny", "system": None}
 
 
 def test_a_saved_batch_is_rated_by_index(tmp_path, monkeypatch):
@@ -164,7 +164,7 @@ def test_an_agent_judge_writes_a_task_and_checks_the_answers(tmp_path):
     texts = ["hello friend", "go away", "fine"]
     with pytest.raises(AnswersPending) as pending:
         judge.rate(texts, TONE)
-    path = pending.value.path
+    path = pending.value.task_dir
     assert json.loads(open(f"{path}/items.jsonl", encoding="utf-8").readline()) == {"id": 0, "text": "hello friend"}
     task = open(f"{path}/TASK.md", encoding="utf-8").read()
     assert "Is this text friendly?" in task and '"yes", "no"' in task and "ids 0 to 2" in task
@@ -183,20 +183,20 @@ NEG = ["I hate this day.", "What a bad gift.", "We lost.", "Such a dreadful even
 
 
 def test_a_critique_task_round_trip_gives_checks_for_the_audit(tmp_path):
-    from concept_probe import compare_poles, critique_task, read_critique
+    from concept_probe import compare_poles, critique_task, load_critique
 
     folder = critique_task(POS, NEG, str(tmp_path), concept="positive vs negative feeling", paired=True, n=4)
     sample = json.load(open(f"{folder}/sample.json", encoding="utf-8"))
     assert len(sample["pairs"]) == 4
     assert "positive vs negative feeling" in open(f"{folder}/TASK.md", encoding="utf-8").read()
     with pytest.raises(FileNotFoundError, match="TASK.md"):
-        read_critique(folder)
+        load_critique(folder)
     answer = {"differences": [{"name": "exclamation", "description": "positives end in !", "more_in": "pos",
                                "examples": ["pos:0", "neg:0"], "regex": "!"}],
               "formulaic": [{"description": "What a ...", "examples": ["pos:1"]}],
               "mislabeled": [], "suggestions": ["vary the punctuation"]}
     json.dump(answer, open(f"{folder}/critique.json", "w", encoding="utf-8"))
-    critique = read_critique(folder)
+    critique = load_critique(folder)
     assert critique.checks()["exclamation"]("Wow!!") == 2.0 and critique.source["by"] == "agent"
     rows = compare_poles(POS, NEG, paired=True, checks=critique.checks())
     assert rows[0]["feature"] == "exclamation"
@@ -204,7 +204,7 @@ def test_a_critique_task_round_trip_gives_checks_for_the_audit(tmp_path):
     answer["differences"][0]["regex"] = "("
     json.dump(answer, open(f"{folder}/critique.json", "w", encoding="utf-8"))
     with pytest.raises(ValueError, match="unknown ids.*does not compile"):
-        read_critique(folder)
+        load_critique(folder)
 
 
 def test_a_judge_can_write_the_critique_directly(monkeypatch):

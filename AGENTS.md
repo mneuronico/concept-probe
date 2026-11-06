@@ -24,5 +24,4 @@ python -c "import concept_probe; print(concept_probe.guide('workflow'))"  # one 
 - Do not write the texts and judge them in the same context: delegate the critique, the ratings and
   the final attack set to a subagent that did not write them.
 - Results are saved by default, with every automatic choice; keep the folders and cite them.
-- The docstrings of the public functions are the reference; `README.md` has the overview and
-  `docs/DESIGN.md` the reasons for the design.
+- The docstrings of the public functions are the reference; `README.md` has the overview.

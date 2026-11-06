@@ -17,7 +17,7 @@ IDS = torch.tensor([ord(c) for c in "^pp nx"])
 
 def _every_token(model):
     # (tokens, layers, dim): every token of the input at every layer
-    return read_encoded(model, CharChatTok(), [Encoded(IDS)], "sequence_tokens", cache=False).data
+    return read_encoded(model, CharChatTok(), [Encoded(IDS)], "through_text_tokens", cache=False).data
 
 
 def _overflow_from(model, layer):

@@ -1,4 +1,4 @@
-"""Auditing a two-pole dataset before trusting a probe trained on it (layer 6d of docs/DESIGN.md).
+"""Auditing a two-pole dataset before trusting a probe trained on it.
 
 Model-free checks for differences between the poles other than the concept, and for how varied
 the texts are. By default it looks at what any two-pole dataset can be checked for, in any
@@ -55,13 +55,13 @@ def count_matches(pattern: str, flags: int = re.IGNORECASE) -> Check:
 
 
 def text_features(text: str, checks: Optional[Dict[str, Check]] = None,
-                  n_tokens: Optional[Callable[[str], int]] = None) -> Dict[str, float]:
-    """A text's length in characters and words (and tokens, with ``n_tokens``, e.g. a tokenizer's
+                  count_tokens: Optional[Callable[[str], int]] = None) -> Dict[str, float]:
+    """A text's length in characters and words (and tokens, with ``count_tokens``, e.g. a tokenizer's
     count), and the value of each check."""
     text = str(text)
     feats: Dict[str, float] = {"chars": float(len(text)), "words": float(len(_words(text)))}
-    if n_tokens is not None:
-        feats["tokens"] = float(n_tokens(text))
+    if count_tokens is not None:
+        feats["tokens"] = float(count_tokens(text))
     for name, fn in (checks or {}).items():
         if name in feats:
             raise ValueError(f"a check cannot be called {name!r}; that name is a built-in feature")
@@ -79,7 +79,7 @@ def _sign_test_p(n_plus: int, n_minus: int) -> float:
 
 
 def compare_poles(pos: Sequence[str], neg: Sequence[str], *, paired: bool = False,
-                  checks: Optional[Dict[str, Check]] = None, n_tokens: Optional[Callable[[str], int]] = None
+                  checks: Optional[Dict[str, Check]] = None, count_tokens: Optional[Callable[[str], int]] = None
                   ) -> List[Dict[str, Any]]:
     """Per feature (length, and each check): each pole's mean, the difference in pooled SDs
     (``std_diff``; infinite when the feature does not vary within the poles but differs between
@@ -87,8 +87,8 @@ def compare_poles(pos: Sequence[str], neg: Sequence[str], *, paired: bool = Fals
     ``|std_diff|``. A feature the poles differ on is a cue a probe can learn instead of the concept."""
     if paired and len(pos) != len(neg):
         raise ValueError("paired poles need the same number of texts")
-    fp = [text_features(t, checks, n_tokens) for t in pos]
-    fn = [text_features(t, checks, n_tokens) for t in neg]
+    fp = [text_features(t, checks, count_tokens) for t in pos]
+    fn = [text_features(t, checks, count_tokens) for t in neg]
     rows = []
     for k in fp[0]:
         a = np.array([f[k] for f in fp], dtype=np.float64)
@@ -267,7 +267,7 @@ class DatasetAudit:
     words: Dict[str, List[Dict[str, Any]]]
     formulaicity: Dict[str, Any]
     diversity: Dict[str, Dict[str, float]]
-    dir: Optional[str] = None
+    out_dir: Optional[str] = None
     notes: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -310,7 +310,7 @@ class DatasetAudit:
         json_dump(os.path.join(out_dir, "audit.json"), self.to_dict())
         with open(os.path.join(out_dir, "audit.md"), "w", encoding="utf-8") as f:
             f.write(self.markdown())
-        self.dir = out_dir
+        self.out_dir = out_dir
         return out_dir
 
 
@@ -323,7 +323,7 @@ def audit_dataset(
     checks: Optional[Dict[str, Check]] = None,
     ids: Optional[Sequence[str]] = None,
     embed: Optional[Callable[[List[str]], Any]] = None,
-    n_tokens: Optional[Callable[[str], int]] = None,
+    count_tokens: Optional[Callable[[str], int]] = None,
     folds: int = 8,
     save: Optional[bool] = None,
     out_dir: Optional[str] = None,
@@ -350,7 +350,7 @@ def audit_dataset(
         ids = [f"{i}:pos" for i in range(len(pos))] + [f"{i}:neg" for i in range(len(neg))]
     audit = DatasetAudit(
         name=name, n_pos=len(pos), n_neg=len(neg), paired=paired,
-        features=compare_poles(pos, neg, paired=paired, checks=checks, n_tokens=n_tokens),
+        features=compare_poles(pos, neg, paired=paired, checks=checks, count_tokens=count_tokens),
         baselines=baselines, words=distinctive_words(pos, neg),
         formulaicity=formulaicity(pos + neg, ids),
         diversity={"positive": diversity(pos, None if embed is None else embed(pos)),

@@ -3,10 +3,11 @@
 Every such choice (the dtype resolved from ``"auto"``, the source a model was loaded from, how a
 cache was used, ...) is recorded with its reason, travels with the result it shaped, is printed to
 the console when that is on, and goes to the run log and the saved metrics. Each one has an option
-to choose something else (decisions D1 and D5 in docs/DESIGN.md).
+to choose something else.
 """
+import sys
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, Optional, Set, Tuple
 
 from .settings import settings
 
@@ -58,3 +59,30 @@ def announce(choices: Iterable[Choice], *, console: Optional[bool] = None, logge
         if show and not (once and key in _ANNOUNCED):
             print(f"[concept-probe] {choice}", flush=True)
         _ANNOUNCED.add(key)
+
+
+def progress_line(label: str, show: bool) -> Callable[[int, int], None]:
+    """A progress report for a loop of known length, ``report(done, total)``: one line rewritten in
+    place where the output is a terminal or a notebook; elsewhere (a log file), a line at the start,
+    one halfway and one at the end. Nothing when ``show`` is False."""
+    in_place = _rewritable_output()
+
+    def report(done: int, total: int) -> None:
+        if not show:
+            return
+        text = f"[concept-probe] {label} {done}/{total}"
+        if in_place:
+            print("\r" + text, end="\n" if done >= total else "", flush=True)
+        elif done in {1, (total + 1) // 2, total}:
+            print(text, flush=True)
+
+    return report
+
+
+def _rewritable_output() -> bool:
+    try:
+        if sys.stdout.isatty():
+            return True
+    except (AttributeError, ValueError):
+        pass
+    return "ipykernel" in sys.modules

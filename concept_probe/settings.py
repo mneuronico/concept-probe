@@ -1,7 +1,7 @@
 """Session-wide defaults for saving and for the console.
 
-Functions that produce results save them by default (decision D4 in docs/DESIGN.md: better to save
-too much than too little) and announce the choices they make on their own (D1, D5). Each such
+Functions that produce results save them by default (better to save too much than too
+little) and announce the choices they make on their own. Each such
 function takes ``save=`` / ``console=`` arguments; when they are None, these defaults apply.
 ``configure(...)`` changes them for the rest of the session::
 
@@ -18,8 +18,8 @@ from typing import Optional
 class Settings:
     #: write results to disk, including the representations cache of reading
     save: bool = True
-    #: where results go when there is no run directory
-    output_root: str = "outputs"
+    #: where results go when no folder is given (named after the library, so you know what made it)
+    output_root: str = "concept_probe_outputs"
     #: the representations cache; None means ``<output_root>/rep_cache``
     rep_cache_dir: Optional[str] = None
     #: print automatic choices (and progress) to the console

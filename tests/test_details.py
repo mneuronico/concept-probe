@@ -46,9 +46,9 @@ def test_unknown_span_makes_text_readouts_refuse_instead_of_reading_the_template
     ids, start, end = _encode_text_for_read(CharChatTok(offsets=False), "ppx", "sys", role="user")
     assert start is None and end is None
     hs = fake_forward(None, ids)
-    with pytest.raises(ValueError, match="sequence_"):
+    with pytest.raises(ValueError, match="through_text_"):
         reps_from_hs_layers(hs, start, "text_mean", 4, span_end=end)
-    reps_from_hs_layers(hs, start, "sequence_mean", 4)  # whole-sequence readouts still work
+    reps_from_hs_layers(hs, start, "through_text_mean", 4)  # whole-sequence readouts still work
 
 
 def test_text_readouts_pool_over_the_span_only():
@@ -60,24 +60,24 @@ def test_text_readouts_pool_over_the_span_only():
     np.testing.assert_allclose(reps_from_hs_layers(hs, start, "text_last_k", 2, span_end=end)[0], [0.5, 1])
 
 
-def test_sequence_pooling_depends_on_length_and_text_pooling_does_not():
+def test_through_text_pooling_depends_on_length_and_text_pooling_does_not():
     # The template prefix is identical in every input, so its weight in a sequence mean is 1/length.
     tok = CharChatTok()
     seq, own = [], []
     for text in ("pp", "pppppp"):
         ids, start, end = _encode_text_for_read(tok, text, "sys", role="user")
         hs = fake_forward(None, ids)
-        seq.append(reps_from_hs_layers(hs, None, "sequence_mean", 4)[0, 0])
+        seq.append(reps_from_hs_layers(hs, None, "through_text_mean", 4)[0, 0])
         own.append(reps_from_hs_layers(hs, start, "text_mean", 4, span_end=end)[0, 0])
     assert seq[0] < seq[1]
     np.testing.assert_allclose(own, [1.0, 1.0])
 
 
-def test_sequence_modes_stop_where_the_item_ends():
+def test_through_text_modes_stop_where_the_item_ends():
     hs = [torch.tensor([[1.0], [2.0], [3.0], [9.0]])]  # the last position is a trailing EOS
-    assert reps_from_hs_layers(hs, 1, "sequence_last", 1, span_end=3)[0, 0] == 3.0
-    assert reps_from_hs_layers(hs, 1, "sequence_mean", 1, span_end=3)[0, 0] == pytest.approx(2.0)
-    assert reps_from_hs_layers(hs, 1, "sequence_last_k", 2, span_end=3)[0, 0] == pytest.approx(2.5)
+    assert reps_from_hs_layers(hs, 1, "through_text_last", 1, span_end=3)[0, 0] == 3.0
+    assert reps_from_hs_layers(hs, 1, "through_text_mean", 1, span_end=3)[0, 0] == pytest.approx(2.0)
+    assert reps_from_hs_layers(hs, 1, "through_text_last_k", 2, span_end=3)[0, 0] == pytest.approx(2.5)
 
 
 # ----------------------------------------------------------------- generated completions
@@ -124,8 +124,8 @@ def test_p_value_selection_without_a_positive_layer_raises():
 
 
 @pytest.mark.parametrize("bad", ["pvalue", "p", "Effect_size"])
-def test_unknown_sweep_select_raises(bad):
-    with pytest.raises(ValueError, match="sweep_select"):
+def test_an_unknown_layer_selection_raises(bad):
+    with pytest.raises(ValueError, match="select_layer_by"):
         _select_best_layer([1.0], [0.1], [0], bad)
 
 
@@ -134,7 +134,7 @@ def _probe(num_layers=6, layer=3):
     v = np.zeros((num_layers, 4), dtype=np.float32)
     v[:, 0] = 1.0
     probe = ConceptProbe.from_directions(v, layer, identity="m", save=False)
-    probe.steer_sigma, probe.resid_norm = 0.5, np.arange(1, num_layers + 1, dtype=float)
+    probe.steer_sd, probe.resid_norm = 0.5, np.arange(1, num_layers + 1, dtype=float)
     return probe
 
 
@@ -145,9 +145,9 @@ def _alphas(add, num_layers=6):
 
 def test_by_default_only_the_probe_layer_is_steered_with_the_whole_dose():
     probe = _probe()
-    assert _alphas(probe.steering(2.0)) == {3: 2.0}
-    assert _alphas(probe.steering(2.0, layers=[1, -1])) == {1: 2.0, 5: 2.0}  # each listed layer, the whole dose
-    assert _alphas(probe.steering(2.0, layers=[1, 5], distribute=True)) == {1: 1.0, 5: 1.0}  # only when asked
+    assert _alphas(probe.steering(2.0)) == {3: pytest.approx(8.0)}  # in residual norms by default (layer 3's is 4)
+    assert _alphas(probe.steering(2.0, "raw", layers=[1, -1])) == {1: 2.0, 5: 2.0}  # each listed layer, the whole dose
+    assert _alphas(probe.steering(2.0, "raw", layers=[1, 5], distribute=True)) == {1: 1.0, 5: 1.0}  # only when asked
 
 
 def test_a_window_is_clipped_at_the_edges_and_says_so(capsys):
@@ -168,16 +168,16 @@ def test_a_window_is_clipped_at_the_edges_and_says_so(capsys):
 
 def test_units_scale_the_dose_and_need_their_reference():
     probe = _probe()
-    assert _alphas(probe.steering(2.0, "sigma")) == {3: pytest.approx(1.0)}
+    assert _alphas(probe.steering(2.0, "sd")) == {3: pytest.approx(1.0)}
     assert _alphas(probe.steering(0.5, "resid_norm", layers=[0, 3])) == {0: pytest.approx(0.5), 3: pytest.approx(2.0)}
     with pytest.raises(ValueError, match="unit must be one of"):
         probe.steering(1.0, "Sigma")
-    probe.steer_sigma = None
-    with pytest.raises(ValueError, match="steer_sigma"):
-        probe.steering(1.0, "sigma")
-    assert _alphas(probe.steering(0.0, "sigma")) == {3: 0.0}  # dose 0 needs no unit
+    probe.steer_sd = None
+    with pytest.raises(ValueError, match="steer_sd"):
+        probe.steering(1.0, "sd")
+    assert _alphas(probe.steering(0.0, "sd")) == {3: 0.0}  # dose 0 needs no unit
     probe.resid_norm = None
-    with pytest.raises(ValueError, match="norms=True"):
+    with pytest.raises(ValueError, match="resid_norm"):
         probe.steering(1.0, "resid_norm")
     with pytest.raises(ValueError):
         probe.steering(1.0, layers=[6])
@@ -217,3 +217,22 @@ def test_the_sweep_plot_can_show_the_selection_half(tmp_path):
     out = tmp_path / "sweep.png"
     assert plot_sweep([0.1, 0.5], [0.5, 0.01], str(out), best_layer=1, selection_d=[0.2, 0.9])
     assert out.exists()
+
+
+# ------------------------------------------------------------------------------------- progress
+def test_progress_rewrites_one_line_or_prints_three(capsys, monkeypatch):
+    from concept_probe import record
+
+    monkeypatch.setattr(record, "_rewritable_output", lambda: False)
+    report = record.progress_line("Generated condition", True)
+    for done in range(1, 8):
+        report(done, 7)
+    assert [line.split()[-1] for line in capsys.readouterr().out.splitlines()] == ["1/7", "4/7", "7/7"]
+    monkeypatch.setattr(record, "_rewritable_output", lambda: True)
+    report = record.progress_line("Generated condition", True)
+    for done in range(1, 4):
+        report(done, 3)
+    out = capsys.readouterr().out
+    assert out.count("\r") == 3 and out.count("\n") == 1 and out.endswith("3/3\n")
+    record.progress_line("x", False)(1, 1)
+    assert capsys.readouterr().out == ""

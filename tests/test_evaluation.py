@@ -1,5 +1,5 @@
-"""Evaluating how a probe reads (layer 6b): named eval sets, the primary set read without the
-pole's system prompt (decision D2), pairs, AUROC, accuracy, random-direction nulls, shuffled labels,
+"""Evaluating how a probe reads: named eval sets, the primary set read without the
+pole's system prompt, pairs, AUROC, accuracy, random-direction nulls, shuffled labels,
 paired comparisons between scorers and probes read on each other's sets."""
 import json
 import os
@@ -44,7 +44,7 @@ def test_the_primary_set_chooses_the_layer_and_the_others_are_measured_there():
     main, other = ev.sets["main"], ev.sets["other"]
     assert main.measured_on == "the held-out part" and other.measured_on == "all items"
     assert main.d > 1 and 0 < main.auroc <= 1 and main.accuracy > 0.6 and main.null_d95 < 1
-    assert other.d == pytest.approx(other.d_curve[2]) and other.accuracy is None  # no threshold in another context
+    assert other.d == pytest.approx(other.d_by_layer[2]) and other.accuracy is None  # no threshold in another context
     assert ev.threshold["layer"] == 2 and len(ev.selection_idx[0]) == 20
 
 
@@ -63,7 +63,7 @@ def test_paired_items_stay_together_and_get_paired_statistics():
 def test_a_fixed_layer_uses_every_item_and_a_missing_primary_raises():
     pos, neg = _blobs()
     ev = evaluate_reading(_directions(), [EvalSet("main", pos, neg)], layer=1, n_bootstrap=0, n_permutations=0)
-    assert ev.selection == "fixed_layer" and ev.sweep_max_d_perm_p is None and len(ev.report_idx[0]) == len(pos)
+    assert ev.selection == "fixed_layer" and ev.max_d_permutation_p is None and len(ev.report_idx[0]) == len(pos)
     with pytest.raises(ValueError, match="no eval set named"):
         evaluate_reading(_directions(), [EvalSet("main", pos, neg)], primary="nope")
 
@@ -80,7 +80,7 @@ def test_random_directions_give_the_null_of_d():
 def test_shuffled_labels_do_not_train_a_probe():
     pos, neg = _blobs(n=60, gap=3.0)
     out = label_shuffle_control("mean_diff", pos[:30], neg[:30], pos[30:], neg[30:], layer=2, n_shuffles=20)
-    assert out["n_shuffles"] == 20 and out["abs_d_p95"] < 1.5
+    assert out["n_shuffles"] == 20 and out["null_abs_d95"] < 1.5
 
 
 def test_compare_two_scorers_on_the_same_items():
@@ -134,14 +134,14 @@ def test_the_old_judgement_is_the_primary_set_away_and_gives_the_old_number():
     gp = generate(MODEL, TOK, EVAL_QUESTIONS, system=POS_SYSTEM, **gen)
     gn = generate(MODEL, TOK, EVAL_QUESTIONS, system=NEG_SYSTEM, **gen)
     with_system, _ = _generated_set("eval_with_system_prompt", gp, gn, "as generated")
-    probe = ConceptProbe.fit(P, N, eval=with_system, n_permutations=200, n_bootstrap=200, identity="tiny", save=False)
-    assert probe.metrics["d"] == pytest.approx(20.403938831070754, rel=1e-4)  # the number before decision D2
+    probe = ConceptProbe.fit(P, N, eval_sets=with_system, n_permutations=200, n_bootstrap=200, identity="tiny", save=False)
+    assert probe.metrics["d"] == pytest.approx(20.403938831070754, rel=1e-4)  # read with the pole's system prompt
 
 
 def _texts_probe(eval_sets, **kw):
     model, tok = TinyCausalLM(), CharChatTok()
     P, N = read_texts(model, tok, TRAIN_POS, cache=False), read_texts(model, tok, TRAIN_NEG, cache=False)
-    return ConceptProbe.fit(P, N, eval=eval_sets, n_permutations=200, n_bootstrap=200, **{"save": False, **kw})
+    return ConceptProbe.fit(P, N, eval_sets=eval_sets, n_permutations=200, n_bootstrap=200, **{"save": False, **kw})
 
 
 def test_minimal_pairs_of_eval_texts_are_split_and_tested_by_pair():
@@ -177,8 +177,8 @@ def test_named_eval_sets_controls_and_new_numbers_are_reported(tmp_path):
     assert m["null_d95"] < m["d"] and m["auroc"] is not None and m["accuracy"] is not None
     assert m["label_shuffle"]["n_shuffles"] == 10
     assert "n_label_shuffles" in [c.setting for c in probe.choices]
-    assert {"sweep.png", "score_hist.png", "sweep_short.png"} <= set(os.listdir(os.path.join(probe.run_dir, "plots")))
-    loaded = ConceptProbe.load(probe.run_dir)
+    assert {"sweep.png", "score_hist.png", "sweep_short.png"} <= set(os.listdir(os.path.join(probe.out_dir, "plots")))
+    loaded = ConceptProbe.load(probe.out_dir)
     assert loaded.metrics == json.loads(json.dumps(m, default=float)) or loaded.metrics["d"] == pytest.approx(m["d"])
     np.testing.assert_allclose(loaded.directions, probe.directions)
     assert loaded.calibrations[0].context.matches(probe.calibrations[0].context)

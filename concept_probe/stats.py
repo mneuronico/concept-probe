@@ -1,4 +1,4 @@
-"""Statistics on scores (layer 6a of docs/DESIGN.md): effect sizes, tests, splits, permutation and
+"""Statistics on scores: effect sizes, tests, splits, permutation and
 bootstrap. Pure functions on arrays."""
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -113,11 +113,11 @@ def _bootstrap_d_ci(
     return [float(lo), float(hi)]
 
 
-SWEEP_SELECTS = ("effect_size", "p_value")
+LAYER_SELECTIONS = ("effect_size", "p_value")
 
 
 def _select_best_layer(
-    sweep_d: np.ndarray, sweep_p: np.ndarray, search_layers: Sequence[int], sweep_select: str
+    d_by_layer: np.ndarray, p_by_layer: np.ndarray, search_layers: Sequence[int], select_layer_by: str
 ) -> int:
     """Best layer of the sweep among ``search_layers``.
 
@@ -125,32 +125,32 @@ def _select_best_layer(
     separate the eval sets in the concept's direction (d > 0), since the t-test is two-sided;
     ties in p (it underflows to 0 for well-separated sets) go to the larger d.
     """
-    if sweep_select not in SWEEP_SELECTS:
-        raise ValueError(f"training.sweep_select must be one of {SWEEP_SELECTS}; got {sweep_select!r}")
-    d = np.asarray(sweep_d, dtype=np.float64)
-    p = np.asarray(sweep_p, dtype=np.float64)
+    if select_layer_by not in LAYER_SELECTIONS:
+        raise ValueError(f"select_layer_by must be one of {LAYER_SELECTIONS}; got {select_layer_by!r}")
+    d = np.asarray(d_by_layer, dtype=np.float64)
+    p = np.asarray(p_by_layer, dtype=np.float64)
     allowed = np.zeros(d.shape, dtype=bool)
     allowed[list(search_layers)] = True
-    if sweep_select == "effect_size":
+    if select_layer_by == "effect_size":
         masked = np.where(allowed & np.isfinite(d), d, -np.inf)
         best = int(np.argmax(masked))
         if not np.isfinite(masked[best]):
             raise ValueError(
-                "No finite Cohen's d in the best_layer_search range: d needs at least 2 eval items per pole "
-                "(on each side of evaluation.selection_split, if set); add eval data or disable the layer sweep."
+                "No finite Cohen's d in search_layers: d needs at least 2 eval items per pole (on each side of "
+                "selection_split, if set); add eval items, or give layer= instead of searching for one."
             )
         return best
     candidates = np.flatnonzero(allowed & (d > 0) & np.isfinite(p))
     if candidates.size == 0:
         raise ValueError(
-            "No layer in best_layer_search has d > 0 and a finite p-value. "
-            "Install scipy, add eval data, or use sweep_select='effect_size'."
+            "No layer in search_layers has d > 0 and a finite p-value. "
+            "Install scipy, add eval data, or use select_layer_by='effect_size'."
         )
     order = np.lexsort((-d[candidates], p[candidates]))
     return int(candidates[order[0]])
 
 
-# ------------------------------------------------------------------------------------- stage 3
+# ------------------------------------------------------------------------------- comparisons
 def auroc(pos: np.ndarray, neg: np.ndarray) -> float:
     """Area under the ROC curve of scores separating ``pos`` from ``neg``: the chance that a random
     positive item scores above a random negative one (ties count half)."""
@@ -225,8 +225,8 @@ def compare_scorers(stat, a_pos: np.ndarray, a_neg: np.ndarray, b_pos: np.ndarra
 
 
 def random_directions_null(pos: np.ndarray, neg: np.ndarray, n_random: int = 50, seed: int = 0,
-                           quantile: float = 95.0) -> np.ndarray:
-    """What Cohen's d is without a concept, on the same items: per layer, the ``quantile`` of |d|
+                           percentile: float = 95.0) -> np.ndarray:
+    """What Cohen's d is without a concept, on the same items: per layer, the ``percentile`` of |d|
     between ``pos`` and ``neg`` representations ``(n, layers, dim)`` projected on ``n_random``
     random unit directions (the same directions at every layer). A direction's length does not
     change d, so random directions of any norm give the same null."""
@@ -238,7 +238,7 @@ def random_directions_null(pos: np.ndarray, neg: np.ndarray, n_random: int = 50,
     for l in range(pos.shape[1]):
         a = pos[:, l, :].astype(np.float64) @ w
         b = neg[:, l, :].astype(np.float64) @ w
-        out[l] = float(np.percentile(np.abs(_cohen_d_columns(a, b)), quantile))
+        out[l] = float(np.percentile(np.abs(_cohen_d_columns(a, b)), percentile))
     return out
 
 

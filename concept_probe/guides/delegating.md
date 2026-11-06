@@ -9,7 +9,7 @@ start, or a person. The task is written to a folder with everything needed; noth
 
 ```python
 judge = AgentJudge("tasks")
-judge.rate(texts, rubric)    # writes tasks/<rubric>-<id>/ and raises AnswersPending(path)
+judge.rate(texts, rubric)    # writes tasks/<rubric>-<id>/ and raises AnswersPending(task_dir)
 ```
 
 The folder has:
@@ -31,13 +31,13 @@ every text on its own; do not show a subagent the probe's scores or which pole a
 ```python
 folder = critique_task(pos, neg, "critique", concept="positive vs negative feeling", paired=True)
 # an agent answers critique/TASK.md, writing critique/critique.json
-critique = read_critique(folder)
+critique = load_critique(folder)
 audit_dataset(pos, neg, checks=critique.checks())
 ```
 
 The folder has `TASK.md` (what to look for, and the JSON format), `sample.json` (a random sample of
 each pole, or of the pairs, with ids like `pos:3`) and, once answered, `critique.json`.
-`read_critique` checks the answer: the names, the poles, that the ids are in the sample and that
+`load_critique` checks the answer: the names, the poles, that the ids are in the sample and that
 the regular expressions compile. A critique works best from a reader that did not write the texts.
 
 ## Good practice

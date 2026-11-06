@@ -1,13 +1,12 @@
-"""The probe object (layers 2 and 3 of docs/DESIGN.md).
+"""The probe object.
 
 A :class:`ConceptProbe` is one direction per layer of a model to read a concept with, the layer it
 reads at, the calibrations that turn its projections into z scores, and the directions it steers
 with. It is built from representations already read (:meth:`ConceptProbe.fit`, which can also
 evaluate it on named eval sets), from directions computed elsewhere
-(:meth:`ConceptProbe.from_directions`), or from a saved probe (:meth:`ConceptProbe.load`, also for
-runs saved by earlier versions). It reads arrays without a model; with one attached
-(:meth:`ConceptProbe.attach`) it also scores texts token by token and builds its steering
-intervention.
+(:meth:`ConceptProbe.from_directions`), or from a saved probe (:meth:`ConceptProbe.load`). It
+reads arrays without a model; with one attached (:meth:`ConceptProbe.attach`) it also scores
+texts token by token and builds its steering intervention.
 """
 import json
 import os
@@ -16,21 +15,19 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
-from .directions import estimator_spec, fit_directions, make_estimator
+from .directions import estimator_spec, fit_directions, make_estimator, steer_directions_for
 from .evaluation import EvalSet, ReadingEvaluation, evaluate_reading, label_shuffle_control
 from .inputs import (
     TEXT_ROLES,
     Encoded,
     PromptLike,
     ReadContext,
-    _completion_input_ids,
-    _normalize_messages,
     _prompt_to_text,
-    encode_text,
+    _encode_text,
 )
 from .interventions import Add
-from .linear_probe import Calibration, calibrations_from_tensors, sigmoid, steer_directions_for
-from .modeling import ModelBundle, identity_from_config, identity_mismatches, upgrade_saved_config
+from .calibration import Calibration, sigmoid
+from .modeling import ModelBundle, identity_mismatches
 from .reading import Readout, _read
 from .record import Choice, announce
 from .scoring import ScoreInput, Scores, TokenScorer, score_inputs
@@ -41,7 +38,7 @@ from .visuals import plot_score_hist, plot_sweep
 
 #: Units of a steering dose: as is, the eval items' within-pole SD on the steering direction, or each
 #: layer's mean residual norm.
-ALPHA_UNITS = ("raw", "sigma", "resid_norm")
+STEER_UNITS = ("resid_norm", "sd", "raw")
 #: Units of a probe's z: within-pole SDs, or the poles' scale (+1 the positive mean, 0 the zero).
 Z_UNITS = ("sd", "poles")
 
@@ -100,12 +97,12 @@ class ConceptProbe:
     #: the layers a score combines (their mean, or sum with ``score_aggregate="sum"``); default the probe's
     score_layers: Optional[List[int]] = None
     score_aggregate: str = "mean"
-    #: (layers, dim) directions steering adds (decision D1: the raw difference of means by default)
+    #: (layers, dim) directions steering adds (the raw difference of means by default)
     steer_directions: Optional[np.ndarray] = None
     #: one calibration per reading context: the zero and unit of z scores, a threshold, neutral texts
     calibrations: List[Calibration] = field(default_factory=list)
-    #: the unit of ``unit="sigma"``: the eval items' pooled within-pole SD on the steering direction
-    steer_sigma: Optional[float] = None
+    #: the unit of ``unit="sd"``: the eval items' pooled within-pole SD on the steering direction
+    steer_sd: Optional[float] = None
     #: the unit of ``unit="resid_norm"``: the mean residual norm per layer of the training texts
     resid_norm: Optional[np.ndarray] = None
     #: the model the directions belong to (see :func:`concept_probe.modeling.identity_of`)
@@ -114,17 +111,17 @@ class ConceptProbe:
     estimator: Optional[Dict[str, Any]] = None
     steer_estimator: Optional[Dict[str, Any]] = None
     #: Cohen's d and its p per layer on the primary eval set (all its items)
-    sweep_d: Optional[np.ndarray] = None
-    sweep_p: Optional[np.ndarray] = None
+    d_by_layer: Optional[np.ndarray] = None
+    p_by_layer: Optional[np.ndarray] = None
     #: the evaluation made when the probe was fitted (in memory), and its numbers (also saved)
     evaluation: Optional[ReadingEvaluation] = None
     metrics: Dict[str, Any] = field(default_factory=dict)
     #: every choice made on the caller's behalf
     choices: List[Choice] = field(default_factory=list)
     model_bundle: Optional[ModelBundle] = None
-    run_dir: Optional[str] = None
+    out_dir: Optional[str] = None
     #: where a probe without a folder creates one when it first saves (None: the session's output_root)
-    save_root: Optional[str] = None
+    output_root: Optional[str] = None
 
     # ------------------------------------------------------------------ building
     @classmethod
@@ -133,19 +130,19 @@ class ConceptProbe:
         pos: Any,
         neg: Any,
         *,
-        eval: Union[None, EvalSet, Sequence[EvalSet]] = None,
+        eval_sets: Union[None, EvalSet, Sequence[EvalSet]] = None,
         layer: Optional[int] = None,
         estimator: Any = "mean_diff",
-        steer: Any = "mean_diff",
+        steer_estimator: Any = "mean_diff",
         search_layers: Optional[Sequence[int]] = None,
-        sweep_select: str = "effect_size",
+        select_layer_by: str = "effect_size",
         selection_split: Any = 0.5,
         n_random: int = 50,
         n_bootstrap: int = 1000,
         n_permutations: int = 1000,
         n_label_shuffles: Union[int, str] = "auto",
         neutral: Any = None,
-        baseline: bool = False,
+        zero: str = "midpoint",
         erase: Any = None,
         threshold_l2: float = 1e-2,
         seed: int = 0,
@@ -158,7 +155,7 @@ class ConceptProbe:
         tokenizer: Any = None,
         identity: Optional[Union[Dict[str, Any], str]] = None,
         allow_model_mismatch: bool = False,
-        root_dir: Optional[str] = None,
+        output_root: Optional[str] = None,
         run_name: Optional[str] = None,
         save: Optional[bool] = None,
         overwrite: bool = False,
@@ -168,49 +165,49 @@ class ConceptProbe:
         (arrays, or what :func:`concept_probe.read_texts` returns, which says which model they come
         from and how they were read).
 
-        ``estimator`` and ``steer`` set the reading and steering directions (see
-        :mod:`concept_probe.directions`; ``steer="read"`` steers with the reading direction).
+        ``estimator`` and ``steer_estimator`` set the reading and steering directions (see
+        :mod:`concept_probe.directions`; ``steer_estimator="read"`` steers with the reading direction).
         ``erase`` (an :class:`~concept_probe.directions.Eraser`) fits both without a confound.
 
-        With ``eval`` (an :class:`~concept_probe.evaluation.EvalSet`, or several: the first is the
+        With ``eval_sets`` (an :class:`~concept_probe.evaluation.EvalSet`, or several: the first is the
         primary), the probe is evaluated as :func:`concept_probe.evaluate_reading` does: the layer is
         chosen on a ``selection_split`` part of the primary set (a fraction, or the items that choose
         it; see there) within ``search_layers``, its numbers come from the rest, every other set is
         measured there, with random-direction nulls (``n_random``), bootstrap intervals and a
         permutation p; ``n_label_shuffles`` refits with shuffled labels (``"auto"``: 10 for the
         difference of means, which is quick, else 0; announced). Each set's scores calibrate the
-        probe for items read like it (the primary one with a threshold; ``baseline=True`` puts the
+        probe for items read like it (the primary one with a threshold; ``zero="baseline"`` puts the
         zero at the second pole's mean, for a concept read against a baseline). ``neutral``, texts
         without the concept read like the primary set, are placed on its calibration (reported, not
-        used as the zero). Without ``eval``, give the ``layer``.
+        used as the zero). Without ``eval_sets``, give the ``layer``.
 
         The probe belongs to the model the representations came from: the one ``read_texts``
         recorded, ``model`` (loaded, then attached; another one raises unless
-        ``allow_model_mismatch``), or ``identity`` (a dict, or a model id). Representations read with
-        ``norms=True`` give the unit of ``unit="resid_norm"``. The probe saves to
+        ``allow_model_mismatch``), or ``identity`` (a dict, or a model id). The residual norms the
+        representations carry are the unit of ``unit="resid_norm"``. The probe saves to
         ``<root>/<name>/<run_name or time>`` unless ``save=False`` (or the session does not save),
         with the plots of its evaluation unless ``plots=False``.
         """
         P, N = _as_array(pos), _as_array(neg)
-        sets = [] if eval is None else ([eval] if isinstance(eval, EvalSet) else list(eval))
+        sets = [] if eval_sets is None else ([eval_sets] if isinstance(eval_sets, EvalSet) else list(eval_sets))
         if layer is None and not sets:
-            raise ValueError("Pass eval= (eval sets, to choose the layer on items that did not train) or layer=.")
+            raise ValueError("Pass eval_sets= (eval sets, to choose the layer on items that did not train) or layer=.")
         probe = cls._new(name, pos_label, neg_label, model, tokenizer, identity, getattr(pos, "identity", None),
-                         root_dir, allow_model_mismatch)
+                         output_root, allow_model_mismatch)
         choices: List[Choice] = []
         flips: List[int] = []
         est = make_estimator(estimator)
         read = fit_directions(est, P, N, erase=erase, flips=flips)
         probe.estimator = estimator_spec(est)
         _record_estimator_notes(probe, est, flips, choices)
-        steer_dirs, steer_spec, choice = steer_directions_for(est, steer, P, N, read, erase=erase)
+        steer_dirs, steer_spec, choice = steer_directions_for(est, steer_estimator, P, N, read, erase=erase)
         if choice is not None:
             choices.append(choice)
         probe.directions, probe.steer_directions = read, steer_dirs
         probe.steer_estimator = steer_spec
         if erase is not None:
-            probe.estimator = dict(probe.estimator, erased=erase.describe())
-            probe.steer_estimator = dict(probe.steer_estimator, erased=erase.describe())
+            probe.estimator = dict(probe.estimator, erased=erase.to_dict())
+            probe.steer_estimator = dict(probe.steer_estimator, erased=erase.to_dict())
         num_layers = read.shape[0]
         norms = [getattr(r, "norms", None) for r in (pos, neg)]
         if all(n is not None for n in norms):
@@ -218,12 +215,12 @@ class ConceptProbe:
 
         if sets:
             ev = evaluate_reading(read, sets, layer=layer, selection_split=selection_split, search_layers=search_layers,
-                                  sweep_select=sweep_select, n_random=int(n_random), n_bootstrap=int(n_bootstrap),
+                                  select_layer_by=select_layer_by, n_random=int(n_random), n_bootstrap=int(n_bootstrap),
                                   n_permutations=int(n_permutations), threshold_l2=threshold_l2, seed=seed)
             probe.layer = int(ev.layer)
             probe.evaluation = ev
             main = ev.main
-            probe.sweep_d, probe.sweep_p = main.d_curve, main.p_curve
+            probe.d_by_layer, probe.p_by_layer = main.d_by_layer, main.p_by_layer
             primary = sets[0]
             for s in sets:
                 result = ev.sets.get(s.name)
@@ -231,8 +228,8 @@ class ConceptProbe:
                 if result is None or any(c.context.matches(context) for c in probe.calibrations):
                     continue
                 tokens = _token_projections(s, read)
-                cal = Calibration.from_scores(result.pos_scores, result.neg_scores, context, pos_tokens=tokens[0],
-                                              neg_tokens=tokens[1], zero="baseline" if baseline else "midpoint",
+                cal = Calibration._from_scores(result.pos_scores, result.neg_scores, context, pos_tokens=tokens[0],
+                                              neg_tokens=tokens[1], zero=zero,
                                               source="evaluation" if s is primary else s.name)
                 if s is primary:
                     cal.threshold = ev.threshold
@@ -253,8 +250,8 @@ class ConceptProbe:
             if neutral is not None:
                 cal = probe.calibrations[0]
                 scores = np.einsum("nld,ld->nl", _as_array(neutral).astype(np.float64), read.astype(np.float64))
-                cal.add_neutral(scores)
-                z = cal.items_z(scores[:, [probe.layer]], [probe.layer])
+                cal._add_neutral(scores)
+                z = cal._items_z(scores[:, [probe.layer]], [probe.layer])
                 neutral_report = {"n": int(len(scores)), "mean_score": float(scores[:, probe.layer].mean()),
                                   "z": None if z is None else float(z.mean()),
                                   "z_sd": None if z is None or len(z) < 2 else float(z.std(ddof=1))}
@@ -272,11 +269,11 @@ class ConceptProbe:
             if steer_dirs is not read:
                 sp = np.einsum("nd,d->n", primary_set.pos[:, probe.layer].astype(np.float64), steer_dirs[probe.layer])
                 sn = np.einsum("nd,d->n", primary_set.neg[:, probe.layer].astype(np.float64), steer_dirs[probe.layer])
-                probe.steer_sigma = float(_pooled_sd_columns(sp[:, None], sn[:, None])[0])
+                probe.steer_sd = float(_pooled_sd_columns(sp[:, None], sn[:, None])[0])
             else:
-                probe.steer_sigma = float(probe.calibrations[0].scale[probe.layer])
-            if not np.isfinite(probe.steer_sigma):
-                probe.steer_sigma = None
+                probe.steer_sd = float(probe.calibrations[0].scale[probe.layer])
+            if not np.isfinite(probe.steer_sd):
+                probe.steer_sd = None
         probe.choices = choices
         announce(choices)
         probe._save_new(run_name, save, overwrite, "fit", plots=plots)
@@ -296,7 +293,7 @@ class ConceptProbe:
         tokenizer: Any = None,
         identity: Optional[Union[Dict[str, Any], str]] = None,
         allow_model_mismatch: bool = False,
-        root_dir: Optional[str] = None,
+        output_root: Optional[str] = None,
         run_name: Optional[str] = None,
         save: Optional[bool] = None,
         overwrite: bool = False,
@@ -305,7 +302,7 @@ class ConceptProbe:
         unit length per layer (announced when they were not), and steers with ``steer_directions``,
         or with the directions as given. Calibrate it with :meth:`calibrate` to get z scores. The
         model and saving work as in :meth:`fit`."""
-        probe = cls._new(name, pos_label, neg_label, model, tokenizer, identity, None, root_dir, allow_model_mismatch)
+        probe = cls._new(name, pos_label, neg_label, model, tokenizer, identity, None, output_root, allow_model_mismatch)
         v = np.asarray(directions, dtype=np.float64)
         if v.ndim != 2:
             raise ValueError(f"directions must be (layers, dim); got shape {v.shape}")
@@ -325,9 +322,109 @@ class ConceptProbe:
         return probe
 
     @classmethod
-    def _new(cls, name, pos_label, neg_label, model, tokenizer, identity, reps_identity, root_dir,
+    def from_texts(
+        cls,
+        model: Any,
+        pos: Sequence[PromptLike],
+        neg: Sequence[PromptLike],
+        eval_pos: Sequence[PromptLike],
+        eval_neg: Sequence[PromptLike],
+        *,
+        paired: bool = False,
+        readout: Union[str, Readout] = "text_mean",
+        role: str = "raw",
+        system: Optional[str] = None,
+        prompt: Optional[str] = None,
+        tokenizer: Any = None,
+        batch_size: int = 16,
+        **fit_options: Any,
+    ) -> "ConceptProbe":
+        """Read texts of each pole and fit a probe on them, evaluated on other texts: :func:`read_texts`,
+        an :class:`~concept_probe.EvalSet` and :meth:`fit` in one call.
+
+        ``model`` is a :class:`ModelBundle` (or a loaded model, with its ``tokenizer``). ``pos`` and
+        ``neg`` train the probe; ``eval_pos`` and ``eval_neg`` are the eval set ``"eval"``, which
+        chooses the layer on half of its items and measures it on the rest (``paired=True`` when
+        ``eval_pos[i]`` and ``eval_neg[i]`` are a minimal pair). Every text is read the same way
+        (``readout``, ``role``, ``system``, ``prompt``: see :func:`read_texts`). ``fit_options`` go to
+        :meth:`fit` (``name``, ``pos_label``, ``estimator``, ``layer``, ``save``, ...). For other eval
+        sets or readings, call those steps yourself: this is only them in a row.
+        """
+        from .reading import read_texts
+
+        bundle = model if isinstance(model, ModelBundle) else ModelBundle.from_loaded(model, tokenizer)
+
+        def read(texts: Sequence[PromptLike]) -> Any:
+            return read_texts(bundle.model, bundle.tokenizer, list(texts), readout, role=role, system=system,
+                              prompt=prompt, batch_size=batch_size)
+
+        eval_set = EvalSet("eval", read(eval_pos), read(eval_neg), paired=paired)
+        return cls.fit(read(pos), read(neg), eval_sets=eval_set, model=bundle, **fit_options)
+
+    @classmethod
+    def from_system_prompts(
+        cls,
+        model: Any,
+        pos_system: str,
+        neg_system: str,
+        questions: Sequence[PromptLike],
+        eval_questions: Sequence[PromptLike],
+        *,
+        eval_texts: Optional[Tuple[Sequence[PromptLike], Sequence[PromptLike]]] = None,
+        max_new_tokens: int = 64,
+        tokenizer: Any = None,
+        batch_size: int = 16,
+        **fit_options: Any,
+    ) -> "ConceptProbe":
+        """Fit a probe on what the model writes under one system prompt per pole, in one call.
+
+        The model answers every one of ``questions`` under ``pos_system`` and under ``neg_system``
+        (greedy, up to ``max_new_tokens``), and the probe is fitted on those answers, read as written
+        (after their system prompt). It is evaluated on its answers to ``eval_questions``, paired by
+        question: the eval set ``"eval"`` reads them without the system prompt they were written
+        under, because read with it the system prompt itself pushes the score toward its pole and
+        inflates d; ``"eval_with_system_prompt"`` reads them as written, to see that difference; and
+        ``eval_texts = (pos_texts, neg_texts)``, if given, are read alone as the set ``"texts"``. An
+        empty answer drops its pair. ``fit_options`` go to :meth:`fit`; the answers are saved with
+        the probe (``generations/``) when it is saved. A probe trained on texts you write
+        (:meth:`from_texts`) usually reads text the model did not write better.
+        """
+        from .generation import generate
+        from .reading import read_encoded, read_texts
+
+        bundle = model if isinstance(model, ModelBundle) else ModelBundle.from_loaded(model, tokenizer)
+        mdl, tok = bundle.model, bundle.tokenizer
+
+        def answers(qs: Sequence[PromptLike], system: str) -> Any:
+            return generate(mdl, tok, list(qs), system=system, max_new_tokens=max_new_tokens, batch_size=batch_size,
+                            save=False)
+
+        def answers_set(name: str, gens_pos: Any, gens_neg: Any, system: Any) -> EvalSet:
+            reads = [read_encoded(mdl, tok, g.encodings(system), skip_empty=True, batch_size=batch_size)
+                     for g in (gens_pos, gens_neg)]
+            both = sorted(set(reads[0].read_items) & set(reads[1].read_items))
+            P, N = (r.data[[r.read_items.index(q) for q in both]] for r in reads)
+            return EvalSet(name, P, N, context=ReadContext.generated(system=None), paired=True)
+
+        gens = {"train_pos": answers(questions, pos_system), "train_neg": answers(questions, neg_system),
+                "eval_pos": answers(eval_questions, pos_system), "eval_neg": answers(eval_questions, neg_system)}
+        sets = [answers_set("eval", gens["eval_pos"], gens["eval_neg"], None),
+                answers_set("eval_with_system_prompt", gens["eval_pos"], gens["eval_neg"], "as generated")]
+        if eval_texts is not None:
+            sets.append(EvalSet("texts", read_texts(mdl, tok, list(eval_texts[0]), batch_size=batch_size),
+                                read_texts(mdl, tok, list(eval_texts[1]), batch_size=batch_size)))
+        pos = read_encoded(mdl, tok, gens["train_pos"].encodings(), skip_empty=True, batch_size=batch_size)
+        neg = read_encoded(mdl, tok, gens["train_neg"].encodings(), skip_empty=True, batch_size=batch_size)
+        probe = cls.fit(pos, neg, eval_sets=sets, model=bundle, **fit_options)
+        if probe.out_dir:
+            for name, g in gens.items():
+                g.save(os.path.join(probe.out_dir, "generations", name))
+        return probe
+
+    @classmethod
+    def _new(cls, name, pos_label, neg_label, model, tokenizer, identity, reps_identity, output_root,
              allow_model_mismatch) -> "ConceptProbe":
-        probe = cls(name=str(name), pos_label=str(pos_label), neg_label=str(neg_label), save_root=root_dir)
+        probe = cls(name=str(name), pos_label=str(pos_label), neg_label=str(neg_label), output_root=output_root)
         if isinstance(identity, str):
             identity = {"model_id": identity}
         if model is not None:
@@ -370,27 +467,27 @@ class ConceptProbe:
                   plots: bool = True) -> None:
         if not (settings().save if save is None else save):
             return
-        root = self.save_root or settings().output_root
-        run_dir = os.path.join(root, safe_slug(self.name), run_name or now_tag())
-        if os.path.isdir(run_dir) and os.listdir(run_dir):
+        root = self.output_root or settings().output_root
+        out_dir = os.path.join(root, safe_slug(self.name), run_name or now_tag())
+        if os.path.isdir(out_dir) and os.listdir(out_dir):
             if not overwrite:
-                raise FileExistsError(f"{run_dir} already holds files; pass overwrite=True or another run_name.")
+                raise FileExistsError(f"{out_dir} already holds files; pass overwrite=True or another run_name.")
             import shutil
 
-            shutil.rmtree(run_dir)
-        self.save(run_dir, how=how)
+            shutil.rmtree(out_dir)
+        self._save(out_dir, how=how)
         if plots and self.evaluation is not None:
-            self._plots(os.path.join(run_dir, "plots"))
+            self._plots(os.path.join(out_dir, "plots"))
         if settings().console:
-            print(f"[concept-probe] saved the probe to {run_dir}", flush=True)
+            print(f"[concept-probe] saved the probe to {out_dir}", flush=True)
 
     def _plots(self, folder: str) -> None:
         ev = self.evaluation
         ensure_dir(folder)
         main = ev.main
-        plot_sweep(main.d_curve, main.p_curve, os.path.join(folder, "sweep.png"), best_layer=self.layer,
-                   selection_d=ev.selection_d_curve, report_d=ev.report_d_curve if ev.selection == "split" else None,
-                   null_d95=ev.report_null_d95_curve, best_d=main.d,
+        plot_sweep(main.d_by_layer, main.p_by_layer, os.path.join(folder, "sweep.png"), best_layer=self.layer,
+                   selection_d=ev.selection_d_by_layer, report_d=ev.held_out_d_by_layer if ev.selection == "split" else None,
+                   null_d95=ev.held_out_null_d95_by_layer, best_d=main.d,
                    title=f"{self.name}: Cohen's d per layer on the {ev.primary} items")
         rp, rn = ev.report_idx
         plot_score_hist(main.pos_scores[rp, self.layer], main.neg_scores[rn, self.layer],
@@ -400,55 +497,57 @@ class ConceptProbe:
                         labels=(self.pos_label, self.neg_label))
         for set_name, result in ev.sets.items():
             if set_name != ev.primary:
-                plot_sweep(result.d_curve, result.p_curve, os.path.join(folder, f"sweep_{safe_slug(set_name)}.png"),
-                           best_layer=self.layer, null_d95=result.null_d95_curve, best_d=result.d,
+                plot_sweep(result.d_by_layer, result.p_by_layer, os.path.join(folder, f"sweep_{safe_slug(set_name)}.png"),
+                           best_layer=self.layer, null_d95=result.null_d95_by_layer, best_d=result.d,
                            title=f"{self.name}: Cohen's d per layer on the {set_name} items")
 
-    def save(self, run_dir: Optional[str] = None, *, how: str = "save") -> str:
-        """Write the probe to ``run_dir`` (default: its own): ``probe.json`` (what it is, its
+    def save(self, out_dir: Optional[str] = None) -> str:
+        """Write the probe to ``out_dir`` (default: its own): ``probe.json`` (what it is, its
         calibrations, its evaluation's numbers, the choices made) and ``probe.npz`` (its directions
         and per-layer curves). :meth:`load` reads it back."""
         self._require_trained()
-        run_dir = run_dir or self.run_dir
-        if not run_dir:
-            raise ValueError("The probe has no folder; pass run_dir.")
-        ensure_dir(run_dir)
-        self.run_dir = run_dir
+        return self._save(out_dir, how="save")
+
+    def _save(self, out_dir: Optional[str], how: str) -> str:
+        out_dir = out_dir or self.out_dir
+        if not out_dir:
+            raise ValueError("The probe has no folder; pass out_dir.")
+        ensure_dir(out_dir)
+        self.out_dir = out_dir
         arrays = {"directions": np.asarray(self.directions, dtype=np.float32)}
         if self.steer_directions is not None and self.steer_directions is not self.directions:
             arrays["steer_directions"] = np.asarray(self.steer_directions, dtype=np.float32)
-        for key in ("resid_norm", "sweep_d", "sweep_p"):
+        for key in ("resid_norm", "d_by_layer", "p_by_layer"):
             if getattr(self, key) is not None:
                 arrays[key] = np.asarray(getattr(self, key), dtype=np.float64)
-        np.savez_compressed(os.path.join(run_dir, "probe.npz"), **arrays)
-        json_dump(os.path.join(run_dir, "probe.json"), {
+        np.savez_compressed(os.path.join(out_dir, "probe.npz"), **arrays)
+        json_dump(os.path.join(out_dir, "probe.json"), {
             "name": self.name, "pos_label": self.pos_label, "neg_label": self.neg_label, "layer": int(self.layer),
             "score_layers": self.score_layers, "score_aggregate": self.score_aggregate, "identity": self.identity,
-            "estimator": self.estimator, "steer_estimator": self.steer_estimator, "steer_sigma": self.steer_sigma,
+            "estimator": self.estimator, "steer_estimator": self.steer_estimator, "steer_sd": self.steer_sd,
             "calibrations": [c.to_dict() for c in self.calibrations], "metrics": self.metrics,
             "choices": [c.to_dict() for c in self.choices], "built_by": how,
         })
-        return run_dir
+        return out_dir
 
     @classmethod
-    def load(cls, run_dir: str, model: Any = None, tokenizer: Any = None, *,
+    def load(cls, out_dir: str, model: Any = None, tokenizer: Any = None, *,
              allow_model_mismatch: bool = False) -> "ConceptProbe":
-        """A probe saved in ``run_dir`` (by :meth:`save`, or a training run of an earlier version),
-        with ``model`` attached if given (see :meth:`attach`)."""
-        if os.path.exists(os.path.join(run_dir, "probe.json")):
-            obj = cls._load_probe(run_dir)
-        else:
-            obj = cls._load_old_run(run_dir)
-        obj.run_dir = run_dir
+        """A probe saved in ``out_dir`` by :meth:`save`, with ``model`` attached if given (see
+        :meth:`attach`)."""
+        if not os.path.exists(os.path.join(out_dir, "probe.json")):
+            raise FileNotFoundError(f"No probe in {out_dir!r}: ConceptProbe.save writes probe.json and probe.npz there.")
+        obj = cls._load_probe(out_dir)
+        obj.out_dir = out_dir
         if model is not None:
             obj.attach(model, tokenizer, allow_model_mismatch=allow_model_mismatch)
         return obj
 
     @classmethod
-    def _load_probe(cls, run_dir: str) -> "ConceptProbe":
-        with open(os.path.join(run_dir, "probe.json"), "r", encoding="utf-8") as f:
+    def _load_probe(cls, out_dir: str) -> "ConceptProbe":
+        with open(os.path.join(out_dir, "probe.json"), "r", encoding="utf-8") as f:
             d = json.load(f)
-        with np.load(os.path.join(run_dir, "probe.npz")) as z:
+        with np.load(os.path.join(out_dir, "probe.npz")) as z:
             arrays = {k: z[k] for k in z.files}
         obj = cls(name=d["name"], pos_label=d["pos_label"], neg_label=d["neg_label"])
         obj.directions = arrays["directions"]
@@ -456,69 +555,13 @@ class ConceptProbe:
         obj.layer = int(d["layer"])
         obj.score_layers, obj.score_aggregate = d.get("score_layers"), d.get("score_aggregate", "mean")
         obj.identity, obj.estimator, obj.steer_estimator = d.get("identity"), d.get("estimator"), d.get("steer_estimator")
-        obj.steer_sigma = d.get("steer_sigma")
+        obj.steer_sd = d.get("steer_sd")
         obj.calibrations = [Calibration.from_dict(c) for c in d.get("calibrations", [])]
         obj.metrics = d.get("metrics") or {}
         obj.choices = [Choice(**c) for c in d.get("choices", [])]
-        obj.resid_norm, obj.sweep_d, obj.sweep_p = (arrays.get(k) for k in ("resid_norm", "sweep_d", "sweep_p"))
+        obj.resid_norm, obj.d_by_layer, obj.p_by_layer = (arrays.get(k) for k in ("resid_norm", "d_by_layer", "p_by_layer"))
         return obj
 
-    @classmethod
-    def _load_old_run(cls, run_dir: str) -> "ConceptProbe":
-        """A training run of an earlier version: ``config.json``, ``concept.json``, ``metrics.json``
-        and ``tensors.npz``, in the names of then."""
-        with open(os.path.join(run_dir, "config.json"), "r", encoding="utf-8") as f:
-            cfg = upgrade_saved_config(json.loads(f.read()))
-        with open(os.path.join(run_dir, "concept.json"), "r", encoding="utf-8") as f:
-            concept = json.loads(f.read())
-        metrics: Dict[str, Any] = {}
-        if os.path.exists(os.path.join(run_dir, "metrics.json")):
-            with open(os.path.join(run_dir, "metrics.json"), "r", encoding="utf-8") as f:
-                metrics = json.loads(f.read())
-        with np.load(os.path.join(run_dir, "tensors.npz")) as t:
-            tensors = {k: t[k] for k in t.files}
-        obj = cls(name=concept.get("name", "concept"), pos_label=concept.get("pos_label", "positive"),
-                  neg_label=concept.get("neg_label", "negative"))
-        obj.directions = tensors["concept_vectors"]
-        obj.layer = int(tensors["best_layer"][0])
-        obj.sweep_d, obj.sweep_p = tensors.get("sweep_d"), tensors.get("sweep_p")
-        obj.resid_norm = tensors.get("resid_norm")
-        obj.calibrations = calibrations_from_tensors(tensors)
-        obj.identity = metrics.get("model_identity") or identity_from_config(cfg.get("model", {}))
-        obj.estimator = metrics.get("estimator") or estimator_spec(cfg.get("training", {}).get("estimator", "mean_diff"))
-        evaluation = cfg.get("evaluation", {})
-        selection = evaluation.get("layer_selection") or {"mode": "best"}
-        num_layers = int(np.asarray(obj.directions).shape[0])
-        mode = selection.get("mode", "best")
-        if mode == "window":
-            obj.score_layers = _window(obj.layer, selection.get("window_radius", 0), num_layers)[0]
-        elif mode == "explicit":
-            obj.score_layers = _layer_list(selection.get("layers", []), num_layers, "layer_selection.layers")
-        elif mode == "all":
-            obj.score_layers = list(range(num_layers))
-        obj.score_aggregate = evaluation.get("score_aggregate", "mean")
-        obj.metrics = {k: metrics.get(k) for k in ("best_layer", "best_d", "best_p", "best_d_ci95", "best_auroc",
-                                                   "null_d95_at_best_layer", "selection") if k in metrics}
-        if "steer_vectors" in tensors:
-            obj.steer_directions = tensors["steer_vectors"]
-            if np.array_equal(obj.steer_directions, obj.directions):
-                obj.steer_directions = obj.directions
-            sigma = float(tensors["steer_sigma_best_layer"][0])
-            obj.steer_estimator = metrics.get("steer_direction") or obj.estimator
-        else:
-            # Saved before steering had its own direction: it steers with the one it reads with.
-            obj.steer_directions, obj.steer_estimator = obj.directions, obj.estimator
-            sigma = float(tensors["score_scale"][obj.layer]) if "score_scale" in tensors else float("nan")
-            if obj.estimator != {"kind": "mean_diff", "normalization": "none"}:
-                obj.choices.append(Choice(
-                    "steering direction", "mean_diff", "the run's reading direction",
-                    f"this run ({obj.estimator}) was saved before steering had its own direction, so it steers with "
-                    "the one it reads with; refit it to steer with the raw difference of means"))
-                announce(obj.choices)
-        obj.steer_sigma = sigma if np.isfinite(sigma) else None
-        return obj
-
-    # ------------------------------------------------------------------ reading arrays
     @property
     def num_layers(self) -> int:
         self._require_trained()
@@ -571,9 +614,9 @@ class ConceptProbe:
             raise ValueError(f"unit must be one of {Z_UNITS}; got {unit!r}")
         cal = self._calibration_of(reps, context, tokens=per_text is not None)
         layers = self._score_layers()
-        z = cal.items_z(self.project(reps)[:, layers], layers, self.score_aggregate, unit=unit)
+        z = cal._items_z(self.project(reps)[:, layers], layers, self.score_aggregate, unit=unit)
         if z is None:
-            raise ValueError(f"the calibration for items read {cal.context.describe()} has no usable references "
+            raise ValueError(f"the calibration for items read {cal.context} has no usable references "
                              f"{'in poles units ' if unit == 'poles' else ''}at layers {layers}.")
         return self._per_text(z, reps, per_text, 0.0)
 
@@ -632,12 +675,12 @@ class ConceptProbe:
         return next((c for c in self.calibrations if c.context.matches(target)), None)
 
     def _missing_z_reason(self, context: Optional[Union[ReadContext, Dict[str, Any]]]) -> str:
-        have = "; ".join(c.context.describe() for c in self.calibrations) or "in no context"
+        have = "; ".join(str(c.context) for c in self.calibrations) or "in no context"
         if context is None:
             return (f"the probe has {len(self.calibrations)} calibrations (items read {have}); say which reading "
                     "context the items come from (context=...).")
         target = context if isinstance(context, ReadContext) else ReadContext.from_dict(context)
-        return (f"the probe has no calibration for items read {target.describe()} (it has one for items read "
+        return (f"the probe has no calibration for items read {target} (it has one for items read "
                 f"{have}); z scores from another reading context are not comparable. Add one with "
                 "probe.calibrate(pos, neg, ...).")
 
@@ -647,12 +690,11 @@ class ConceptProbe:
         neg: Any,
         *,
         context: Optional[Union[ReadContext, Dict[str, Any]]] = None,
-        as_reply_to: Optional[Union[str, List[str]]] = None,
         role: str = "raw",
         system: Optional[str] = None,
-        prompt: Optional[str] = None,
+        prompt: Union[None, str, Sequence[str]] = None,
         neutral: Any = None,
-        baseline: bool = False,
+        zero: str = "midpoint",
         threshold_l2: float = 1e-2,
         batch_size: int = 16,
     ) -> Calibration:
@@ -661,10 +703,11 @@ class ConceptProbe:
 
         ``pos`` / ``neg`` (and ``neutral``, texts without the concept, whose place is recorded) are
         representations already read, with ``context`` saying how (default: what they record, or raw
-        text); or texts, which the probe reads with its model: as replies to ``as_reply_to`` (one
-        user turn, or one per text), after ``system`` if given, which is how generated completions
-        are read; or with ``role`` / ``system`` / ``prompt``, as :meth:`score_texts` reads them.
-        Texts also give single tokens their references. ``baseline=True`` sets the zero at ``neg``'s
+        text); or texts, which the probe reads with its model as :func:`concept_probe.read_texts` does
+        (``role``, ``system``, and ``prompt``: one user turn, or one per text with
+        ``role="assistant"``, which is how generated completions are read as replies to their own
+        prompts).
+        Texts also give single tokens their references. ``zero="baseline"`` sets the zero at ``neg``'s
         mean instead of the midpoint. Call :meth:`save` to keep it.
         """
         self._require_trained()
@@ -676,48 +719,45 @@ class ConceptProbe:
                 scores["neutral"] = self.project(neutral)
             tokens: Dict[str, Optional[List[np.ndarray]]] = {"pos": None, "neg": None}
         else:
-            ctx, scores, tokens = self._read_for_calibration(pos, neg, neutral, as_reply_to, role, system, prompt,
+            ctx, scores, tokens = self._read_for_calibration(pos, neg, neutral, role, system, prompt,
                                                              batch_size)
-        cal = Calibration.from_scores(scores["pos"], scores["neg"], ctx, pos_tokens=tokens["pos"],
-                                      neg_tokens=tokens["neg"], zero="baseline" if baseline else "midpoint",
+        cal = Calibration._from_scores(scores["pos"], scores["neg"], ctx, pos_tokens=tokens["pos"],
+                                      neg_tokens=tokens["neg"], zero=zero,
                                       source="calibrate()")
         layer = int(self.layer)
-        cal.add_threshold(scores["pos"][:, layer], scores["neg"][:, layer], layer, "the calibration items",
+        cal._add_threshold(scores["pos"][:, layer], scores["neg"][:, layer], layer, "the calibration items",
                           l2=threshold_l2)
         if "neutral" in scores:
-            cal.add_neutral(scores["neutral"])
+            cal._add_neutral(scores["neutral"])
         self.calibrations = [c for c in self.calibrations if not c.context.matches(ctx)] + [cal]
         return cal
 
-    def _read_for_calibration(self, pos_texts, neg_texts, neutral_texts, as_reply_to, role, system, prompt,
+    def _read_for_calibration(self, pos_texts, neg_texts, neutral_texts, role, system, prompt,
                               batch_size):
         self._require_model("calibrating on texts")
         tokenizer, model = self.model_bundle.tokenizer, self.model_bundle.model
 
+        per_text = prompt is not None and not isinstance(prompt, str)
+        if per_text and role != "assistant":
+            raise ValueError("one prompt per text is a user turn before each text: it needs role='assistant'")
+
         def encode(texts: List[PromptLike], label: str) -> List[Encoded]:
-            if as_reply_to is None:
-                return [encode_text(tokenizer, t, system, role=role, prompt=prompt, warn=_warn,
-                                    warn_prefix=f"calibrate.{label}[{i}]") for i, t in enumerate(texts)]
-            turns = [as_reply_to] * len(texts) if isinstance(as_reply_to, str) else list(as_reply_to)
+            turns = list(prompt) if per_text else [prompt] * len(texts)
             if len(turns) != len(texts):
-                raise ValueError(f"as_reply_to has {len(turns)} turns for {len(texts)} {label} texts.")
-            out = []
-            for turn, text in zip(turns, texts):
-                messages, _ = _normalize_messages(turn, system)
-                ids, plen = _completion_input_ids(tokenizer, messages, str(text))
-                out.append(Encoded(ids[0], plen, int(ids.shape[-1])))
-            return out
+                raise ValueError(f"prompt has {len(turns)} turns for {len(texts)} {label} texts.")
+            return [_encode_text(tokenizer, t, system, role=role, prompt=p, warn=_warn,
+                                warn_prefix=f"calibrate.{label}[{i}]") for i, (t, p) in enumerate(zip(texts, turns))]
 
         if role not in TEXT_ROLES:
             raise ValueError(f"role must be one of {TEXT_ROLES}; got {role!r}")
-        ctx = (ReadContext.generated("text_mean", system) if as_reply_to is not None else
+        ctx = (ReadContext.generated("text_mean", system) if per_text else
                ReadContext(kind="text", role=role, system=None if role == "raw" else system,
                            prompt=prompt if role == "assistant" else None, readout="text_mean"))
         scores, tokens = {}, {}
         for label, texts in (("pos", pos_texts), ("neg", neg_texts), ("neutral", neutral_texts or [])):
             if not texts:
                 continue
-            reps = _read(model, tokenizer, encode(list(texts), label), [Readout.parse("text_mean")],
+            reps = _read(model, tokenizer, encode(list(texts), label), [Readout._parse("text_mean")],
                          batch_size=batch_size, project_on=self.directions, cache=False,
                          label=f"calibrate.{label}")[0]
             announce(reps.choices)
@@ -790,7 +830,7 @@ class ConceptProbe:
                          "text's mean token score has no z (single tokens still do)")
         inputs = []
         for i, text in enumerate(texts):
-            enc = encode_text(tokenizer, text, system, role=role, prompt=prompt, warn=_warn,
+            enc = _encode_text(tokenizer, text, system, role=role, prompt=prompt, warn=_warn,
                               warn_prefix=f"score_texts.texts[{i}]")
             span = (0, 0) if enc.start is None else (int(enc.start), int(enc.end))
             info = {"input": text, "role": role, "system": system,
@@ -804,7 +844,7 @@ class ConceptProbe:
         result = Scores("texts", [scorer.name], items, run_settings, {scorer.name: z_missing})
         if settings().save if save is None else save:
             if out_dir is None:
-                root = self.run_dir or os.path.join(self.save_root or settings().output_root, safe_slug(self.name))
+                root = self.out_dir or os.path.join(self.output_root or settings().output_root, safe_slug(self.name))
                 out_dir = os.path.join(root, "scores", now_tag())
             ensure_dir(out_dir)
             result.save(out_dir, html=html)
@@ -812,8 +852,8 @@ class ConceptProbe:
 
     def steering(
         self,
-        alpha: float,
-        unit: str = "raw",
+        dose: float,
+        unit: str = "resid_norm",
         *,
         layers: Optional[Sequence[int]] = None,
         window: Optional[int] = None,
@@ -823,13 +863,13 @@ class ConceptProbe:
     ) -> Add:
         """The intervention that steers with this probe: an :class:`~concept_probe.interventions.Add`
         of ``alpha_l * v_l`` at each steered layer ``l``, where ``v_l`` is the probe's steering
-        direction at that layer (``steer_directions``; decision D1) and ``alpha`` is in ``unit``:
+        direction at that layer (``steer_directions``) and ``alpha_l`` is ``dose`` in ``unit``:
 
-        - ``"raw"``: as is;
-        - ``"sigma"``: times ``steer_sigma``, the eval items' pooled within-pole SD on the steering
+        - ``"resid_norm"`` (the default, as in :func:`concept_probe.evaluate_steering`): times each
+          layer's mean residual norm on the training texts, so 0.1 adds 10% of a typical token's norm;
+        - ``"sd"``: times ``steer_sd``, the eval items' pooled within-pole SD on the steering
           direction at the probe's layer (a scale knob, not "n standard deviations of behavior");
-        - ``"resid_norm"``: times each layer's mean residual norm on the training texts, so 0.1
-          adds 10% of a typical token's norm.
+        - ``"raw"``: as is (the directions have unit length).
 
         It steers at the probe's layer, at ``layers``, or at the layers within ``window`` of it (a
         window that reaches past the model is clipped, and that is announced). With several layers,
@@ -839,19 +879,19 @@ class ConceptProbe:
         :func:`concept_probe.generate` or :func:`concept_probe.answer_logprobs`.
         """
         self._require_trained()
-        if unit not in ALPHA_UNITS:
-            raise ValueError(f"unit must be one of {ALPHA_UNITS}; got {unit!r}")
+        if unit not in STEER_UNITS:
+            raise ValueError(f"unit must be one of {STEER_UNITS}; got {unit!r}")
         steer_layers = self.steer_layer_list(layers, window)
-        if abs(float(alpha)) > 1e-12:
-            self._check_alpha_unit(unit)
-        value = float(alpha)
-        if unit == "sigma" and abs(value) > 1e-12:
-            value *= float(self.steer_sigma)
+        if abs(float(dose)) > 1e-12:
+            self._check_unit(unit)
+        value = float(dose)
+        if unit == "sd" and abs(value) > 1e-12:
+            value *= float(self.steer_sd)
         per = value / len(steer_layers) if distribute else value
         alphas = {l: float(per * (float(self.resid_norm[l]) if unit == "resid_norm" else 1.0)) for l in steer_layers}
         V = self.steer_directions if vectors is None else vectors
         return Add({l: np.asarray(V[l], dtype=np.float32) for l in steer_layers}, alpha=alphas, positions=positions,
-                   label=f"steering with {self.name!r}: alpha {float(alpha):g} ({unit})")
+                   label=f"steering with {self.name!r}: dose {float(dose):g} ({unit})")
 
     def steer_layer_list(self, layers: Optional[Sequence[int]] = None, window: Optional[int] = None) -> List[int]:
         """The layers :meth:`steering` steers: the probe's layer, ``layers``, or the layers within
@@ -869,23 +909,24 @@ class ConceptProbe:
         return _layer_list(list(layers) if not isinstance(layers, (int, np.integer)) else layers, self.num_layers,
                            "layers")
 
-    def _check_alpha_unit(self, unit: str) -> None:
+    def _check_unit(self, unit: str) -> None:
         """Raise if the probe lacks the reference that ``unit`` scales by."""
-        if unit == "sigma" and (self.steer_sigma is None or not np.isfinite(self.steer_sigma)):
-            raise ValueError("unit='sigma' needs the probe's steering unit (steer_sigma), which comes from evaluation "
+        if unit == "sd" and (self.steer_sd is None or not np.isfinite(self.steer_sd)):
+            raise ValueError("unit='sd' needs the probe's steering unit (steer_sd), which comes from evaluation "
                              "or calibration items; this probe has none.")
         if unit == "resid_norm" and self.resid_norm is None:
-            raise ValueError("unit='resid_norm' needs the mean residual norm per layer: fit the probe on texts read "
-                             "with norms=True, or set probe.resid_norm (evaluate_steering measures it on the prompts).")
+            raise ValueError("unit='resid_norm' needs the mean residual norm per layer of the texts the probe was "
+                             "fitted on, which this probe lacks (it was built from directions): set probe.resid_norm, "
+                             "or pass unit='raw' (evaluate_steering measures the norms on its prompts).")
 
-    def describe(self) -> Dict[str, Any]:
+    def to_dict(self) -> Dict[str, Any]:
         """What the probe is, in a dict: its concept, layer, estimators, calibrations and numbers."""
         self._require_trained()
         return {"name": self.name, "poles": [self.pos_label, self.neg_label], "layer": int(self.layer),
                 "score_layers": self._score_layers(), "estimator": self.estimator,
-                "steer_estimator": self.steer_estimator, "steer_sigma": self.steer_sigma, "identity": self.identity,
-                "calibrations": [c.context.describe() for c in self.calibrations], "metrics": self.metrics,
-                "run_dir": self.run_dir}
+                "steer_estimator": self.steer_estimator, "steer_sd": self.steer_sd, "identity": self.identity,
+                "calibrations": [str(c.context) for c in self.calibrations], "metrics": self.metrics,
+                "out_dir": self.out_dir}
 
     # ------------------------------------------------------------------ checks
     def _require_trained(self) -> None:
@@ -941,7 +982,7 @@ def _metrics(ev: ReadingEvaluation, shuffle: Optional[Dict[str, Any]], neutral: 
     return {
         "layer": int(ev.layer), "d": main.d, "p": main.p, "d_ci95": main.d_ci95, "auroc": main.auroc,
         "auroc_ci95": main.auroc_ci95, "null_d95": main.null_d95, "accuracy": main.accuracy,
-        "accuracy_ci95": main.accuracy_ci95, "d_all_eval": None if not np.isfinite(main.d_curve[ev.layer])
-        else float(main.d_curve[ev.layer]), "n_train": {"pos": int(n_pos), "neg": int(n_neg)},
-        "evaluation": ev.to_metrics(), "label_shuffle": shuffle, "neutral": neutral,
+        "accuracy_ci95": main.accuracy_ci95, "d_all_eval": None if not np.isfinite(main.d_by_layer[ev.layer])
+        else float(main.d_by_layer[ev.layer]), "n_train": {"pos": int(n_pos), "neg": int(n_neg)},
+        "evaluation": ev.to_dict(), "label_shuffle": shuffle, "neutral": neutral,
     }

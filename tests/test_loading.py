@@ -1,4 +1,4 @@
-"""Loading (layer 0): the dtype chosen for "auto", quantization settings, the model identity, and
+"""Loading: the dtype chosen for "auto", quantization settings, the model identity, and
 workspaces built around a model that is already loaded."""
 from types import SimpleNamespace
 
@@ -10,7 +10,6 @@ from transformers import BitsAndBytesConfig
 
 from concept_probe import ConceptProbe, ModelBundle, modeling, read_texts
 from concept_probe.modeling import (
-    identity_from_config,
     identity_mismatches,
     quantization_identity,
     resolve_dtype,
@@ -117,14 +116,6 @@ def test_a_dict_or_object_config_is_passed_through():
     assert resolve_quantization(own, torch.float16)[0] is own
 
 
-def test_saved_configs_from_earlier_versions_are_read_in_todays_terms():
-    old = {"model": {"model_id": "m", "use_4bit": True}, "training": {"direction_normalization": "var"}}
-    new = modeling.upgrade_saved_config(old)
-    assert new["model"] == {"model_id": "m", "quantization": "nf4"}
-    assert new["training"] == {"estimator": {"kind": "mean_diff", "normalization": "var"}}
-    assert old["model"]["use_4bit"] is True  # the input is left alone
-
-
 def test_bad_quantization_settings_raise():
     with pytest.raises(ValueError, match="one of"):
         resolve_quantization("q4", torch.float16)
@@ -139,13 +130,12 @@ def test_quantization_identities_name_the_levels():
 
 
 # -------------------------------------------------------------------------------------- identity
-def test_identity_from_an_old_config_and_mismatches():
-    old = identity_from_config({"model_id": "m", "dtype": "bfloat16", "use_4bit": True})
-    assert old["dtype"] == "bfloat16" and old["quantization"] == "nf4"
+def test_identity_mismatches_compare_what_both_sides_know():
+    old = {"model_id": "m", "dtype": "bfloat16", "quantization": "nf4"}
     new = dict(old, dtype="float16")
     assert identity_mismatches(old, new) == ["dtype: 'bfloat16' vs 'float16'"]
-    unknown = identity_from_config({"model_id": "m", "dtype": "auto", "use_4bit": True})
-    assert identity_mismatches(unknown, new) == []  # an "auto" config does not say which dtype was used
+    assert identity_mismatches(dict(old, dtype=None), new) == []  # a dtype one side does not know
+    assert identity_mismatches({"model_id": "m"}, new) == []  # only the model id given
 
 
 def test_identity_reads_the_repo_id_out_of_a_cached_snapshot_path():
@@ -153,10 +143,9 @@ def test_identity_reads_the_repo_id_out_of_a_cached_snapshot_path():
     model.config = SimpleNamespace(_name_or_path="/h/hub/models--org--name/snapshots/abc123", _commit_hash="abc123")
     ident = modeling.identity_of(model, CharChatTok())
     assert ident["model_id"] == "org/name" and ident["revision"] == "abc123" and ident["dtype"] == "float64"
-    # Runs saved by earlier versions recorded the snapshot's path: it is the same model as the repo.
+    # A model given by its snapshot's path is the same model as the repo.
     path = "C:\\Users\\u\\.cache\\huggingface\\hub\\models--org--name\\snapshots\\abc123"
     assert identity_mismatches(dict(ident, model_id=path), ident) == []
-    assert identity_from_config({"model_id": path})["model_id"] == "org/name"
     assert identity_mismatches(dict(ident, model_id="org/other"), ident) == ["model_id: 'org/other' vs 'org/name'"]
 
 
@@ -173,11 +162,11 @@ def test_a_loaded_model_is_wrapped_and_its_tokenizer_set_up_and_announced():
 def test_a_fitted_probe_records_its_model_identity_and_refuses_another(tmp_path):
     model, tok = TinyCausalLM(), CharChatTok()
     P, N = read_texts(model, tok, ["pp x", "p y"], cache=False), read_texts(model, tok, ["nn x", "n y"], cache=False)
-    probe = ConceptProbe.fit(P, N, layer=1, save=True, root_dir=str(tmp_path), run_name="r")
+    probe = ConceptProbe.fit(P, N, layer=1, save=True, output_root=str(tmp_path), run_name="r")
     assert probe.identity["dtype"] == "float64"
-    assert ConceptProbe.load(probe.run_dir).identity == probe.identity
+    assert ConceptProbe.load(probe.out_dir).identity == probe.identity
     with pytest.raises(ValueError, match="dtype: 'float64' vs 'float32'"):
-        ConceptProbe.load(probe.run_dir, TinyCausalLM().float(), tok)
+        ConceptProbe.load(probe.out_dir, TinyCausalLM().float(), tok)
     other = read_texts(TinyCausalLM().float(), tok, ["pp x", "p y"], cache=False)
     with pytest.raises(ValueError, match="another model"):
         ConceptProbe.fit(other, other, layer=1, model=model, tokenizer=tok, save=False)

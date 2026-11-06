@@ -43,27 +43,45 @@ an API need no client package.
 ## Quickstart
 
 ```python
-from concept_probe import ConceptProbe, EvalSet, ModelBundle, evaluate_steering, read_texts
+from concept_probe import ConceptProbe, ModelBundle, evaluate_steering, load_example, read_texts
 
 bundle = ModelBundle.load("meta-llama/Llama-3.2-3B-Instruct")
-model, tok = bundle.model, bundle.tokenizer
+data = load_example("valence")      # minimal pairs to try it with; your own lists of texts go here
 
-pos = read_texts(model, tok, train_pos_texts, norms=True)          # (texts, layers, dim), and how it was read
-neg = read_texts(model, tok, train_neg_texts, norms=True)
-eval_set = EvalSet("eval", read_texts(model, tok, eval_pos_texts), read_texts(model, tok, eval_neg_texts),
-                   paired=True)                                       # minimal pairs stay together
-
-probe = ConceptProbe.fit(pos, neg, eval=eval_set, name="valence", model=bundle)
+probe = ConceptProbe.from_texts(bundle, data.train_pos, data.train_neg, data.eval_pos, data.eval_neg,
+                                paired=True, name="valence")   # minimal pairs stay together
 probe.metrics["d"], probe.metrics["null_d95"]       # d on the held-out half, and what random directions give
-probe.z(read_texts(model, tok, ["The storm passed and nobody was hurt."]))
+probe.z(read_texts(bundle.model, bundle.tokenizer, ["The storm passed and nobody was hurt."]))
 probe.score_texts(["The storm passed and nobody was hurt."])        # every token, with an HTML heatmap
 
+prompts = ["Write a short story about a student getting exam results.", "Tell me about your weekend."]
 ev = evaluate_steering(probe, prompts, doses=[-0.25, 0.25])          # against 10 random directions
 ev.row(0.25)["effects"]["valence"], ev.largest_coherent_dose
 ```
 
+`load_example("valence")` is a dataset that ships with the library: 224 pairs of English texts, each
+one situation told with a good and with a bad outcome (141 pairs to train, 83 to evaluate). It is
+there to see the library work; for your concept, write its texts (`concept_probe.guide("datasets")`).
+
+`ConceptProbe.from_texts` is three steps in a row, which you can also take yourself (to read
+another way, add eval sets, or look at what each step gives):
+
+```python
+from concept_probe import EvalSet
+
+model, tok = bundle.model, bundle.tokenizer
+pos, neg = read_texts(model, tok, data.train_pos), read_texts(model, tok, data.train_neg)  # (texts, layers, dim)
+eval_set = EvalSet("eval", read_texts(model, tok, data.eval_pos), read_texts(model, tok, data.eval_neg), paired=True)
+probe = ConceptProbe.fit(pos, neg, eval_sets=eval_set, name="valence", model=bundle)
+```
+
+Everything is saved by default, in `concept_probe_outputs/` under the folder you run from: the
+probe with its plots, the steering evaluation, and a cache of what was read.
+`concept_probe.configure(save=False)` turns that off for the session, and `output_root=` puts it
+elsewhere.
+
 The layer is chosen on half of the eval items and the numbers are measured on the other half. The
-probe saves itself (`probe.run_dir`) with its plots; `examples/quickstart.py` runs this end to end,
+probe saves itself (`probe.out_dir`) with its plots; `examples/quickstart.py` runs this end to end,
 and `examples/system_prompts.py` trains on what the model writes under a system prompt per pole.
 
 **Before you trust a probe**, read the `workflow` guide (`print(concept_probe.guide("workflow"))`):
@@ -97,12 +115,12 @@ from it: a probe refuses another model unless `allow_model_mismatch=True`.
 preview_input(tok, "The storm passed.")                         # BOS + the text, and the span read
 preview_input(tok, "The storm passed.", role="user", system="You are helpful.")
 preview_input(tok, "Sure, here it is.", role="assistant", prompt="Write a story.")
-preview_input(tok, "Write a story.", generation=True)          # a prompt to generate from
+preview_input(tok, "Write a story.", add_generation_prompt=True)          # a prompt to generate from
 ```
 
 A text is read **alone** by default (`role="raw"`: the BOS and the text, no template): the probe
 learns the text, not a chat around it. `role="user"` reads it as a user turn, `role="assistant"` as
-the model's reply after `prompt` (one, or one per text) and `system`. With `generation=True`, a text
+the model's reply after `prompt` (one, or one per text) and `system`. With `add_generation_prompt=True`, a text
 is a prompt to generate from, exactly as `generate` and `answer_logprobs` feed it. Whatever a role
 would leave out (a system prompt with `role="raw"`, a template the tokenizer lacks) is warned about.
 
@@ -115,16 +133,16 @@ read_texts(model, tok, texts, "text_last")                          # the text's
 read_texts(model, tok, texts, ["text_mean", "text_last"])           # {name: reps}, from one pass
 read_texts(model, tok, texts, Readout(substring="river"))           # the tokens of a word
 read_texts(model, tok, texts, "text_tokens")                        # every token is a row (reps.items)
-read_texts(model, tok, prompts, Readout("input", "last"), generation=True)  # the token that predicts the reply
-read_texts(model, tok, texts, layers=["embeddings", 0, -1], norms=True)
+read_texts(model, tok, prompts, Readout("input", "last"), add_generation_prompt=True)  # the token that predicts the reply
+read_texts(model, tok, texts, layers=["embeddings", 0, -1])
 read_encoded(model, tok, generations.encodings())                    # completions, as generated
 ```
 
 A `Readout` takes the text's own tokens (`span="text"`), the input up to the end of the text
-(`"sequence"`: template tokens too) or the whole input (`"input"`), narrows them to the last
+(`"through_text"`: from the start of the input through the text, template tokens too) or the whole input (`"input"`), narrows them to the last
 `last_k`, one `position` or a `substring`, and reduces them with `agg` (`"mean"`, `"max"`,
 `"first"`, `"last"`, or `"tokens"`). The names `text_mean`, `text_last`, `text_last_k`,
-`text_first`, `text_max`, `text_tokens` and their `sequence_*` versions are shorthands. A text
+`text_first`, `text_max`, `text_tokens` and their `through_text_*` versions are shorthands. A text
 without the position or substring raises `EmptySpanError` naming it (or is skipped with
 `skip_empty=True`). Activations that are not finite raise at the layers read, naming them.
 
@@ -136,7 +154,7 @@ token ids, span and readout, so the same text is never read twice (`cache=False`
 ## Fitting a probe
 
 ```python
-probe = ConceptProbe.fit(pos, neg, eval=[eval_set, other_set], estimator="mean_diff", model=bundle)
+probe = ConceptProbe.fit(pos, neg, eval_sets=[eval_set, other_set], estimator="mean_diff", model=bundle)
 ```
 
 - **Directions**: one per layer, from `estimator`: `"mean_diff"` (the difference of means),
@@ -144,8 +162,8 @@ probe = ConceptProbe.fit(pos, neg, eval=[eval_set, other_set], estimator="mean_d
   `"mean_diff_drop_outliers"`, `"logistic"`, `"lda"`, a dict with parameters, or your own
   (`register_estimator`). Each points toward the first pole (a turned direction is announced).
   `erase=Eraser.fit(reps, confound_labels)` fits without a confound.
-- **Steering directions** are the raw difference of means by default, whatever reads (decision D1:
-  normalized directions read better and push less); `steer="read"` steers with the reading ones.
+- **Steering directions** are the raw difference of means by default, whatever reads
+  (normalized directions read better and push less); `steer_estimator="read"` steers with the reading ones.
 - **The layer** is chosen on a `selection_split` part of the primary eval set (half, at random, pairs
   kept together; or the indices you give), within `search_layers`, and its numbers come from the
   rest: Cohen's d with a bootstrap interval and its p, AUROC, accuracy at a calibrated threshold, and
@@ -153,13 +171,12 @@ probe = ConceptProbe.fit(pos, neg, eval=[eval_set, other_set], estimator="mean_d
   d for the search over layers; `n_label_shuffles` refits with the labels shuffled. Every other set is
   measured at that layer. Without `eval`, give `layer=`.
 - **Calibrations**: each eval set's scores give the zero and unit of z for items read like it (the
-  primary one with a threshold; `baseline=True` puts the zero at the second group's mean, for a
+  primary one with a threshold; `zero="baseline"` puts the zero at the second group's mean, for a
   concept read against a baseline). `neutral=` texts are placed on it, not used as the zero.
 - The probe belongs to the model the representations came from (`read_texts` records it; else pass
   `model=` or `identity=`). It saves to `<output_root>/<name>/<time>` by default (`probe.json`,
-  `probe.npz`, `plots/`), and `ConceptProbe.load(folder, model, tokenizer)` reads it back, also runs
-  saved by earlier versions. `ConceptProbe.from_directions(directions, layer)` makes one from
-  directions computed elsewhere.
+  `probe.npz`, `plots/`), and `ConceptProbe.load(folder, model, tokenizer)` reads it back.
+  `ConceptProbe.from_directions(directions, layer)` makes one from directions computed elsewhere.
 
 `probe.metrics` has the numbers (layer, d, p, intervals, AUROC, accuracy, nulls, every set, the
 label shuffles, the neutral texts); `probe.evaluation` the full evaluation, with per-layer curves;
@@ -174,7 +191,7 @@ probe.z(reps, unit="poles")               # +1 the positive pole's mean, -1 the 
 probe.z(token_reps, per_text="max")       # each text's tokens summarized: mean, max, min, median, p90, extreme
 probe.classify(reps)                      # the calibrated threshold, and the probability
 probe.accuracy(pos_reps, neg_reps)        # with a bootstrap interval
-probe.calibrate(pos_texts, neg_texts, as_reply_to=prompts)   # a calibration for another reading
+probe.calibrate(pos_texts, neg_texts, role="assistant", prompt=prompts)  # another reading: replies
 ```
 
 **z = 0 is the midpoint between the poles, not "no concept"**: neutral texts can sit far from it
@@ -191,7 +208,8 @@ primary set, every set measured there, with nulls and intervals. Around it:
 
 - `cross_reading(probes, sets)`: each probe on each other's sets, with nulls and the cosines between
   them (two nearly orthogonal probes can still read each other's concept).
-- `compare_scorers(a, b)`: two scorers on the same items, with a paired bootstrap.
+- `compare_scorers(stat, a_pos, a_neg, b_pos, b_neg)`: how much better one scorer does than another on
+  the same items, by `stat` (`auroc`, `cohen_d`...), with a paired bootstrap.
 - `cohen_d(x, y)`, `auroc(pos, neg)`, `accuracy(pos, neg, threshold)`: the same numbers for any two
   groups of scores (a per-text summary of token scores, say).
 - `label_shuffle_control`, `random_directions_null`, `learning_curve(pos, neg, eval_sets, sizes)`
@@ -200,19 +218,27 @@ primary set, every set measured there, with nulls and intervals. Around it:
 ## Training on what the model writes
 
 A concept can be easier to ask for than to write: generate each pole's texts under its system prompt
-and fit on them.
+and fit on them. In one call:
+
+```python
+probe = ConceptProbe.from_system_prompts(bundle, pos_system, neg_system, questions, eval_questions,
+                                         eval_texts=(eval_pos_texts, eval_neg_texts))
+```
+
+or step by step:
 
 ```python
 pos_gens = generate(model, tok, questions, system=pos_system)
 neg_gens = generate(model, tok, questions, system=neg_system)
-pos = read_encoded(model, tok, pos_gens.encodings(), norms=True)
-neg = read_encoded(model, tok, neg_gens.encodings(), norms=True)
+pos = read_encoded(model, tok, pos_gens.encodings())
+neg = read_encoded(model, tok, neg_gens.encodings())
 ```
 
 Evaluate on answers to other questions **read without the system prompt they were written under**
-(`gens.encodings(system=None)`; decision D2): read with it, the system prompt itself pushes the score
+(`gens.encodings(system=None)`): read with it, the system prompt itself pushes the score
 toward its pole. In one study the same answers gave d 8.5 read with their system prompt and 4.9
-without. `examples/system_prompts.py` is the whole recipe, with the eval sets paired by question.
+without. `from_system_prompts` evaluates that way, with the sets paired by question, and also reports
+the answers read with their system prompt; `examples/system_prompts.py` runs it.
 Probes trained on written texts read text the model did not write better.
 
 ## Interventions
@@ -235,9 +261,9 @@ with intervene(model, Ablate(probe.directions, layers=range(16))):
 
 Layer `l` is the output of block `l`. Positions count each row's own tokens from 0, without padding;
 negative ones count back from the end of the prompt, and `"prompt"` / `"generated"` select those
-parts. `probe.steering(alpha, unit, layers=..., window=...)` builds the `Add` a probe steers with:
-`unit` is `"raw"`, `"sigma"` (the eval items' SD on the steering direction) or `"resid_norm"` (each
-layer's typical residual norm); each layer steered gets the whole dose unless `distribute=True`.
+parts. `probe.steering(dose, unit, layers=..., window=...)` builds the `Add` a probe steers with:
+`unit` is `"resid_norm"` (each layer's typical residual norm; the default here and in
+`evaluate_steering`), `"sd"` (the eval items' SD on the steering direction) or `"raw"`; each layer steered gets the whole dose unless `distribute=True`.
 `generate`, `answer_logprobs` and `evaluate_steering` take any intervention and say which prompt
 each row of a batch is, so a `Patch` can carry one donor per prompt. Reading under an intervention
 reports the stream after the edit.
@@ -252,7 +278,7 @@ answer_logprobs(model, tok, prompts, ["Positive", "Negative"], intervention=Abla
 
 `generate` works in batches padded on the left (greedy by default; when sampling, settings left
 unset take the model's own and that is announced). `on_token=` gets each step's token and the
-scores of the probes in `watch=`; `keep_logits=` keeps the logits. `answer_logprobs` gives
+scores of the probes in `probes=`; `keep_logits=` keeps the logits. `answer_logprobs` gives
 log P(answer | prompt) for given answers, with or without an intervention (write each answer as the
 model would start it; `answer_tokens` shows the tokens).
 
@@ -267,7 +293,7 @@ ev.relate("valence", "positivity")      # does the probe's score predict the out
 ```
 
 - **Doses** are in residual-stream norms of each layer by default (a probe without those norms gets
-  them measured on the prompts, and that is said), or `unit="raw"` / `"sigma"`; an `Add` (given at
+  them measured on the prompts, and that is said), or `unit="sd"` / `"raw"`; an `Add` (given at
   dose 1) or a function `dose -> Add` also steer. Dose 0 is the baseline, added when missing.
 - **Random controls**: at each dose, `n_random` (10) random directions of the same length, each the
   same at every dose; every measure reports the steering's mean change next to the 95th percentile
@@ -279,7 +305,7 @@ ev.relate("valence", "positivity")      # does the probe's score predict the out
 - **Coherence**: perplexity under the model without the intervention, repetition and length.
   `CoherenceRule` (perplexity within half and twice that of dose 0, repetition up by at most 0.2) is
   a heuristic that flags doses and gives the largest coherent one; it filters nothing, and
-  `coherence=` takes your own rule.
+  `coherence_rule=` takes your own rule.
 
 It saves the completions, `steering.json` and `dose_response.png`; `SteeringEvaluation.load`
 reads them back.
@@ -295,7 +321,7 @@ positivity = Rubric("positivity", "How positive is the feeling this text express
 judge = APIJudge("anthropic", model="<a model id>")      # or "openai", "gemini", "openrouter", "groq", "ollama"
 judge = LocalJudge(judge_model, judge_tokenizer)         # a model loaded here: answer probabilities
 judge = AgentJudge("tasks")                              # an agent or a person, through files
-judge.score(texts, positivity), judge.measure(COHERENCE)
+judge.score(texts, positivity), judge.as_measure(COHERENCE)
 ```
 
 Behind an API, several texts go per request at temperature 0; the key comes from `api_key`, a file
@@ -311,7 +337,7 @@ and near duplicates, measures variety, and trains classifiers that see only word
 only your checks; nothing about a particular concept is checked unless you pass it
 (`checks={"negation": count_matches(r"\b(not|no|never)\b|n't\b")}`). `surface_baseline` is the
 number a probe has to beat. **Critiquing**: `critique_task(pos, neg, folder)` writes a task for an
-agent (`read_critique` reads it), `critique_dataset(pos, neg, judge)` asks a judge. The `datasets`
+agent (`load_critique` reads it), `critique_dataset(pos, neg, judge)` asks a judge. The `datasets`
 guide says how to write the texts.
 
 **Confounds**: `confound_check(directions, layer, {"negation": (with, without)})`, and to fit
@@ -332,15 +358,15 @@ activations along the shape (`steering`) or between classes (`toward`).
 ```python
 for model_id in ["meta-llama/Llama-3.2-3B-Instruct", "Qwen/Qwen2.5-3B-Instruct"]:
     bundle = ModelBundle.load(model_id)
-    read = lambda texts: read_texts(bundle.model, bundle.tokenizer, texts)
-    probe = ConceptProbe.fit(read(train_pos), read(train_neg), eval=EvalSet("eval", read(test_pos), read(test_neg)))
+    probe = ConceptProbe.from_texts(bundle, train_pos, train_neg, test_pos, test_neg)
     results[model_id] = (probe.layer / (probe.num_layers - 1), probe.metrics["d"], probe.metrics["null_d95"])
     del bundle
 ```
 
 ## Saving, choices and the session
 
-Every function that produces a result saves it by default, and every automatic choice (dtype, cache,
+Every function that produces a result saves it by default (in `concept_probe_outputs/`, unless you
+give a folder), and every automatic choice (dtype, cache,
 steering direction, controls, sampling settings, ...) is printed once per session and kept with the
 result. `concept_probe.configure(save=False, console=False, output_root="...")` changes that for the
 session.
@@ -350,7 +376,6 @@ session.
 ```text
 concept_probe/          the library
 concept_probe/guides/   guides for people and agents (concept_probe.guide())
-docs/DESIGN.md          the design, its decisions and its stages
 examples/               quickstart.py, system_prompts.py and example concepts
 AGENTS.md               where agents start
 CHANGELOG.md            what changed

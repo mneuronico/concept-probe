@@ -1,4 +1,4 @@
-"""Evaluating how a probe reads (layer 6b of docs/DESIGN.md).
+"""Evaluating how a probe reads.
 
 :func:`evaluate_reading` takes a probe's directions and named sets of evaluation items (each the
 representations of its positive and negative items, with how they were read and whether they come
@@ -16,9 +16,9 @@ import numpy as np
 
 from .directions import fit_directions
 from .inputs import ReadContext
-from .linear_probe import fit_threshold
+from .calibration import fit_threshold
 from .stats import (
-    SWEEP_SELECTS,
+    LAYER_SELECTIONS,
     _bootstrap_d_ci,
     _cohen_d_columns,
     _max_d_permutation_p,
@@ -79,9 +79,9 @@ class SetResult:
     n_neg: int
     pos_scores: np.ndarray
     neg_scores: np.ndarray
-    d_curve: np.ndarray
-    p_curve: np.ndarray
-    null_d95_curve: np.ndarray
+    d_by_layer: np.ndarray
+    p_by_layer: np.ndarray
+    null_d95_by_layer: np.ndarray
     measured_on: str
     d: Optional[float] = None
     p: Optional[float] = None
@@ -92,7 +92,7 @@ class SetResult:
     accuracy: Optional[float] = None
     accuracy_ci95: Optional[List[float]] = None
 
-    def to_metrics(self) -> Dict[str, Any]:
+    def to_dict(self) -> Dict[str, Any]:
         return {"description": self.description, "context": self.context, "paired": self.paired,
                 "n_pos": self.n_pos, "n_neg": self.n_neg, "measured_on": self.measured_on,
                 "d": self.d, "p": self.p, "d_ci95": self.d_ci95, "auroc": self.auroc, "auroc_ci95": self.auroc_ci95,
@@ -109,14 +109,14 @@ class ReadingEvaluation:
     primary: str
     selection: str
     sets: Dict[str, SetResult]
-    selection_d_curve: Optional[np.ndarray] = None
-    report_d_curve: Optional[np.ndarray] = None
-    report_null_d95_curve: Optional[np.ndarray] = None
+    selection_d_by_layer: Optional[np.ndarray] = None
+    held_out_d_by_layer: Optional[np.ndarray] = None
+    held_out_null_d95_by_layer: Optional[np.ndarray] = None
     selection_idx: Tuple[np.ndarray, np.ndarray] = (np.zeros(0, int), np.zeros(0, int))
     report_idx: Tuple[np.ndarray, np.ndarray] = (np.zeros(0, int), np.zeros(0, int))
     d_selection: Optional[float] = None
-    sweep_max_d: Optional[float] = None
-    sweep_max_d_perm_p: Optional[float] = None
+    max_d: Optional[float] = None
+    max_d_permutation_p: Optional[float] = None
     n_permutations: Optional[int] = None
     search_layers: Optional[List[int]] = None
     threshold: Optional[Dict[str, Any]] = None
@@ -127,7 +127,7 @@ class ReadingEvaluation:
     def main(self) -> SetResult:
         return self.sets[self.primary]
 
-    def to_metrics(self) -> Dict[str, Any]:
+    def to_dict(self) -> Dict[str, Any]:
         notes = {
             "split": "the layer was chosen on the selection part of the primary set's items; its numbers are "
                      "measured on the held-out rest (split by pair when the items are paired).",
@@ -135,10 +135,10 @@ class ReadingEvaluation:
             "fixed_layer": "the layer was fixed in advance; the numbers use all of the primary set's items.",
         }
         return {"primary": self.primary, "selection": self.selection, "selection_note": notes[self.selection],
-                "layer": self.layer, "d_selection": self.d_selection, "sweep_max_d": self.sweep_max_d,
-                "sweep_max_d_perm_p": self.sweep_max_d_perm_p, "n_permutations": self.n_permutations,
-                "n_random_directions": self.n_random, "threshold": self.threshold,
-                "sets": {name: r.to_metrics() for name, r in self.sets.items()}}
+                "layer": self.layer, "d_selection": self.d_selection, "max_d": self.max_d,
+                "max_d_permutation_p": self.max_d_permutation_p, "n_permutations": self.n_permutations,
+                "n_random": self.n_random, "threshold": self.threshold,
+                "sets": {name: r.to_dict() for name, r in self.sets.items()}}
 
 
 def _given_split(selection: Any, n_pos: int, n_neg: int, paired: bool
@@ -163,13 +163,13 @@ def _project(reps: np.ndarray, directions: np.ndarray) -> np.ndarray:
 
 def evaluate_reading(
     directions: np.ndarray,
-    sets: Sequence[EvalSet],
+    eval_sets: Sequence[EvalSet],
     *,
     primary: Optional[str] = None,
     layer: Optional[int] = None,
     selection_split: Any = 0.5,
     search_layers: Optional[Sequence[int]] = None,
-    sweep_select: str = "effect_size",
+    select_layer_by: str = "effect_size",
     n_random: int = 50,
     n_bootstrap: int = 1000,
     n_permutations: int = 1000,
@@ -180,21 +180,21 @@ def evaluate_reading(
     there. See the module docstring.
 
     With ``layer`` given, it is used as is. Otherwise the layer with the largest d (or smallest p
-    among layers with d > 0, ``sweep_select="p_value"``) within ``search_layers`` is chosen on a
+    among layers with d > 0, ``select_layer_by="p_value"``) within ``search_layers`` is chosen on a
     ``selection_split`` part of the primary items, and its numbers come from the rest; a
     permutation p for the largest d corrects for having searched over the layers.
     ``selection_split`` is a fraction (drawn at random, pairs kept together), or the items that
     choose the layer: a list of indices (the same for both poles; for paired sets, the pairs), or a
     pair of lists ``(pos indices, neg indices)``. ``None`` chooses and measures on every item.
     """
-    if not sets:
+    if not eval_sets:
         raise ValueError("evaluate_reading needs at least one eval set.")
-    if sweep_select not in SWEEP_SELECTS:
-        raise ValueError(f"sweep_select must be one of {SWEEP_SELECTS}; got {sweep_select!r}")
-    by_name = {s.name: s for s in sets}
-    if len(by_name) != len(sets):
+    if select_layer_by not in LAYER_SELECTIONS:
+        raise ValueError(f"select_layer_by must be one of {LAYER_SELECTIONS}; got {select_layer_by!r}")
+    by_name = {s.name: s for s in eval_sets}
+    if len(by_name) != len(eval_sets):
         raise ValueError("eval sets need distinct names.")
-    primary = primary or sets[0].name
+    primary = primary or eval_sets[0].name
     if primary not in by_name:
         raise ValueError(f"no eval set named {primary!r}; the sets are {sorted(by_name)}.")
     main = by_name[primary]
@@ -204,9 +204,9 @@ def evaluate_reading(
 
     P, N = _project(main.pos, directions), _project(main.neg, directions)
     nP, nN = len(P), len(N)
-    sweep_d = _cohen_d_columns(P, N)
+    d_by_layer = _cohen_d_columns(P, N)
     # float64: p-values of well-separated sets underflow to 0 in float32.
-    sweep_p = _welch_p_columns(P, N, paired=main.paired)
+    p_by_layer = _welch_p_columns(P, N, paired=main.paired)
     pos_sel = neg_sel = np.zeros((0,), dtype=np.int64)
     pos_est, neg_est = np.arange(nP), np.arange(nN)
     selection_d = d_selection = perm = max_d = None
@@ -231,10 +231,10 @@ def evaluate_reading(
         if selection == "split":
             selection_d = _cohen_d_columns(P[pos_sel], N[neg_sel])
             best = _select_best_layer(selection_d, _welch_p_columns(P[pos_sel], N[neg_sel], paired=main.paired),
-                                      search, sweep_select)
+                                      search, select_layer_by)
             d_selection = float(selection_d[best])
         else:
-            best = _select_best_layer(sweep_d, sweep_p, search, sweep_select)
+            best = _select_best_layer(d_by_layer, p_by_layer, search, select_layer_by)
             warnings.append(f"the layer was chosen over {len(search)} layers on the same eval items that measure it, "
                             "so its numbers are optimistic; set a selection split for a held-out estimate.")
         if n_permutations and int(n_permutations) > 0:
@@ -255,8 +255,8 @@ def evaluate_reading(
     acc = None if threshold is None else accuracy(ep[:, best], en[:, best], threshold["threshold"])
     results[primary] = SetResult(
         name=primary, description=main.description, context=None if main.context is None else main.context.to_dict(),
-        paired=main.paired, n_pos=nP, n_neg=nN, pos_scores=P, neg_scores=N, d_curve=sweep_d, p_curve=sweep_p,
-        null_d95_curve=report_null if report_null is not None else np.full(num_layers, np.nan),
+        paired=main.paired, n_pos=nP, n_neg=nN, pos_scores=P, neg_scores=N, d_by_layer=d_by_layer, p_by_layer=p_by_layer,
+        null_d95_by_layer=report_null if report_null is not None else np.full(num_layers, np.nan),
         measured_on="the held-out part" if selection == "split" else "all items",
         d=_opt(cohen_d(ep[:, best], en[:, best])), p=_opt(p_best),
         d_ci95=_bootstrap_d_ci(ep[:, best], en[:, best], n_bootstrap, np.random.default_rng([seed, 3]), paired=main.paired),
@@ -271,19 +271,19 @@ def evaluate_reading(
     )
 
     # Every other set, at that layer, on all its items.
-    for k, s in enumerate([s for s in sets if s.name != primary]):
+    for k, s in enumerate([s for s in eval_sets if s.name != primary]):
         TP, TN = _project(s.pos, directions), _project(s.neg, directions)
         if len(TP) == 0 or len(TN) == 0:
             warnings.append(f"the eval set {s.name!r} has no {'positive' if len(TP) == 0 else 'negative'} items, so "
                             "it is left out.")
             continue
         null = random_directions_null(s.pos, s.neg, n_random, seed=seed) if n_random else np.full(num_layers, np.nan)
-        d_curve, p_curve = _cohen_d_columns(TP, TN), _welch_p_columns(TP, TN, paired=s.paired)
+        d_by_layer, p_by_layer = _cohen_d_columns(TP, TN), _welch_p_columns(TP, TN, paired=s.paired)
         results[s.name] = SetResult(
             name=s.name, description=s.description, context=None if s.context is None else s.context.to_dict(),
-            paired=s.paired, n_pos=len(TP), n_neg=len(TN), pos_scores=TP, neg_scores=TN, d_curve=d_curve,
-            p_curve=p_curve, null_d95_curve=null, measured_on="all items",
-            d=_opt(d_curve[best]), p=_opt(p_curve[best]),
+            paired=s.paired, n_pos=len(TP), n_neg=len(TN), pos_scores=TP, neg_scores=TN, d_by_layer=d_by_layer,
+            p_by_layer=p_by_layer, null_d95_by_layer=null, measured_on="all items",
+            d=_opt(d_by_layer[best]), p=_opt(p_by_layer[best]),
             d_ci95=_bootstrap_d_ci(TP[:, best], TN[:, best], n_bootstrap, np.random.default_rng([seed, 4 + 10 * k]),
                                    paired=s.paired),
             auroc=_opt(auroc(TP[:, best], TN[:, best])),
@@ -292,9 +292,9 @@ def evaluate_reading(
             null_d95=_opt(null[best]) if n_random else None,
         )
     return ReadingEvaluation(
-        layer=int(best), primary=primary, selection=selection, sets=results, selection_d_curve=selection_d,
-        report_d_curve=report_d, report_null_d95_curve=report_null, selection_idx=(pos_sel, neg_sel),
-        report_idx=(pos_est, neg_est), d_selection=d_selection, sweep_max_d=_opt(max_d), sweep_max_d_perm_p=_opt(perm),
+        layer=int(best), primary=primary, selection=selection, sets=results, selection_d_by_layer=selection_d,
+        held_out_d_by_layer=report_d, held_out_null_d95_by_layer=report_null, selection_idx=(pos_sel, neg_sel),
+        report_idx=(pos_est, neg_est), d_selection=d_selection, max_d=_opt(max_d), max_d_permutation_p=_opt(perm),
         n_permutations=int(n_permutations) if perm is not None else None, search_layers=search, threshold=threshold,
         n_random=int(n_random), warnings=warnings,
     )
@@ -325,12 +325,12 @@ def label_shuffle_control(
         ds.append(abs(cohen_d(a, b)))
     ds = np.asarray(ds)
     return {"n_shuffles": int(n_shuffles), "layer": int(layer), "abs_d_mean": _opt(float(ds.mean())) if len(ds) else None,
-            "abs_d_p95": _opt(float(np.percentile(ds, 95))) if len(ds) else None, "abs_d": ds.tolist()}
+            "null_abs_d95": _opt(float(np.percentile(ds, 95))) if len(ds) else None, "abs_d": ds.tolist()}
 
 
 def cross_reading(
     probes: Sequence[Any],
-    sets: Mapping[str, Tuple[np.ndarray, np.ndarray]],
+    eval_sets: Mapping[str, Tuple[np.ndarray, np.ndarray]],
     n_random: int = 50,
     seed: int = 0,
 ) -> Dict[str, Any]:
@@ -339,7 +339,7 @@ def cross_reading(
     layer, and the cosine between the probes' directions. Probes are read on each other's training
     or eval sets to see whether one also encodes the other's concept.
 
-    ``probes`` have ``directions``, ``layer`` and ``name``; ``sets`` map a name to the
+    ``probes`` have ``directions``, ``layer`` and ``name``; ``eval_sets`` map a name to the
     representations ``(pos, neg)``, each ``(items, layers, dim)``.
     """
     names = [str(p.name) for p in probes]
@@ -347,7 +347,7 @@ def cross_reading(
     for probe, name in zip(probes, names):
         v = np.asarray(probe.directions)[probe.layer].astype(np.float64)
         row = {}
-        for set_name, (pos, neg) in sets.items():
+        for set_name, (pos, neg) in eval_sets.items():
             pos, neg = np.asarray(pos), np.asarray(neg)
             d = cohen_d(pos[:, probe.layer].astype(np.float64) @ v, neg[:, probe.layer].astype(np.float64) @ v)
             null = random_directions_null(pos[:, [probe.layer]], neg[:, [probe.layer]], n_random, seed=seed)[0]

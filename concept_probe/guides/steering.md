@@ -24,7 +24,7 @@ ev.largest_coherent_dose
   (`CoherenceRule`) or pass your own. Report effects only at coherent doses.
 - **Measures of effect independent of the probe.** The steering probe's own reading of the steered
   text is informative but not independent of the steering. Add at least one measure that is not
-  the probe: a classifier, a judge (`judge.measure(rubric)`), another probe (`probes=`), or whether
+  the probe: a classifier, a judge (`judge.as_measure(rubric)`), another probe (`probes=`), or whether
   an answer is right (`items=` and `exact_match()`). Probes are measured in raw scores and in SDs of
   their own eval items.
 

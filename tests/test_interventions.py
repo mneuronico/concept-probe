@@ -1,4 +1,4 @@
-"""Interventions on the residual stream (layer 4): what each one does to the stream, at which layers
+"""Interventions on the residual stream: what each one does to the stream, at which layers
 and positions, in batches padded on either side, and how reading reports the edited stream."""
 import numpy as np
 import pytest
@@ -22,7 +22,7 @@ def _ids(text):
 
 def _stream(model, texts=TEXTS, batch_size=4):
     """Every token's residual stream at every layer, per text: a list of (tokens, layers, dim)."""
-    reps = read_encoded(model, CharChatTok(), [Encoded(_ids(t)) for t in texts], "sequence_tokens",
+    reps = read_encoded(model, CharChatTok(), [Encoded(_ids(t)) for t in texts], "through_text_tokens",
                         batch_size=batch_size, cache=False)
     return [reps.data[reps.items == i] for i in range(len(texts))]
 
@@ -52,7 +52,7 @@ def test_add_takes_an_array_of_vectors_per_layer_negative_layers_and_alpha_per_l
     np.testing.assert_allclose(steered[:, 0] - clean[:, 0], np.tile(vectors[0], (len(clean), 1)), atol=1e-5)
     edit = Add(vectors, alpha={0: 1.0, -1: 0.5}, layers=[0, -1])
     edit.prepare(4)
-    assert edit.alpha_per_layer == {0: 1.0, 3: 0.5} and edit.describe()["layers"] == [0, 3]
+    assert edit.alpha_per_layer == {0: 1.0, 3: 0.5} and edit.to_dict()["layers"] == [0, 3]
 
 
 def test_alpha_zero_changes_nothing_and_hooks_go_away():

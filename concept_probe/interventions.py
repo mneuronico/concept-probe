@@ -1,4 +1,4 @@
-"""Interventions on the residual stream (layer 4 of docs/DESIGN.md).
+"""Interventions on the residual stream.
 
 An intervention says what to change in the residual stream, at which layers and at which token
 positions, with any vectors:
@@ -193,7 +193,7 @@ def _per_layer_value(value: Any, layers: Sequence[int], what: str) -> Dict[int, 
 # ---------------------------------------------------------------------------------- interventions
 class Intervention:
     """Base class: what to change in the residual stream. Subclasses define :meth:`layer_list`,
-    :meth:`edit` and :meth:`describe`."""
+    :meth:`edit` and :meth:`to_dict`."""
 
     def layer_list(self, n_blocks: int) -> List[int]:
         raise NotImplementedError
@@ -201,7 +201,7 @@ class Intervention:
     def edit(self, layer: int, hidden: torch.Tensor, where: Where) -> torch.Tensor:
         raise NotImplementedError
 
-    def describe(self) -> Dict[str, Any]:
+    def to_dict(self) -> Dict[str, Any]:
         raise NotImplementedError
 
     def prepare(self, n_blocks: int) -> None:
@@ -269,7 +269,7 @@ class Add(Intervention):
             return hidden + offset
         return hidden + offset * mask.to(hidden.device, hidden.dtype)[..., None]
 
-    def describe(self) -> Dict[str, Any]:
+    def to_dict(self) -> Dict[str, Any]:
         if self._by_layer is not None:
             norms = {l: float(v.norm()) for l, (_, v) in self._by_layer.items()}
         else:
@@ -365,7 +365,7 @@ class Ablate(Intervention):
         new = (h + (target - coords) @ U).to(hidden.dtype)
         return _apply_masked(hidden, new, where.mask(self.positions))
 
-    def describe(self) -> Dict[str, Any]:
+    def to_dict(self) -> Dict[str, Any]:
         layers = sorted(int(l) for l, _ in self._entries)
         return {"type": "ablate", "label": self.label, "layers": layers,
                 "n_directions": {int(l): int(np.atleast_2d(d).shape[0]) for l, d in self._entries},
@@ -462,7 +462,7 @@ class Patch(Intervention):
                 out[r] = torch.where(hit[:, None], vals[j], out[r])
         return out
 
-    def describe(self) -> Dict[str, Any]:
+    def to_dict(self) -> Dict[str, Any]:
         out = {"type": "patch", "label": self.label, "layers": [self._layer if self.layer is None else self.layer]}
         if self.per_input is None:
             out["positions"] = list(self.positions)
@@ -516,7 +516,7 @@ class Rotate(Intervention):
         new = h + ((a * c - b * s) - a)[..., None] * E[0] + ((a * s + b * c) - b)[..., None] * E[1]
         return _apply_masked(hidden, new.to(hidden.dtype), where.mask(self.positions))
 
-    def describe(self) -> Dict[str, Any]:
+    def to_dict(self) -> Dict[str, Any]:
         return {"type": "rotate", "label": self.label, "layers": sorted(int(l) for l, _ in self._u),
                 "angle": self.angle, "positions": _describe_positions(self.positions)}
 
@@ -547,7 +547,7 @@ class Edit(Intervention):
     def edit(self, layer: int, hidden: torch.Tensor, where: Where) -> torch.Tensor:
         return self.fn(layer, hidden, where)
 
-    def describe(self) -> Dict[str, Any]:
+    def to_dict(self) -> Dict[str, Any]:
         return {"type": "edit", "label": self.label or getattr(self.fn, "__name__", "function"),
                 "layers": self._layers if self._resolved is None else self._resolved}
 
@@ -583,8 +583,8 @@ class Compose(Intervention):
             hidden = p.edit(layer, hidden, where)
         return hidden
 
-    def describe(self) -> Dict[str, Any]:
-        return {"type": "compose", "parts": [p.describe() for p in self.parts]}
+    def to_dict(self) -> Dict[str, Any]:
+        return {"type": "compose", "parts": [p.to_dict() for p in self.parts]}
 
 
 # ------------------------------------------------------------------------------------ applying them
@@ -740,4 +740,4 @@ def edited_outputs(model: torch.nn.Module) -> _Recording:
 
 def active_interventions(model: torch.nn.Module) -> List[Dict[str, Any]]:
     """What is being applied to ``model`` right now (for the records of a reading)."""
-    return [a.intervention.describe() for a in _ACTIVE.get(model, [])]
+    return [a.intervention.to_dict() for a in _ACTIVE.get(model, [])]

@@ -1,4 +1,4 @@
-"""Datasets and extras (stage 6 of docs/DESIGN.md): erasing confounds, learning curves, confound
+"""Datasets and beyond two poles: erasing confounds, learning curves, confound
 checks, red teaming, several classes, regression, circles, and auditing a dataset."""
 import json
 import os
@@ -43,7 +43,7 @@ def test_erasing_a_confound_leaves_no_trace_of_it_and_reads_raw_reps(method):
     # ...and reading raw reps with the stored direction is reading the erased ones
     on_erased = fit_directions("mean_diff", erased[concept == 1], erased[concept == 0])
     assert np.corrcoef(X[:, 0] @ clean[0], erased[:, 0] @ on_erased[0])[0, 1] == pytest.approx(1.0)
-    assert eraser.describe()["dimensions_erased"] == {0: 1, 1: 1, 2: 1}
+    assert eraser.to_dict()["dimensions_erased"] == {0: 1, 1: 1, 2: 1}
 
 
 def test_leace_leaves_no_linear_classifier_above_chance():
@@ -142,44 +142,44 @@ def _days(n_per, seed, circle=True):
 def test_the_shape_of_a_cycle_is_found_where_it_is_and_only_in_order():
     X, labels = _days(20, 1)
     shape = target_shape(X, Target.cycle(labels, range(7)), n_shuffles=100)
-    assert shape.best_layer == 2 and shape.fit[2] > 0.95 and shape.fit[2] > shape.fit_null_p95[2]
-    assert shape.similarity[2] > shape.similarity_null_p95[2] and shape.fit[0] < shape.fit_null_p95[0]
-    assert shape.coords.shape == (L, 7, 2) and shape.share[2] > 0.75  # the plane keeps most of the spread
+    assert shape.best_layer == 2 and shape.shape_r2[2] > 0.95 and shape.shape_r2[2] > shape.null_shape_r2_95[2]
+    assert shape.rsa_correlation[2] > shape.null_rsa_correlation95[2] and shape.shape_r2[0] < shape.null_shape_r2_95[0]
+    assert shape.coords.shape == (L, 7, 2) and shape.explained_variance_ratio[2] > 0.75  # the plane keeps most of the spread
     # the same clusters out of order: a circle, but not the days' cycle
     Xs, labels_s = _days(20, 1, circle=False)
     scrambled = target_shape(Xs, Target.cycle(labels_s, range(7)), n_shuffles=100)
-    assert scrambled.fit[2] < scrambled.fit_null_p95[2] + 0.05
+    assert scrambled.shape_r2[2] < scrambled.null_shape_r2_95[2] + 0.05
     # an ellipse fits an affine map but not the shape itself as well
     Xe = X.copy()
     Xe[:, 2, 1] *= 0.3
-    assert target_shape(Xe, Target.cycle(labels, range(7)), fit="affine", n_shuffles=0).fit[2] > \
-        target_shape(Xe, Target.cycle(labels, range(7)), n_shuffles=0).fit[2] + 0.05
+    assert target_shape(Xe, Target.cycle(labels, range(7)), transform="affine", n_shuffles=0).shape_r2[2] > \
+        target_shape(Xe, Target.cycle(labels, range(7)), n_shuffles=0).shape_r2[2] + 0.05
 
 
 def test_reading_a_cycle_does_not_prove_its_shape_but_reading_through_the_shape_does():
     X, labels = _days(20, 1)
     t = Target.cycle(labels, range(7))
-    linear = read_target(X, t, model="linear", n_shuffles=10)
-    assert linear.best_score == 1.0 and linear.null_p95[2] >= 0.9  # any arrangement is readable
-    through = read_target(X, t, model="shape", n_shuffles=10)
-    assert through.score[2] > 0.9 and through.null_p95[2] < 0.7 and through.shuffle == "classes"
+    linear = read_target(X, t, decoder="linear", n_shuffles=10)
+    assert linear.best_score == 1.0 and linear.null_score95_by_layer[2] >= 0.9  # any arrangement is readable
+    through = read_target(X, t, decoder="shape", n_shuffles=10)
+    assert through.score_by_layer[2] > 0.9 and through.null_score95_by_layer[2] < 0.7 and through.shuffle == "classes"
     with pytest.raises(ValueError, match="layout"):
         target_shape(X, Target.categories(labels))
 
 
 def test_categories_numbers_and_orders_are_read_with_their_controls():
     X, labels = _days(20, 1)
-    cats = read_target(X, Target.categories(labels), model="centroid", n_shuffles=10)
-    assert cats.best_layer == 2 and cats.best_score > 0.9 and cats.null_p95[2] < 0.4
+    cats = read_target(X, Target.categories(labels), decoder="centroid", n_shuffles=10)
+    assert cats.best_layer == 2 and cats.best_score > 0.9 and cats.null_score95_by_layer[2] < 0.4
     assert cats.chance == pytest.approx(1 / 7) and cats.shuffle == "items"
     rng = np.random.default_rng(3)
     Z = rng.normal(size=(200, L, D))
     y = 2.0 * Z[:, 1, 3] + rng.normal(size=200) * 0.1
     num = read_target(Z, Target.number(y), alpha=0.1, n_shuffles=10)
-    assert num.best_layer == 1 and num.best_score > 0.9 and num.rank_correlation[1] > 0.9 and num.null_p95[1] < 0.2
+    assert num.best_layer == 1 and num.best_score > 0.9 and num.rank_correlation[1] > 0.9 and num.null_score95_by_layer[1] < 0.2
     assert num.predict(Z[:3]).shape == (3, 1)
     ordered = Target.order(labels, range(7))
-    assert ordered.places.shape == (7, 1) and ordered.structured and not Target.categories(labels).structured
+    assert ordered.places.shape == (7, 1) and ordered._structured and not Target.categories(labels)._structured
     tree = Target.layout(["a", "b", "c", "a"], {"a": [0, 0], "b": [1, 0], "c": [0, 1]})
     assert tree.kind == "layout" and tree.values.tolist() == [[0, 0], [1, 0], [0, 1], [0, 0]]
 
@@ -189,8 +189,8 @@ def test_any_model_with_fit_and_predict_can_read():
     from sklearn.neighbors import KNeighborsRegressor
 
     X, labels = _days(20, 1)
-    knn = read_target(X, Target.cycle(labels, range(7)), model=KNeighborsRegressor(3), layers=[2], n_shuffles=5)
-    assert knn.model == "KNeighborsRegressor" and knn.score[2] > 0.9 and np.isnan(knn.score[0])
+    knn = read_target(X, Target.cycle(labels, range(7)), decoder=KNeighborsRegressor(3), layers=[2], n_shuffles=5)
+    assert knn.decoder == "KNeighborsRegressor" and knn.score_by_layer[2] > 0.9 and np.isnan(knn.score_by_layer[0])
 
 
 # -------------------------------------------------------------------------------------- datasets
@@ -274,13 +274,13 @@ def test_a_target_probe_scores_new_activations_and_moves_them_around_the_cycle()
     X, labels = _days(20, 1)
     new, new_labels = _days(10, 2)
     probe = TargetProbe.fit(X, Target.cycle(labels, range(7)), save=False)
-    assert probe.layer == 2 and probe.reading["score"] > 0.9 and probe.shape["fit"] > probe.shape["fit_null_p95"]
-    s = probe.score(new)
+    assert probe.layer == 2 and probe.reading["score"] > 0.9 and probe.shape["shape_r2"] > probe.shape["null_shape_r2_95"]
+    s = probe.scores(new)
     assert np.mean(np.array(s.nearest) == new_labels) > 0.9
     on_own_day = (s.position - new_labels + 3.5) % 7 - 3.5
-    assert np.abs(on_own_day).mean() < 0.3 and abs(s.fit.mean() - 1.0) < 0.3
+    assert np.abs(on_own_day).mean() < 0.3 and abs(s.radius.mean() - 1.0) < 0.3
     for steps in (1, -2):
-        moved = probe.score(_apply(probe.steering(steps), new[:, 2, :], 2))
+        moved = probe.scores(_apply(probe.steering(steps), new[:, 2, :], 2))
         delta = (moved.position - s.position + 3.5) % 7 - 3.5
         assert delta.mean() == pytest.approx(steps, abs=0.1)
     toward = probe.toward(source=3, steps=2)  # from class 3, two steps on
@@ -288,11 +288,11 @@ def test_a_target_probe_scores_new_activations_and_moves_them_around_the_cycle()
     with pytest.raises(ValueError, match="either"):
         probe.toward(2, source=3, steps=1)
     step = _apply(toward, new[new_labels == 3][:, 2, :], 2)
-    assert np.array(probe.score(step).nearest).tolist().count(5) >= 9
+    assert np.array(probe.scores(step).nearest).tolist().count(5) >= 9
     np.testing.assert_allclose(step - new[new_labels == 3][:, 2, :],
                                np.tile(probe.centroids[5, 2] - probe.centroids[3, 2], (10, 1)), atol=1e-5)
     rotated_elsewhere = probe.steering(1, layer=1)
-    assert rotated_elsewhere.describe()["layers"] == [1]
+    assert rotated_elsewhere.to_dict()["layers"] == [1]
 
 
 def test_a_target_probe_for_numbers_and_categories(tmp_path):
@@ -303,16 +303,16 @@ def test_a_target_probe_for_numbers_and_categories(tmp_path):
     y = 2.0 * Z[:, 1, 3] + rng.normal(size=200) * 0.1
     num = TargetProbe.fit(Z, Target.number(y), alpha=0.1, save=False)
     assert num.layer == 1 and num.reading["metric"] == "R2" and num.reading["score"] > 0.9
-    before = num.score(Z[:5]).position
-    after = num.score(_apply(num.steering(1.5), Z[:5, 1, :], 1)).position
+    before = num.scores(Z[:5]).position
+    after = num.scores(_apply(num.steering(1.5), Z[:5, 1, :], 1)).position
     np.testing.assert_allclose(after - before, 1.5, atol=1e-6)  # moves the predicted value by exactly that
     X, labels = _days(20, 1)
-    cats = TargetProbe.fit(X, Target.categories([f"c{k}" for k in labels]), save=True, root_dir=str(tmp_path))
-    assert cats.score(X[:3]).nearest == ["c0", "c0", "c0"] and cats.score(X[:3]).class_scores.shape == (3, 7)
+    cats = TargetProbe.fit(X, Target.categories([f"c{k}" for k in labels]), save=True, output_root=str(tmp_path))
+    assert cats.scores(X[:3]).nearest == ["c0", "c0", "c0"] and cats.scores(X[:3]).class_scores.shape == (3, 7)
     with pytest.raises(ValueError, match="toward"):
         cats.steering(1)
-    loaded = TargetProbe.load(cats.dir)
-    assert loaded.score(X[:5]).nearest == cats.score(X[:5]).nearest and loaded.reading == cats.reading
+    loaded = TargetProbe.load(cats.out_dir)
+    assert loaded.scores(X[:5]).nearest == cats.scores(X[:5]).nearest and loaded.reading == cats.reading
     np.testing.assert_allclose(loaded.centroids, cats.centroids)
 
 

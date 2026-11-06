@@ -1,11 +1,13 @@
-"""Directions (layer 2 of docs/DESIGN.md): an estimator takes the representations of two groups at
+"""Directions: an estimator takes the representations of two groups at
 one layer and returns a unit direction in the raw activation space, oriented so that the first
 group projects higher. A new estimator is added by registering it, without touching anything else.
 """
 import importlib
-from typing import Any, Callable, Dict, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
+
+from .record import Choice
 
 
 def normed_np(v: np.ndarray) -> np.ndarray:
@@ -30,7 +32,7 @@ def concept_direction(pos_reps: np.ndarray, neg_reps: np.ndarray, normalization:
     direction. ``"none"`` is computed in the input dtype, as training always did.
 
     In a trained probe this is the :class:`MeanDiff` estimator. It sets the direction to read with;
-    steering uses the raw difference of means unless asked otherwise (``ConceptProbe.fit(steer=...)``),
+    steering uses the raw difference of means unless asked otherwise (``ConceptProbe.fit(steer_estimator=...)``),
     since ``"var"`` tends to read better and steer less (see the README).
     """
     if normalization not in DIRECTION_NORMALIZATIONS:
@@ -200,7 +202,7 @@ def fit_directions(
     oriented so the first group's mean projects higher than the second's. With ``erase`` (an
     :class:`Eraser`), the estimator is fitted on the reps with the confound erased, and each
     direction is turned into the one that reads the same thing from raw reps
-    (:meth:`Eraser.read_directions`): projections then do not depend on the confound.
+    (:meth:`Eraser.to_raw_directions`): projections then do not depend on the confound.
     """
     est = make_estimator(estimator)
     if hasattr(est, "dropped"):
@@ -220,7 +222,7 @@ def fit_directions(
                 flips.append(int(l))
         out[l] = v
     if erase is not None:
-        out = erase.read_directions(out)
+        out = erase.to_raw_directions(out)
     return out
 
 
@@ -250,7 +252,7 @@ class Eraser:
     - ``"project"``: the orthogonal projection that removes the confound's directions (the
       difference of the groups' means, or of each group's mean from the overall mean).
 
-    :meth:`apply` erases reps; :meth:`read_directions` turns a direction fitted on erased reps into
+    :meth:`apply` erases reps; :meth:`to_raw_directions` turns a direction fitted on erased reps into
     the direction that gives the same projections (up to a constant) on raw reps, which is what a
     probe stores. Both work in the space the fitting reps span: what lies outside it is left alone.
     """
@@ -302,7 +304,7 @@ class Eraser:
             out[:, l, :] -= ((out[:, l, :] - e["mu"]) @ e["right"]) @ e["left"].T
         return out.astype(np.asarray(reps).dtype, copy=False)
 
-    def read_directions(self, directions: np.ndarray) -> np.ndarray:
+    def to_raw_directions(self, directions: np.ndarray) -> np.ndarray:
         """Directions fitted on erased reps, as directions on raw reps: ``v - right @ left.T @ v``
         (normalized), so that ``raw @ result`` equals ``erased @ v`` up to a constant and a scale."""
         out = np.array(directions, dtype=np.float64, copy=True)
@@ -313,6 +315,30 @@ class Eraser:
             out[l] = v / (np.linalg.norm(v) + 1e-12)
         return out.astype(np.float32)
 
-    def describe(self) -> Dict[str, Any]:
+    def to_dict(self) -> Dict[str, Any]:
         return {"method": self.method, "layers": self.layers, "n_items": self.n_items,
                 "dimensions_erased": {l: int(e["left"].shape[1]) for l, e in self._layers.items()}}
+
+
+# ---------------------------------------------------------------------------- steering direction
+def steer_directions_for(estimator: Any, steer: Any, pos: np.ndarray, neg: np.ndarray,
+                         to_raw_directions: np.ndarray, erase: Any = None) -> Tuple[np.ndarray, Dict[str, Any], Optional[Choice]]:
+    """The directions to steer with, their estimator's settings, and the choice to
+    announce when they differ from the reading directions.
+
+    ``steer`` is ``"read"`` (the reading directions, returned as the same array), or an estimator
+    spec (default ``"mean_diff"``: the raw difference of means, which pushes further than
+    variance-normalized directions do).
+    """
+    read_spec = estimator_spec(estimator)
+    if steer in (None, "read"):
+        return to_raw_directions, read_spec, None
+    steer_spec = estimator_spec(steer)
+    if steer_spec == read_spec:
+        return to_raw_directions, steer_spec, None
+    vectors = fit_directions(make_estimator(steer), pos, neg, erase=erase)
+    return vectors, steer_spec, Choice(
+        "steering direction", steer if isinstance(steer, (str, dict)) else steer_spec, steer_spec,
+        f"steering uses its own direction, not the reading one ({read_spec}): the raw difference of means "
+        "pushes further than normalized directions; pass steer_estimator='read' to steer with the reading direction",
+    )

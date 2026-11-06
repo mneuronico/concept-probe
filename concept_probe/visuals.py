@@ -304,8 +304,8 @@ NEG_COLOR = "#dd8452"    # the negative pole's items
 
 
 def plot_sweep(
-    sweep_d: Iterable[float],
-    sweep_p: Iterable[float],
+    d_by_layer: Iterable[float],
+    p_by_layer: Iterable[float],
     out_path: str,
     *,
     best_layer: Optional[int] = None,
@@ -320,7 +320,7 @@ def plot_sweep(
 
     With ``report_d`` (the d on the held-out items, which the reported number comes from) the top
     panel draws that curve, with the reported ``best_d`` marked on it, and ``selection_d`` (the
-    items that chose the layer) dashed; otherwise it draws ``sweep_d``, all eval items. ``null_d95``
+    items that chose the layer) dashed; otherwise it draws ``d_by_layer``, all eval items. ``null_d95``
     (the 95th percentile of |d| over random directions on the same items) is the gray band: a d
     inside it is what any direction would give. The bottom panel has the p-values on all items.
     """
@@ -329,8 +329,8 @@ def plot_sweep(
     except Exception:
         return False
 
-    d = np.array(list(sweep_d), dtype=np.float64)
-    p = np.array(list(sweep_p), dtype=np.float64)
+    d = np.array(list(d_by_layer), dtype=np.float64)
+    p = np.array(list(p_by_layer), dtype=np.float64)
     layers = np.arange(len(d))
 
     fig, ax = plt.subplots(2, 1, figsize=(8, 6), sharex=True, gridspec_kw={"height_ratios": [2, 1]})
@@ -499,8 +499,8 @@ def plot_shape(shape: Any, out_path: str, layer: Optional[int] = None, *, title:
     ax.set_ylabel("second direction" if C.shape[1] > 1 else "")
     if C.shape[1] > 1:
         ax.set_aspect("equal", adjustable="datalim")
-    ax.set_title(title or f"Class centroids at layer {layer}: fit {shape.fit[layer]:.2f} "
-                          f"(shuffled orders, p95 {shape.fit_null_p95[layer]:.2f})", fontsize=9)
+    ax.set_title(title or f"Class centroids at layer {layer}: shape R² {shape.shape_r2[layer]:.2f} "
+                          f"(shuffled orders, p95 {shape.null_shape_r2_95[layer]:.2f})", fontsize=9)
     fig.tight_layout()
     fig.savefig(out_path, dpi=160)
     plt.close(fig)

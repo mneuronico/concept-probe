@@ -1,5 +1,5 @@
-"""Generating in batches, reading while generating, answer probabilities and the files of scores
-(layer 5), on the tiny deterministic model."""
+"""Generating in batches, reading while generating, answer probabilities and the files of scores,
+on the tiny deterministic model."""
 import json
 import os
 
@@ -55,7 +55,7 @@ def test_steering_changes_the_completions_and_is_recorded():
 
 def test_generations_are_saved_when_asked(tmp_path):
     gens = generate(TinyCausalLM(), CharChatTok(), PROMPTS[:2], max_new_tokens=4, save=True, out_dir=str(tmp_path))
-    assert gens.dir == str(tmp_path)
+    assert gens.out_dir == str(tmp_path)
     lines = [json.loads(l) for l in open(tmp_path / "generations.jsonl", encoding="utf-8")]
     assert lines[0]["settings"]["greedy"] is True and [l["text"] for l in lines[1:]] == [g.text for g in gens]
     data = np.load(tmp_path / "generations.npz")
@@ -72,7 +72,7 @@ def test_on_token_gets_the_score_of_each_token_as_it_is_read():
     model, tok, scorer = TinyCausalLM(), CharChatTok(), _scorer()
     steps = []
     gens = generate(model, tok, PROMPTS, max_new_tokens=6, save=False, batch_size=5, on_token=steps.append,
-                    watch=[scorer])
+                    probes=[scorer])
     reread = _project_tokens(model, tok, [torch.as_tensor(g.token_ids) for g in gens], [scorer])
     assert steps[0].step == 0 and steps[0].prompts == list(range(5))
     for row, g in enumerate(gens):
@@ -92,7 +92,7 @@ def test_reading_while_steering_includes_the_added_vector():
     steer = Add({2: scorer.vectors[0]}, 2.0)
     steps = []
     gens = generate(model, tok, PROMPTS[:1], max_new_tokens=3, save=False, intervention=steer, on_token=steps.append,
-                    watch=[scorer])
+                    probes=[scorer])
     clean = _project_tokens(model, tok, [torch.as_tensor(gens[0].token_ids)], [scorer])[0]["c"][:, 0]
     with intervene(model, steer):
         steered = _project_tokens(model, tok, [torch.as_tensor(gens[0].token_ids)], [scorer])[0]["c"][:, 0]

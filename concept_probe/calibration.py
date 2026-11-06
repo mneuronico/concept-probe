@@ -1,19 +1,16 @@
-"""What turns a probe's projections into numbers someone can read (layer 3 of docs/DESIGN.md).
+"""What turns a probe's projections into numbers someone can read 
 
 A :class:`Calibration` holds the zero and unit of z scores, measured on items read in a given way
 (a :class:`~concept_probe.inputs.ReadContext`), and optionally where texts without the concept
 fall and a calibrated threshold to classify with. Every z score of the library is computed here.
 :class:`~concept_probe.probe.ConceptProbe` holds a list of them, one per reading context.
 """
-import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .directions import estimator_spec, fit_directions, make_estimator
 from .inputs import ReadContext
-from .record import Choice
 from .stats import _pooled_sd_columns
 
 
@@ -94,7 +91,7 @@ class Calibration:
     neg_mean: Optional[np.ndarray] = None
 
     @classmethod
-    def from_scores(
+    def _from_scores(
         cls,
         pos: np.ndarray,
         neg: np.ndarray,
@@ -121,7 +118,7 @@ class Calibration:
                    token_scale=token_scale, zero=zero, n_pos=int(P.shape[0]), n_neg=int(N.shape[0]), source=source,
                    pos_mean=P.mean(axis=0), neg_mean=N.mean(axis=0))
 
-    def usable(self, layers: Sequence[int], tokens: bool = False) -> bool:
+    def _usable(self, layers: Sequence[int], tokens: bool = False) -> bool:
         """Whether the references at ``layers`` exist and are finite, with a positive unit."""
         c, u = (self.token_center, self.token_scale) if tokens else (self.center, self.scale)
         if c is None or u is None:
@@ -129,7 +126,7 @@ class Calibration:
         c, u = np.asarray(c)[list(layers)], np.asarray(u)[list(layers)]
         return bool(np.all(np.isfinite(c)) and np.all(np.isfinite(u)) and np.all(u > 0))
 
-    def items_z(self, scores: np.ndarray, layers: Sequence[int], aggregate: str = "mean",
+    def _items_z(self, scores: np.ndarray, layers: Sequence[int], aggregate: str = "mean",
                 unit: str = "sd") -> Optional[np.ndarray]:
         """Item z scores from item scores ``(items, len(layers))`` at ``layers`` (an item's score is
         its mean projection over its tokens): standardized per layer, then aggregated over the
@@ -137,7 +134,7 @@ class Calibration:
         by the distance from the zero to the positive pole's mean (+1 is that mean). None when the
         references at those layers are unusable."""
         layers = list(layers)
-        if not self.usable(layers):
+        if not self._usable(layers):
             return None
         if unit == "poles":
             if self.pos_mean is None:
@@ -150,23 +147,23 @@ class Calibration:
         z = (np.asarray(scores, dtype=np.float64) - self.center[layers]) / unit_size
         return z.mean(axis=1) if aggregate == "mean" else z.sum(axis=1)
 
-    def tokens_z(self, scores: np.ndarray, layers: Sequence[int], aggregate: str = "mean"
+    def _tokens_z(self, scores: np.ndarray, layers: Sequence[int], aggregate: str = "mean"
                  ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         """Single-token z scores from token scores ``(tokens, len(layers))``: per layer, and
         aggregated over the layers. None when this calibration has no usable token references."""
         layers = list(layers)
-        if not self.usable(layers, tokens=True):
+        if not self._usable(layers, tokens=True):
             return None
         z = ((np.asarray(scores, dtype=np.float64) - self.token_center[layers]) / self.token_scale[layers])
         agg = z.mean(axis=1) if aggregate == "mean" else z.sum(axis=1)
         return z.astype(np.float32), agg.astype(np.float32)
 
-    def add_neutral(self, scores: np.ndarray) -> None:
+    def _add_neutral(self, scores: np.ndarray) -> None:
         """Record where texts without the concept fall: their mean item score per layer."""
         s = np.asarray(scores, dtype=np.float64)
         self.neutral, self.n_neutral = s.mean(axis=0), int(s.shape[0])
 
-    def add_threshold(self, pos: np.ndarray, neg: np.ndarray, layer: int, fit_on: str,
+    def _add_threshold(self, pos: np.ndarray, neg: np.ndarray, layer: int, fit_on: str,
                       l2: float = 1e-2) -> Dict[str, Any]:
         """Fit :func:`fit_threshold` on item scores at ``layer`` and keep it."""
         self.threshold = dict(fit_threshold(pos, neg, l2=l2), layer=int(layer), fit_on=fit_on, l2=float(l2))
@@ -189,47 +186,3 @@ class Calibration:
                    zero=d.get("zero", "midpoint"), neutral=_arr(d.get("neutral")), n_neutral=int(d.get("n_neutral", 0)),
                    threshold=d.get("threshold"), n_pos=int(d.get("n_pos", 0)), n_neg=int(d.get("n_neg", 0)),
                    source=d.get("source", ""), pos_mean=_arr(d.get("pos_mean")), neg_mean=_arr(d.get("neg_mean")))
-
-
-def calibrations_from_tensors(tensors: Dict[str, Any]) -> List[Calibration]:
-    """The calibrations a run's ``tensors.npz`` holds: the full list when it was saved, otherwise the
-    evaluation's and the transfer check's references (runs saved before calibrations had their own
-    record)."""
-    if "calibrations" in tensors:
-        return [Calibration.from_dict(c) for c in json.loads(str(np.asarray(tensors["calibrations"])[0]))]
-    out = []
-    ref = json.loads(str(np.asarray(tensors["reference_context"])[0])) if "reference_context" in tensors else None
-    if ref:
-        out.append(Calibration(context=ReadContext.from_dict(ref), center=_arr(tensors["score_center"]),
-                               scale=_arr(tensors["score_scale"]), token_center=_arr(tensors.get("token_center")),
-                               token_scale=_arr(tensors.get("token_scale")), source="evaluation"))
-    transfer = json.loads(str(np.asarray(tensors["transfer_references"])[0])) if "transfer_references" in tensors else None
-    if transfer:
-        out.append(Calibration(context=ReadContext.from_dict(transfer["context"]), center=_arr(transfer["score_center"]),
-                               scale=_arr(transfer["score_scale"]), token_center=_arr(transfer.get("token_center")),
-                               token_scale=_arr(transfer.get("token_scale")), source="transfer check"))
-    return out
-
-
-# --------------------------------------------------------------------------------- steering (D1)
-def steer_directions_for(estimator: Any, steer: Any, pos: np.ndarray, neg: np.ndarray,
-                         read_directions: np.ndarray, erase: Any = None) -> Tuple[np.ndarray, Dict[str, Any], Optional[Choice]]:
-    """The directions to steer with (decision D1), their estimator's settings, and the choice to
-    announce when they differ from the reading directions.
-
-    ``steer`` is ``"read"`` (the reading directions, returned as the same array), or an estimator
-    spec (default ``"mean_diff"``: the raw difference of means, which pushes further than
-    variance-normalized directions do).
-    """
-    read_spec = estimator_spec(estimator)
-    if steer in (None, "read"):
-        return read_directions, read_spec, None
-    steer_spec = estimator_spec(steer)
-    if steer_spec == read_spec:
-        return read_directions, steer_spec, None
-    vectors = fit_directions(make_estimator(steer), pos, neg, erase=erase)
-    return vectors, steer_spec, Choice(
-        "steering direction", steer if isinstance(steer, (str, dict)) else steer_spec, steer_spec,
-        f"steering uses its own direction, not the reading one ({read_spec}): the raw difference of means "
-        "pushes further than normalized directions; pass steer='read' to steer with the reading direction",
-    )

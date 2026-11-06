@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from concept_probe import ReadContext, preview_input
-from concept_probe.linear_probe import Calibration
+from concept_probe.calibration import Calibration
 from concept_probe import ConceptProbe, evaluate_steering
 from concept_probe.inputs import _encode_text_for_read, _normalize_messages
 from fakes import CharChatTok, CharModel
@@ -39,7 +39,7 @@ def test_preview_of_a_user_turn_and_of_a_generation_prompt():
     tok = CharChatTok()
     assert preview_input(tok, "ppx", role="user")["input_text"] == "^<u>ppx|"
     assert preview_input(tok, "ppx", role="user", system="S")["input_text"] == "^<s>S|<u>ppx|"
-    gen = preview_input(tok, "ppx", generation=True)
+    gen = preview_input(tok, "ppx", add_generation_prompt=True)
     assert gen["input_text"] == "^<u>ppx|<a>" and gen["span_text"] == "ppx"  # the text, inside the prompt
 
 
@@ -53,7 +53,7 @@ def test_a_template_that_strips_the_text_warns_once():
 # ------------------------------------------------------------- probes on fakes
 def _probe(tmp_path, name="c", vectors=None):
     # CharModel's hidden states are those of fakes.fake_forward: 'p' is +1, 'n' is -1 at layer 0
-    probe = ConceptProbe(name=name, pos_label="p", neg_label="n", run_dir=str(tmp_path / name),
+    probe = ConceptProbe(name=name, pos_label="p", neg_label="n", out_dir=str(tmp_path / name),
                          identity={"model_id": "fake"})
     probe.model_bundle = SimpleNamespace(model_id="fake", tokenizer=CharChatTok(), model=CharModel(), num_layers=2,
                                          identity={"model_id": "fake"})
@@ -66,7 +66,7 @@ def _probe(tmp_path, name="c", vectors=None):
                 token_center=np.array([0.5, 0.0]), token_scale=np.array([0.25, 1.0]))
     probe.calibrations = [Calibration(ReadContext.generated(), source="evaluation", **refs),
                           Calibration(ReadContext(role="raw"), source="texts", **refs)]
-    probe.steer_sigma = 0.5
+    probe.steer_sd = 0.5
     probe.resid_norm = np.array([2.0, 4.0])
     return probe
 
@@ -86,9 +86,9 @@ def test_score_texts_reads_the_raw_text_by_default(tmp_path):
     assert scores.per_text("max")[0] == pytest.approx(1.0) and scores.per_text("min")[0] == pytest.approx(0.0)
     assert scores.per_text("max", z=True)[0] == pytest.approx(2.0)
     # and the same numbers are on disk, one set of files for the call
-    saved = type(scores).load(scores.dir)
+    saved = type(scores).load(scores.out_dir)
     np.testing.assert_allclose(saved[0].token_z["c"], it.token_z["c"])
-    assert sorted(os.listdir(scores.dir)) == ["scores.jsonl", "scores.npz", "settings.json"]
+    assert sorted(os.listdir(scores.out_dir)) == ["scores.jsonl", "scores.npz", "settings.json"]
 
 
 def test_score_texts_warns_about_settings_its_role_would_ignore(tmp_path):
@@ -127,7 +127,7 @@ def test_random_controls_come_in_the_same_call(tmp_path):
     ev = evaluate_steering(probe, ["hi", "yo"], [1.0, -1.0], n_random=3, layers=[0, 1], n_bootstrap=10, save=False)
     # each dose: the probe and its 3 controls, for each prompt; and dose 0, added
     assert len(ev.scores) == 2 * (1 + 2 * 4)
-    assert ev.settings["n_random"] == 3 and ev.settings["random_seed"] == 0
+    assert ev.settings["n_random"] == 3 and ev.settings["control_seed"] == 0
     seeds = {(it.info["dose"], it.info["control"]): (it.info["intervention"] or {}).get("control_seed")
              for it in ev.scores}
     assert seeds[(1.0, 0)] == [0, 0] and seeds[(-1.0, 0)] == [0, 0]  # the same random direction at every dose

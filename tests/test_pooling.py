@@ -13,14 +13,14 @@ HS = [
 ]
 
 
-def test_sequence_modes():
-    reps = reps_from_hs_layers(HS, prompt_len=None, mode="sequence_last", last_k=2)
+def test_through_text_modes():
+    reps = reps_from_hs_layers(HS, prompt_len=None, mode="through_text_last", last_k=2)
     np.testing.assert_allclose(reps, [[4, 4], [8, 8]])
 
-    reps = reps_from_hs_layers(HS, prompt_len=None, mode="sequence_mean", last_k=2)
+    reps = reps_from_hs_layers(HS, prompt_len=None, mode="through_text_mean", last_k=2)
     np.testing.assert_allclose(reps, [[2.5, 2.5], [5, 5]])
 
-    reps = reps_from_hs_layers(HS, prompt_len=None, mode="sequence_last_k", last_k=2)
+    reps = reps_from_hs_layers(HS, prompt_len=None, mode="through_text_last_k", last_k=2)
     np.testing.assert_allclose(reps, [[3.5, 3.5], [7, 7]])
 
 
@@ -47,7 +47,7 @@ def test_unknown_mode_raises():
 def test_token_scores_per_layer_and_aggregates():
     per_layer = np.array([[1.0, 2.0], [2.0, 4.0], [3.0, 6.0], [4.0, 8.0]], dtype=np.float32)
     mean = TokenScorer("c", [0, 1], np.eye(2, dtype=np.float32), "mean")
-    np.testing.assert_allclose(mean.combine(per_layer), [1.5, 3, 4.5, 6])
+    np.testing.assert_allclose(mean._combine(per_layer), [1.5, 3, 4.5, 6])
     total = TokenScorer("c", [0, 1], np.eye(2, dtype=np.float32), "sum")
-    np.testing.assert_allclose(total.combine(per_layer), [3, 6, 9, 12])
-    assert mean.token_z(per_layer) is None  # no calibration, no z
+    np.testing.assert_allclose(total._combine(per_layer), [3, 6, 9, 12])
+    assert mean._token_z(per_layer) is None  # no calibration, no z

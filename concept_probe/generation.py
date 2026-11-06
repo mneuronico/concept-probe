@@ -1,19 +1,20 @@
-"""Generating, scoring tokens and the probability of given answers (layer 5 of docs/DESIGN.md).
+"""Generating, scoring tokens and the probability of given answers.
 
 - :func:`generate` generates completions in batches (left padding), optionally under an
-  intervention (layer 4), and returns them in memory; ``on_token`` is called at every step with
+  intervention, and returns them in memory; ``on_token`` is called at every step with
   the score of each watched probe on the token just read.
 - :func:`answer_logprobs` gives the log-probability of given answers to each prompt, optionally
   under an intervention.
 - ``_project_tokens`` projects every token of many inputs on the probes' directions, in batches;
-  the scorers of :mod:`concept_probe.scoring` and :func:`score_text_tokens` are built on it.
+  the scorers of :mod:`concept_probe.scoring` (``ConceptProbe.score_texts``) are built on it.
 
 Like everything that produces a result, :func:`generate` and :func:`answer_logprobs` save it by
-default (decision D4): to ``out_dir``, or a new folder under the session's ``output_root``.
+default: to ``out_dir``, or a new folder under the session's ``output_root``.
 """
 import inspect
 import json
 import os
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
@@ -59,6 +60,10 @@ def _pad_id(tokenizer) -> int:
     return 0 if pad is None else int(pad)
 
 
+def _warn(message: str) -> None:
+    warnings.warn(message, stacklevel=4)
+
+
 def _encode_prompts(tokenizer, prompts: Sequence[PromptLike], system: Optional[str],
                     warn: Optional[Callable[[str], None]], label: str) -> List[Tuple[torch.Tensor, bool]]:
     """Each prompt as the model's input for a reply: chat template with the generation prompt."""
@@ -94,7 +99,7 @@ class TokenScorer:
     aggregate: str = "mean"
     calibration: Any = None
 
-    def combine(self, per_layer: np.ndarray) -> np.ndarray:
+    def _combine(self, per_layer: np.ndarray) -> np.ndarray:
         """``(tokens, len(layers))`` projections -> one score per token."""
         if self.aggregate == "mean":
             return per_layer.mean(axis=1)
@@ -102,10 +107,10 @@ class TokenScorer:
             return per_layer.sum(axis=1)
         raise ValueError(f"Unknown aggregate: {self.aggregate}")
 
-    def token_z(self, per_layer: np.ndarray) -> Optional[np.ndarray]:
+    def _token_z(self, per_layer: np.ndarray) -> Optional[np.ndarray]:
         if self.calibration is None:
             return None
-        out = self.calibration.tokens_z(per_layer, self.layers, self.aggregate)
+        out = self.calibration._tokens_z(per_layer, self.layers, self.aggregate)
         return None if out is None else np.asarray(out[1], dtype=np.float32)
 
 
@@ -163,11 +168,6 @@ class Generation:
     def completion_ids(self) -> np.ndarray:
         return self.token_ids[self.prompt_len:self.completion_end]
 
-    def encoded(self) -> Encoded:
-        """The prompt and the completion, with the completion as the span to read."""
-        return Encoded(torch.as_tensor(self.token_ids, dtype=torch.long), self.prompt_len, self.completion_end,
-                       self.text, None)
-
     def record(self) -> Dict[str, Any]:
         return {"index": self.index, "prompt": self.prompt, "system": None if self.own_system else self.system,
                 "text": self.text,
@@ -180,18 +180,18 @@ class Generations(list):
     and the folder it was saved to (``dir``, None when not saved)."""
 
     def __init__(self, items: Sequence[Generation] = (), settings: Optional[Dict[str, Any]] = None,
-                 dir: Optional[str] = None, tokenizer: Any = None):
+                 out_dir: Optional[str] = None, tokenizer: Any = None):
         super().__init__(items)
         self.tokenizer = tokenizer
         self.settings = dict(settings or {})
-        self.dir = dir
+        self.out_dir = out_dir
 
     def encodings(self, system: Any = "as generated") -> List[Encoded]:
         """Each completion to read with :func:`concept_probe.read_encoded` (its readouts pool over the
         completion's own tokens): as generated (its prompt, after the system prompt it was generated
         with), or, with ``system=None`` or another system prompt, the same completion tokens after
-        the prompt alone or after that one (decision D2: to read completions generated under a
-        pole's system prompt without it). The completion is not tokenized again."""
+        the prompt alone or after that one (to read completions generated under a pole's system
+        prompt without it, as the system prompt itself pushes a probe's score toward its pole). The completion is not tokenized again."""
         out = []
         for g in self:
             completion = torch.as_tensor(g.token_ids[g.prompt_len:g.completion_end])
@@ -234,7 +234,7 @@ class Generations(list):
         }
         arrays.update(_pack_logits([g.logits for g in self]))
         np.savez_compressed(os.path.join(out_dir, "generations.npz"), **arrays)
-        self.dir = out_dir
+        self.out_dir = out_dir
         return out_dir
 
 
@@ -312,8 +312,8 @@ class _Watcher:
         for s in self.scorers:
             per_layer = torch.stack([self.last[l].cpu() @ torch.as_tensor(np.asarray(s.vectors[k], np.float32))
                                      for k, l in enumerate(s.layers)], dim=1).numpy()
-            scores[s.name] = s.combine(per_layer).astype(np.float32)
-            zs[s.name] = s.token_z(per_layer)
+            scores[s.name] = s._combine(per_layer).astype(np.float32)
+            zs[s.name] = s._token_z(per_layer)
         self.on_token(TokenStep(self.step, list(self.rows), token_ids, active, scores, zs))
         if self.read is not None:
             self.finished |= torch.tensor([int(t) in self.eos for t in token_ids])
@@ -408,27 +408,25 @@ def generate(
     batch_size: int = 16,
     intervention: Optional[Intervention] = None,
     on_token: Optional[Callable[[TokenStep], Any]] = None,
-    watch: Sequence[Any] = (),
+    probes: Sequence[Any] = (),
     keep_logits: Union[None, int, str] = None,
     save: Optional[bool] = None,
     out_dir: Optional[str] = None,
-    warn: Optional[Callable[[str], None]] = None,
-    label: str = "prompts",
 ) -> Generations:
     """Generate a completion for each prompt, ``batch_size`` prompts at a time.
 
     Each prompt is a user turn of the chat template (a message list is used as given) after
-    ``system`` if one is set; :func:`concept_probe.preview_input` with ``generation=True`` shows the
+    ``system`` if one is set; :func:`concept_probe.preview_input` with ``add_generation_prompt=True`` shows the
     exact input. Prompts in a batch are padded on the left, with an attention mask; padding is
     removed from what is returned. In half precision a batched greedy completion can differ in its
-    last tokens from the one generated alone (D8): use ``batch_size=1`` when that matters. Sampling
+    last tokens from the one generated alone: use ``batch_size=1`` when that matters. Sampling
     (``greedy=False``) seeds the generators with ``seed`` first when it is given; a ``temperature``,
     ``top_p`` or ``top_k`` left as None takes the model's own (its generation config), and the values
     used are announced and saved. Under greedy decoding they do not apply, and passing them warns.
 
     ``intervention`` (see :mod:`concept_probe.interventions`) is applied while generating, with
     positions counted from each prompt's start. ``on_token(step)`` is called at every step with a
-    :class:`TokenStep`: the token each row just read and, for each probe in ``watch``, its score.
+    :class:`TokenStep`: the token each row just read and, for each probe in ``probes``, its score.
     ``keep_logits`` keeps the logits of every generated token: ``"all"``, or the top ``k``.
 
     Returns a :class:`Generations` list, saved by default to ``out_dir`` (or a new folder under the
@@ -436,17 +434,17 @@ def generate(
     """
     if not prompts:
         return Generations([], {})
-    if watch and on_token is None:
-        raise ValueError("watch= needs on_token=, the function that gets the scores at each step")
+    if probes and on_token is None:
+        raise ValueError("probes= needs on_token=, the function that gets the scores at each step")
     sampling, sampling_choices = sampling_settings(model, greedy, temperature, top_p, top_k, seed)
     announce(sampling_choices)
     if not greedy and seed is not None:
         set_seed(int(seed))
-    scorers = [p._token_scorer(ReadContext.generated()) if hasattr(p, "_token_scorer") else p for p in watch]
-    encoded = _encode_prompts(tokenizer, prompts, system, warn, label)
+    scorers = [p._token_scorer(ReadContext.generated()) if hasattr(p, "_token_scorer") else p for p in probes]
+    encoded = _encode_prompts(tokenizer, prompts, system, _warn, "prompts")
     eos_ids = eos_token_ids(model, tokenizer)
     pad = _pad_id(tokenizer)
-    described = None if intervention is None else intervention.describe()
+    described = None if intervention is None else intervention.to_dict()
     results: List[Generation] = []
     step = max(1, int(batch_size))
     for start in range(0, len(encoded), step):
@@ -507,7 +505,7 @@ class AnswerLogprobs:
     n_tokens: np.ndarray
     answer_tokens: List[List[List[str]]]
     intervention: Optional[Dict[str, Any]] = None
-    dir: Optional[str] = None
+    out_dir: Optional[str] = None
 
     def probs(self) -> np.ndarray:
         """Each answer's probability among the given ones (renormalized over them)."""
@@ -526,7 +524,7 @@ class AnswerLogprobs:
             "n_tokens": self.n_tokens.tolist(), "answer_tokens": self.answer_tokens,
             "intervention": self.intervention,
         })
-        self.dir = out_dir
+        self.out_dir = out_dir
         return out_dir
 
 
@@ -591,7 +589,6 @@ def answer_logprobs(
     batch_size: int = 16,
     save: Optional[bool] = None,
     out_dir: Optional[str] = None,
-    warn: Optional[Callable[[str], None]] = None,
 ) -> AnswerLogprobs:
     """How likely the model is to answer each prompt with each of ``answers``.
 
@@ -612,7 +609,7 @@ def answer_logprobs(
     k = len(per_prompt[0]) if per_prompt else 0
     if k == 0 or any(len(a) != k for a in per_prompt):
         raise ValueError("every prompt needs the same, non-zero number of answers")
-    encoded = _encode_prompts(tokenizer, prompts, system, warn, "prompts")
+    encoded = _encode_prompts(tokenizer, prompts, system, _warn, "prompts")
     pairs = []  # (prompt index, answer index, prompt ids, answer ids)
     answer_tokens: List[List[List[str]]] = []
     for i, (ids, _) in enumerate(encoded):
@@ -635,7 +632,7 @@ def answer_logprobs(
         logprobs[i, a] = float(lp.sum())
         n_tokens[i, a] = int(ans.shape[0])
     result = AnswerLogprobs(prompts, per_prompt, logprobs, n_tokens, answer_tokens,
-                            None if intervention is None else intervention.describe())
+                            None if intervention is None else intervention.to_dict())
     if _should_save(save):
         result.save(_new_dir("answer_logprobs", out_dir))
     return result

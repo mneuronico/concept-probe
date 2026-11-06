@@ -1,5 +1,4 @@
-"""Inputs: how a text or a conversation becomes the token ids the model reads (layer 1 of
-docs/DESIGN.md, the part before the forward pass).
+"""Inputs: how a text or a conversation becomes the token ids the model reads.
 
 A text is read in a role (raw, as a user turn, or as the model's own reply), with an optional
 system prompt and, for a reply, the user turn before it. Encoding returns the ids and the span of
@@ -273,6 +272,12 @@ class Encoded:
     offsets: Optional[List[Tuple[int, int]]] = None
 
 
+def _warn(message: str) -> None:
+    import warnings
+
+    warnings.warn(message, stacklevel=4)
+
+
 def encode_text(
     tokenizer,
     text: "PromptLike",
@@ -280,43 +285,59 @@ def encode_text(
     *,
     role: str = "raw",
     prompt: Optional[str] = None,
-    generation: bool = False,
-    warn: Optional[Callable[[str], None]] = None,
-    warn_prefix: str = "read",
+    add_generation_prompt: bool = False,
 ) -> Encoded:
     """Encode a text to read, as :func:`concept_probe.read_texts` and ``ConceptProbe.score_texts`` do
-    (``generation=True``: as a prompt to generate from).
+    (``add_generation_prompt=True``: as a prompt to generate from).
 
     - ``role="raw"`` (default): the text alone, with no chat template and no system prompt: the
       BOS token (if the tokenizer has one) and the text. ``system`` and ``prompt`` are ignored.
       Without a BOS, the text's first token is the attention sink and is left out of the span.
     - ``role="user"``: the text as a user turn of the chat template, after ``system`` if one is
       set. A message list is read as given, and its last message is the text. The span leaves out
-      the template tokens around the text; it is None when it cannot be located (``sequence_*``
+      the template tokens around the text; it is None when it cannot be located (``through_text_*``
       readouts still work then).
     - ``role="assistant"``: the text as the model's own reply: ``system`` if set, an optional user
       turn ``prompt``, the assistant header, then the text, with no end-of-turn token after it.
 
-    ``generation=True`` encodes the text as a prompt to generate from, exactly as
+    ``add_generation_prompt=True`` encodes the text as a prompt to generate from, exactly as
     :func:`concept_probe.generate` and :func:`concept_probe.answer_logprobs` feed it: a user turn
     (after ``system``) and the assistant header the reply would follow. The span is still the
     text's own tokens; the last token of the input is the one that predicts the reply's first.
+    What the role would leave out (a system prompt with ``role="raw"``, a template the tokenizer
+    lacks, a BOS it does not have) is warned about.
     """
+    return _encode_text(tokenizer, text, system, role=role, prompt=prompt,
+                        add_generation_prompt=add_generation_prompt, warn=_warn, warn_prefix="text")
+
+
+def _encode_text(
+    tokenizer,
+    text: "PromptLike",
+    system: Optional[str] = None,
+    *,
+    role: str = "raw",
+    prompt: Optional[str] = None,
+    add_generation_prompt: bool = False,
+    warn: Optional[Callable[[str], None]] = None,
+    warn_prefix: str = "read",
+) -> Encoded:
+    """:func:`encode_text`, with ``warn`` (called with each warning, prefixed with ``warn_prefix``)."""
     if role not in TEXT_ROLES:
         raise ValueError(f"role must be one of {TEXT_ROLES}; got {role!r}")
-    if generation:
+    if add_generation_prompt:
         if role == "assistant" or prompt is not None:
-            raise ValueError(f"{warn_prefix}: generation=True reads the text as a prompt to generate from (a user "
+            raise ValueError(f"{warn_prefix}: add_generation_prompt=True reads the text as a prompt to generate from (a user "
                              "turn and the assistant header); role='assistant' and prompt= do not apply.")
         messages, _ = _normalize_messages(text, system, warn=warn, warn_prefix=warn_prefix)
         ids = apply_chat(tokenizer, messages, add_generation_prompt=True)
-    if role == "user" or generation:
-        if not generation:
+    if role == "user" or add_generation_prompt:
+        if not add_generation_prompt:
             if prompt is not None and warn is not None:
                 warn(f"{warn_prefix}: role='user' reads the text as the user turn; prompt (a user turn before a reply) "
                      "is ignored.")
             ids = _encode_for_read(tokenizer, text, system, warn=warn, warn_prefix=warn_prefix)
-        loc = _user_text_location(tokenizer, text, system, ids, generation=generation)
+        loc = _user_text_location(tokenizer, text, system, ids, generation=add_generation_prompt)
         if loc is None:
             if warn is not None:
                 warn(f"{warn_prefix}: could not locate the text's own tokens in the chat-formatted input.")
@@ -362,20 +383,6 @@ def encode_text(
 
 
 
-#: Readout names of earlier versions, and today's. Saved runs and probes are translated when they
-#: load; code that passes an old name gets an error that names the new one.
-RENAMED_READOUTS = {
-    "assistant_all_mean": "text_mean", "assistant_last": "text_last", "assistant_last_k_mean": "text_last_k",
-    "assistant_first": "text_first", "assistant_max": "text_max", "assistant_tokens": "text_tokens",
-    "sequence_all_mean": "sequence_mean", "sequence_last_k_mean": "sequence_last_k",
-}
-
-
-def upgrade_readout_name(name: Any) -> Any:
-    """A readout name of an earlier version, in today's names (others come back unchanged)."""
-    return RENAMED_READOUTS.get(name, name) if isinstance(name, str) else name
-
-
 @dataclass(frozen=True)
 class ReadContext:
     """How items were read: what a calibration (the zero and unit of z scores) applies to.
@@ -399,8 +406,6 @@ class ReadContext:
             raise ValueError(f"ReadContext kind must be 'text' or 'generated'; got {self.kind!r}")
         if self.kind == "text" and self.role not in TEXT_ROLES:
             raise ValueError(f"ReadContext role must be one of {TEXT_ROLES}; got {self.role!r}")
-        if self.readout is not None:
-            object.__setattr__(self, "readout", upgrade_readout_name(self.readout))
 
     @classmethod
     def generated(cls, readout: Optional[str] = "text_mean", system: Optional[str] = None) -> "ReadContext":
@@ -408,10 +413,9 @@ class ReadContext:
 
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, Any]]) -> "ReadContext":
-        """From the dict probes save (``{"kind", "role", "system", "prompt", "readout"}``; runs saved
-        by earlier versions wrote ``"mode"``, in the readout names of then)."""
+        """From the dict probes save (``{"kind", "role", "system", "prompt", "readout"}``)."""
         d = dict(d or {})
-        readout = d.get("readout", d.get("mode"))
+        readout = d.get("readout")
         if d.get("kind") == "generated":
             return cls.generated(readout, d.get("system"))
         return cls(kind="text", role=d.get("role") or "raw", system=d.get("system") or None,
@@ -430,7 +434,7 @@ class ReadContext:
             return (self.system or None) == (other.system or None)
         return all((getattr(self, k) or None) == (getattr(other, k) or None) for k in ("role", "system", "prompt"))
 
-    def describe(self) -> str:
+    def __str__(self) -> str:
         """A short description, for messages."""
         if self.kind == "generated":
             return "as replies to their own prompts" + (f", after the system prompt {self.system!r}" if self.system
@@ -454,7 +458,7 @@ def _encode_text_for_read(
     warn_prefix: str = "read",
 ) -> Tuple[torch.Tensor, Optional[int], Optional[int]]:
     """:func:`encode_text` as ``(input_ids of shape (1, seq_len), text_start, text_end)``."""
-    enc = encode_text(tokenizer, text, system, role=role, prompt=prompt, warn=warn, warn_prefix=warn_prefix)
+    enc = _encode_text(tokenizer, text, system, role=role, prompt=prompt, warn=warn, warn_prefix=warn_prefix)
     return enc.input_ids.unsqueeze(0), enc.start, enc.end
 
 
@@ -465,13 +469,13 @@ def preview_input(
     role: str = "raw",
     system: Optional[str] = None,
     prompt: Optional[str] = None,
-    generation: bool = False,
+    add_generation_prompt: bool = False,
 ) -> Dict[str, Any]:
     """Exactly what the library feeds the model for ``text``, before running anything.
 
-    ``generation=False`` encodes ``text`` as a text to read, as :func:`concept_probe.read_texts` and
+    ``add_generation_prompt=False`` encodes ``text`` as a text to read, as :func:`concept_probe.read_texts` and
     ``ConceptProbe.score_texts`` do with the same ``role``/``system``/``prompt``.
-    ``generation=True`` encodes it as a prompt to generate from, as :func:`concept_probe.generate` does: a user
+    ``add_generation_prompt=True`` encodes it as a prompt to generate from, as :func:`concept_probe.generate` does: a user
     turn (after ``system`` if set) and the assistant header; ``role`` and ``prompt`` are ignored.
 
     Returns ``input_text`` (decoded with every special and template token), ``input_ids``,
@@ -481,9 +485,9 @@ def preview_input(
     cannot be located) and the ``text`` of that span. A raw text has no messages.
     """
     spans: List[Dict[str, Any]] = []
-    if generation:
+    if add_generation_prompt:
         messages, _ = _normalize_messages(text, system)
-        enc = encode_text(tokenizer, text, system, generation=True)
+        enc = encode_text(tokenizer, text, system, add_generation_prompt=True)
         ids, start, end = enc.input_ids.unsqueeze(0), enc.start, enc.end
         located = message_spans(tokenizer, messages, True, ids[0].tolist())
         spans = [{"role": m["role"], "span": sp} for m, sp in zip(messages, located)]
