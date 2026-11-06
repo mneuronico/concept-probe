@@ -146,3 +146,70 @@ def test_a_saved_batch_is_rated_by_index(tmp_path, monkeypatch):
     assert saved == out and [(r["index"], r["rating"], r["value"]) for r in saved] == [(0, "COHERENT", 1.0),
                                                                                        (1, "NONSENSE", 0.0)]
     assert COHERENCE.match(" partially_coherent. ") == "PARTIALLY_COHERENT"
+
+
+# ---------------------------------------------------------------------------- agents and critiques
+def test_an_agent_judge_writes_a_task_and_checks_the_answers(tmp_path):
+    from concept_probe import AgentJudge, AnswersPending
+
+    judge = AgentJudge(str(tmp_path))
+    texts = ["hello friend", "go away", "fine"]
+    with pytest.raises(AnswersPending) as pending:
+        judge.rate(texts, TONE)
+    path = pending.value.path
+    assert json.loads(open(f"{path}/items.jsonl", encoding="utf-8").readline()) == {"id": 0, "text": "hello friend"}
+    task = open(f"{path}/TASK.md", encoding="utf-8").read()
+    assert "Is this text friendly?" in task and '"yes", "no"' in task and "ids 0 to 2" in task
+    with open(f"{path}/answers.jsonl", "w", encoding="utf-8") as f:
+        f.write('{"id": 0, "answer": "Yes"}\n{"id": 1, "answer": "maybe"}\n')
+    with pytest.raises(ValueError, match="'maybe' is not an allowed answer.*2 ids have no answer"):
+        judge.rate(texts, TONE)
+    with open(f"{path}/answers.jsonl", "w", encoding="utf-8") as f:
+        f.write('{"id": 0, "answer": "Yes"}\n{"id": 1, "answer": "no"}\n{"id": 2, "answer": "yes"}\n')
+    np.testing.assert_array_equal(judge.score(texts, TONE), [1.0, 0.0, 1.0])
+    assert judge.task_dir(texts[:2], TONE) != judge.task_dir(texts, TONE)  # other texts, another task
+
+
+POS = ["I love this day!", "What a great gift!", "We won!", "Such a lovely evening!"]
+NEG = ["I hate this day.", "What a bad gift.", "We lost.", "Such a dreadful evening."]
+
+
+def test_a_critique_task_round_trip_gives_checks_for_the_audit(tmp_path):
+    from concept_probe import compare_poles, critique_task, read_critique
+
+    folder = critique_task(POS, NEG, str(tmp_path), concept="positive vs negative feeling", paired=True, n=4)
+    sample = json.load(open(f"{folder}/sample.json", encoding="utf-8"))
+    assert len(sample["pairs"]) == 4
+    assert "positive vs negative feeling" in open(f"{folder}/TASK.md", encoding="utf-8").read()
+    with pytest.raises(FileNotFoundError, match="TASK.md"):
+        read_critique(folder)
+    answer = {"differences": [{"name": "exclamation", "description": "positives end in !", "more_in": "pos",
+                               "examples": ["pos:0", "neg:0"], "regex": "!"}],
+              "formulaic": [{"description": "What a ...", "examples": ["pos:1"]}],
+              "mislabeled": [], "suggestions": ["vary the punctuation"]}
+    json.dump(answer, open(f"{folder}/critique.json", "w", encoding="utf-8"))
+    critique = read_critique(folder)
+    assert critique.checks()["exclamation"]("Wow!!") == 2.0 and critique.source["by"] == "agent"
+    rows = compare_poles(POS, NEG, paired=True, checks=critique.checks())
+    assert rows[0]["feature"] == "exclamation"
+    answer["differences"][0]["examples"] = ["pos:99"]
+    answer["differences"][0]["regex"] = "("
+    json.dump(answer, open(f"{folder}/critique.json", "w", encoding="utf-8"))
+    with pytest.raises(ValueError, match="unknown ids.*does not compile"):
+        read_critique(folder)
+
+
+def test_a_judge_can_write_the_critique_directly(monkeypatch):
+    from concept_probe import critique_dataset
+
+    reply = {"differences": [], "formulaic": [], "mislabeled": [{"id": "neg:2", "reason": "not negative"}],
+             "suggestions": []}
+    calls = []
+
+    def fake_post(url, headers, payload, timeout):
+        calls.append(payload)
+        return {"choices": [{"message": {"content": "Here it is: " + json.dumps(reply)}}]}
+
+    monkeypatch.setattr(judges, "_post_json", fake_post)
+    critique = critique_dataset(POS, NEG, APIJudge("openai", "m", api_key="k"), concept="valence", n=4)
+    assert critique.mislabeled == reply["mislabeled"] and "valence" in calls[0]["messages"][0]["content"]

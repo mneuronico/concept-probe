@@ -6,9 +6,10 @@ import os
 import numpy as np
 import pytest
 
-from concept_probe import (ConceptProbe, EvalSet, Eraser, audit_dataset, centroid_subspace, compare_poles,
-                           confound_check, distinctive_words, diversity, fit_circle, fit_classes, fit_directions,
-                           fit_regression, formulaicity, learning_curve, read_texts, red_team, surface_baseline)
+from concept_probe import (ConceptProbe, EvalSet, Eraser, Target, audit_dataset, compare_poles, confound_check,
+                           count_matches,
+                           distinctive_words, diversity, fit_directions, formulaicity, learning_curve, read_target,
+                           read_texts, red_team, surface_baseline, target_shape)
 from fakes import CharChatTok
 from test_reference_outputs import EVAL_NEG, EVAL_POS, TRAIN_NEG, TRAIN_POS
 from tiny_model import TinyCausalLM
@@ -115,43 +116,78 @@ def test_red_team_reports_accuracy_and_neutral_shift():
         red_team(probe, {"a": {"pos": ["p"]}}, role="user")
 
 
-# ------------------------------------------------------------------------------------- geometry
-def _days(n_per, seed):
+# ------------------------------------------------------------------------------ targets and shapes
+def _days(n_per, seed, circle=True):
+    """Seven classes; at layer 2 their means lie on a circle in order (or in a scrambled order)."""
     rng = np.random.default_rng(seed)
-    out = {}
+    where = np.arange(7) if circle else np.array([0, 3, 6, 2, 5, 1, 4])
+    # each class also has small features of its own, spread over many dimensions, as in a model
+    own = np.random.default_rng(99).normal(size=(7, D)) * 0.25
+    own[:, :2] = 0.0
+    X, labels = [], []
     for k in range(7):
         x = rng.normal(size=(n_per, L, D)) * 0.3
-        a = 2 * np.pi * k / 7
+        x[:, 2, :] += own[k]
+        a = 2 * np.pi * where[k] / 7
         x[:, 2, 0] += 3 * np.cos(a)
         x[:, 2, 1] += 3 * np.sin(a)
-        out[f"day{k}"] = x
-    return out
+        X.append(x)
+        labels += [k] * n_per
+    return np.concatenate(X), np.array(labels)
 
 
-def test_classes_are_told_apart_where_they_differ():
-    fit, test = fit_classes(_days(20, 1)), _days(10, 2)
-    acc = fit.accuracy(test)
-    assert acc["best_layer"] == 2 and acc["best_accuracy"] > 0.9 and acc["accuracy"][0] < 0.4
-    assert acc["confusion"].sum() == 70 and acc["chance"] == pytest.approx(1 / 7)
-    assert fit.predict(test["day3"], 2).count("day3") >= 9
+def test_the_shape_of_a_cycle_is_found_where_it_is_and_only_in_order():
+    X, labels = _days(20, 1)
+    shape = target_shape(X, Target.cycle(labels, range(7)), n_shuffles=100)
+    assert shape.best_layer == 2 and shape.fit[2] > 0.95 and shape.fit[2] > shape.fit_null_p95[2]
+    assert shape.similarity[2] > shape.similarity_null_p95[2] and shape.fit[0] < shape.fit_null_p95[0]
+    assert shape.coords.shape == (L, 7, 2) and shape.share[2] > 0.75  # the plane keeps most of the spread
+    # the same clusters out of order: a circle, but not the days' cycle
+    Xs, labels_s = _days(20, 1, circle=False)
+    scrambled = target_shape(Xs, Target.cycle(labels_s, range(7)), n_shuffles=100)
+    assert scrambled.fit[2] < scrambled.fit_null_p95[2] + 0.05
+    # an ellipse fits an affine map but not the shape itself as well
+    Xe = X.copy()
+    Xe[:, 2, 1] *= 0.3
+    assert target_shape(Xe, Target.cycle(labels, range(7)), fit="affine", n_shuffles=0).fit[2] > \
+        target_shape(Xe, Target.cycle(labels, range(7)), n_shuffles=0).fit[2] + 0.05
 
 
-def test_a_circle_fits_classes_in_their_cyclic_order():
-    circle = fit_circle(_days(20, 1), n_shuffles=100)
-    assert circle.r2[2] > 0.95 and circle.r2[2] > circle.r2_null_p95[2] and circle.r2[0] < circle.r2_null_p95[0]
-    assert circle.accuracy(_days(10, 2))[2] > 0.9
-    sub = centroid_subspace(_days(20, 1), k=2)
-    assert sub["basis"].shape == (L, 2, D) and sub["share"][2] > 0.95
+def test_reading_a_cycle_does_not_prove_its_shape_but_reading_through_the_shape_does():
+    X, labels = _days(20, 1)
+    t = Target.cycle(labels, range(7))
+    linear = read_target(X, t, model="linear", n_shuffles=10)
+    assert linear.best_score == 1.0 and linear.null_p95[2] >= 0.9  # any arrangement is readable
+    through = read_target(X, t, model="shape", n_shuffles=10)
+    assert through.score[2] > 0.9 and through.null_p95[2] < 0.7 and through.shuffle == "classes"
+    with pytest.raises(ValueError, match="layout"):
+        target_shape(X, Target.categories(labels))
 
 
-def test_a_regression_direction_predicts_a_number():
+def test_categories_numbers_and_orders_are_read_with_their_controls():
+    X, labels = _days(20, 1)
+    cats = read_target(X, Target.categories(labels), model="centroid", n_shuffles=10)
+    assert cats.best_layer == 2 and cats.best_score > 0.9 and cats.null_p95[2] < 0.4
+    assert cats.chance == pytest.approx(1 / 7) and cats.shuffle == "items"
     rng = np.random.default_rng(3)
-    X = rng.normal(size=(200, L, D))
-    y = 2.0 * X[:, 1, 3] + rng.normal(size=200) * 0.1
-    reg = fit_regression(X[:150], y[:150], alpha=0.1)
-    ev = reg.evaluate(X[150:], y[150:])
-    assert ev["best_layer"] == 1 and ev["best_r2"] > 0.9 and ev["r2"][0] < 0.2
-    assert abs(reg.directions[1, 3]) > 0.9  # it found the coordinate
+    Z = rng.normal(size=(200, L, D))
+    y = 2.0 * Z[:, 1, 3] + rng.normal(size=200) * 0.1
+    num = read_target(Z, Target.number(y), alpha=0.1, n_shuffles=10)
+    assert num.best_layer == 1 and num.best_score > 0.9 and num.rank_correlation[1] > 0.9 and num.null_p95[1] < 0.2
+    assert num.predict(Z[:3]).shape == (3, 1)
+    ordered = Target.order(labels, range(7))
+    assert ordered.places.shape == (7, 1) and ordered.structured and not Target.categories(labels).structured
+    tree = Target.layout(["a", "b", "c", "a"], {"a": [0, 0], "b": [1, 0], "c": [0, 1]})
+    assert tree.kind == "layout" and tree.values.tolist() == [[0, 0], [1, 0], [0, 1], [0, 0]]
+
+
+def test_any_model_with_fit_and_predict_can_read():
+    pytest.importorskip("sklearn")
+    from sklearn.neighbors import KNeighborsRegressor
+
+    X, labels = _days(20, 1)
+    knn = read_target(X, Target.cycle(labels, range(7)), model=KNeighborsRegressor(3), layers=[2], n_shuffles=5)
+    assert knn.model == "KNeighborsRegressor" and knn.score[2] > 0.9 and np.isnan(knn.score[0])
 
 
 # -------------------------------------------------------------------------------------- datasets
@@ -163,19 +199,27 @@ NEG = ["I hate this rainy day", "What a terrible gift you gave me", "We lost the
        "Such a dreadful evening with friends", "The trip was horrible and dull"]
 
 
-def test_compare_poles_finds_a_surface_difference():
-    rows = compare_poles([t + "!!" for t in POS], NEG, paired=True)
-    marks = next(r for r in rows if r["feature"] == "exclamations")
-    assert marks["more_pos"] == 8 and marks["p"] < 0.01 and rows.index(marks) < 3
-    assert {r["feature"] for r in rows} >= {"words", "negation", "first_person"}
+def test_compare_poles_finds_a_difference_in_length_or_in_a_check():
+    rows = compare_poles([t + " indeed!!" for t in POS], NEG, paired=True,
+                         checks={"exclamations": count_matches("!")})
+    assert [r["feature"] for r in rows][:1] == ["exclamations"] and rows[0]["std_diff"] == float("inf")
+    words = next(r for r in rows if r["feature"] == "words")
+    assert words["more_pos"] == 8 and words["p"] < 0.01
+    assert {r["feature"] for r in compare_poles(POS, NEG)} == {"chars", "words"}  # nothing else by default
+    with pytest.raises(ValueError, match="built-in"):
+        compare_poles(POS, NEG, checks={"words": len})
 
 
 def test_surface_baselines_and_words():
     pytest.importorskip("sklearn")
     words = surface_baseline(POS, NEG, "words", paired=True, folds=4)
     assert words["accuracy"] >= 0.5 and words["chance"] == 0.5 and words["folds"] == 4
-    marked = surface_baseline([t + "!" for t in POS], NEG, "surface", paired=True, folds=4)
+    marked = surface_baseline([t + "!" for t in POS], NEG, {"bangs": count_matches("!")}, paired=True, folds=4)
     assert marked["accuracy"] == 1.0  # the exclamation gives the pole away
+    longer = surface_baseline([t + " and so on and so forth" for t in POS], NEG, "length", paired=True, folds=4)
+    assert longer["accuracy"] == 1.0
+    function = surface_baseline(POS, NEG, "words", vocabulary=["the", "a", "my"], paired=True, folds=4)
+    assert function["n_features"] == 3
     custom = surface_baseline(POS, NEG, lambda texts: [[t.count("a")] for t in texts], folds=4)
     assert custom["n_features"] == 1
     top = distinctive_words(POS * 3, NEG * 3, top=5)
@@ -195,7 +239,88 @@ def test_formulaic_and_varied_texts():
 def test_an_audit_is_written(tmp_path):
     pytest.importorskip("sklearn")
     audit = audit_dataset([t + "!" for t in POS], NEG, paired=True, name="toy", folds=4, save=True,
-                          out_dir=str(tmp_path))
+                          out_dir=str(tmp_path), checks={"bangs": count_matches("!")})
     assert sorted(os.listdir(tmp_path)) == ["audit.json", "audit.md"]
-    assert json.load(open(tmp_path / "audit.json", encoding="utf-8"))["baselines"]["surface"]["accuracy"] == 1.0
-    assert any("surface classifier" in n for n in audit.notes) and "# Audit: toy" in audit.markdown()
+    saved = json.load(open(tmp_path / "audit.json", encoding="utf-8"))
+    assert saved["baselines"]["checks"]["accuracy"] == 1.0 and set(saved["baselines"]) == {"words", "length", "checks"}
+    assert any("checks classifier" in n for n in audit.notes) and "# Audit: toy" in audit.markdown()
+
+
+def test_the_shape_can_be_drawn(tmp_path):
+    pytest.importorskip("matplotlib")
+    X, labels = _days(10, 1)
+    shape = target_shape(X, Target.cycle(labels, range(7)), n_shuffles=10)
+    assert shape.plot(str(tmp_path / "days.png")) and (tmp_path / "days.png").stat().st_size > 0
+
+
+# --------------------------------------------------------------------------------- target probes
+def _apply(intervention, H, layer):
+    """An intervention's edit applied to activations ``(items, dim)`` at ``layer``, outside a model."""
+    import torch
+    from concept_probe import Where
+
+    h = torch.tensor(H, dtype=torch.float64)[None]
+    intervention.prepare(layer + 1)
+    where = Where(torch.zeros(1, h.shape[1], dtype=torch.long), torch.ones(1, dtype=torch.long))
+    return intervention.edit(layer, h, where)[0].numpy()
+
+
+def test_a_target_probe_scores_new_activations_and_moves_them_around_the_cycle():
+    from concept_probe import TargetProbe
+
+    X, labels = _days(20, 1)
+    new, new_labels = _days(10, 2)
+    probe = TargetProbe.fit(X, Target.cycle(labels, range(7)), save=False)
+    assert probe.layer == 2 and probe.reading["score"] > 0.9 and probe.shape["fit"] > probe.shape["fit_null_p95"]
+    s = probe.score(new)
+    assert np.mean(np.array(s.nearest) == new_labels) > 0.9
+    on_own_day = (s.position - new_labels + 3.5) % 7 - 3.5
+    assert np.abs(on_own_day).mean() < 0.3 and abs(s.fit.mean() - 1.0) < 0.3
+    for steps in (1, -2):
+        moved = probe.score(_apply(probe.steering(steps), new[:, 2, :], 2))
+        delta = (moved.position - s.position + 3.5) % 7 - 3.5
+        assert delta.mean() == pytest.approx(steps, abs=0.1)
+    toward = probe.toward(source=3, steps=2)  # from class 3, two steps on
+    assert probe.toward(2, source=3).label.endswith("to 2")  # to class 2
+    with pytest.raises(ValueError, match="either"):
+        probe.toward(2, source=3, steps=1)
+    step = _apply(toward, new[new_labels == 3][:, 2, :], 2)
+    assert np.array(probe.score(step).nearest).tolist().count(5) >= 9
+    np.testing.assert_allclose(step - new[new_labels == 3][:, 2, :],
+                               np.tile(probe.centroids[5, 2] - probe.centroids[3, 2], (10, 1)), atol=1e-5)
+    rotated_elsewhere = probe.steering(1, layer=1)
+    assert rotated_elsewhere.describe()["layers"] == [1]
+
+
+def test_a_target_probe_for_numbers_and_categories(tmp_path):
+    from concept_probe import TargetProbe
+
+    rng = np.random.default_rng(3)
+    Z = rng.normal(size=(200, L, D))
+    y = 2.0 * Z[:, 1, 3] + rng.normal(size=200) * 0.1
+    num = TargetProbe.fit(Z, Target.number(y), alpha=0.1, save=False)
+    assert num.layer == 1 and num.reading["metric"] == "R2" and num.reading["score"] > 0.9
+    before = num.score(Z[:5]).position
+    after = num.score(_apply(num.steering(1.5), Z[:5, 1, :], 1)).position
+    np.testing.assert_allclose(after - before, 1.5, atol=1e-6)  # moves the predicted value by exactly that
+    X, labels = _days(20, 1)
+    cats = TargetProbe.fit(X, Target.categories([f"c{k}" for k in labels]), save=True, root_dir=str(tmp_path))
+    assert cats.score(X[:3]).nearest == ["c0", "c0", "c0"] and cats.score(X[:3]).class_scores.shape == (3, 7)
+    with pytest.raises(ValueError, match="toward"):
+        cats.steering(1)
+    loaded = TargetProbe.load(cats.dir)
+    assert loaded.score(X[:5]).nearest == cats.score(X[:5]).nearest and loaded.reading == cats.reading
+    np.testing.assert_allclose(loaded.centroids, cats.centroids)
+
+
+def test_a_target_probe_reads_texts_whole_and_token_by_token():
+    from concept_probe import TargetProbe
+
+    model, tok = TinyCausalLM(), CharChatTok()
+    texts = ["pp xp", "p pp", "xpp", "pxp", "nn xn", "n nn", "xnn", "nxn", "zz yz", "z zz", "yzz", "zyz"] * 2
+    labels = (["p"] * 4 + ["n"] * 4 + ["z"] * 4) * 2
+    probe = TargetProbe.fit(read_texts(model, tok, texts, cache=False), Target.categories(labels), save=False)
+    probe.attach(model, tok)
+    assert probe.read(["ppp", "nnn"]).nearest == ["p", "n"]
+    per_token = probe.score_tokens(["pn z"])[0]
+    assert len(per_token) == 4 and per_token.nearest[0] == "p"

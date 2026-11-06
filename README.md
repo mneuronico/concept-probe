@@ -11,8 +11,11 @@
 - Generation-time steering with learned concept vectors
 - Multi-probe scoring on the same model
 - Saved artifacts for configs, metrics, tensors, logs, plots, and HTML heatmaps
-- Behavioral eval helpers and multi-probe reporting utilities
-- Optional generation-logit capture
+- Evaluation against controls: random directions, shuffled labels, random steering directions
+- Interventions (add, erase, patch, rotate), batched generation, answer probabilities
+- Steering evaluation with coherence, judges (any provider, a local model or an agent) and behavioral measures
+- Dataset audits and critiques, confound checks and erasure, probes toward any target and the shape of representations
+- Guides for people and agents (`concept_probe.guide()`, `AGENTS.md`)
 
 ## What it does not include
 
@@ -292,8 +295,8 @@ and keeps float32 for an entry with values float16 cannot hold.
 
 The probe learns whatever separates the two sets of texts, so if the poles also differ in
 length, negation, punctuation, topic or phrasing, the direction mixes the concept with that, and
-held-out accuracy does not show it. [docs/building_datasets.md](docs/building_datasets.md)
-describes how to write varied texts, audit them, and red-team the probe until it cannot be fooled
+held-out accuracy does not show it. The `datasets` guide (`concept_probe.guide("datasets")`)
+describes how to write varied texts, audit them, and attack the probe until it cannot be fooled
 by a confound in the data.
 
 ## Evaluation
@@ -566,14 +569,23 @@ with 5 controls each (248 generations of 32 tokens) took a minute.
 
 ## Datasets, confounds and beyond two poles
 
-**Auditing a dataset** (no model): `audit_dataset(pos_texts, neg_texts, paired=...)` compares the
-poles on surface features (length, punctuation, word groups such as negation or first person),
-trains classifiers that see only surface features, only function words or only words (and any
-embedding you pass as `embed`), lists the words that most mark each pole, and flags formulaic
-writing and low variety; it writes `audit.md` and `audit.json`. The pieces are separate functions
-(`compare_poles`, `surface_baseline`, `distinctive_words`, `formulaicity`, `diversity`).
+**Auditing a dataset** (no model): `audit_dataset(pos_texts, neg_texts, paired=..., checks=...)`
+compares the poles' length (characters, words, and tokens with `n_tokens`), lists the words much
+more frequent in one pole, flags repeated openings and near duplicates, measures variety, and
+trains classifiers that see only words, only length, only your checks (and any embedding you pass
+as `embed`); it writes `audit.md` and `audit.json`. Nothing about a particular concept or language
+is checked by default: anything else you suspect is a check, a function `text -> number`, e.g.
+`checks={"negation": count_matches(r"\b(not|no|never)\b|n't\b")}`. The pieces are separate
+functions (`compare_poles`, `surface_baseline`, `distinctive_words`, `formulaicity`, `diversity`).
 `surface_baseline` is also the number a probe has to beat: a probe that does not read better than
 a bag of words did not need the model.
+
+**Critiquing a dataset.** A reader notices what no check was written for. `critique_task(pos, neg,
+folder, concept=...)` writes a task for an agent (a sample of each pole, what to look for: differences
+besides the concept, formulaic writing, mislabeled items, and the exact JSON to write), and
+`read_critique(folder)` reads and checks the answer; `critique_dataset(pos, neg, judge)` asks a
+judge behind an API or loaded here directly. `critique.checks()` turns the differences that come
+with a regular expression into checks for the audit, so each hypothesis is measured on every text.
 
 **Confounds.** `confound_check(directions, layer, {"negation": (with, without)})` says, for
 representations of items with and without a feature, whether the probe separates them beyond
@@ -602,13 +614,56 @@ reads items written to exploit a suspected confound: each pole's items that carr
 surface, and pairs of neutral texts that differ only in the feature. It reports each pole's
 accuracy and how far the feature alone moves the probe, in z.
 
-**Several classes, a number, a circle.** `fit_classes({class: reps})` fits one direction per class
-against the rest, with a cut per class (`accuracy`, `predict`, a confusion matrix per layer);
-`fit_regression(reps, values)` a ridge direction whose projection predicts a number (r and R² per
-layer); `centroid_subspace` the few directions along which class centroids spread; and
-`fit_circle({class: reps})`, for classes in a cyclic order (days, months), the plane of their
-centroids and the map that puts them on a circle, its fit next to shuffled orders, and which class
-new items fall nearest to.
+**Beyond two poles: any target, and its shape.** A `Target` says what each item is:
+`Target.categories(labels)`, `Target.number(values)`, `Target.order(labels, classes)`,
+`Target.cycle(labels, classes)` (e.g. days of the week, evenly around a circle) or
+`Target.layout(labels, {class: coordinates})`. Two questions, each layer by layer and with its
+control:
+
+- `read_target(reps, target, model=...)`: can it be read? A map fitted on some items and tested on
+  others: `"centroid"` (the nearest class mean), `"linear"` (ridge, optionally of low `rank`),
+  `"shape"` (through the plane of the class centroids), or any model with `fit`/`predict`, nonlinear
+  ones included. Accuracy for classes, R² and rank correlation for numbers, next to the same with the
+  target shuffled (between items, or between classes: which class gets which place).
+- `target_shape(reps, target)`: do the class centroids have the target's shape? The correlation
+  between their distances and the places' distances, and how well their own top plane (or line)
+  matches the places up to rotation and scale (`fit="affine"` also allows stretching), next to
+  shuffled orders. `shape.plot(path)` draws the centroids joined in order.
+
+With many dimensions and few classes almost any arrangement can be read, so reading a cycle says
+little about its shape: in Llama 3.2 3B, a rank-2 linear map read the days of the week perfectly,
+and just as perfectly with the days shuffled. Their centroids lie on a circle in order (fit 0.97,
+shuffled orders 0.54, at layer 18), and reading through that plane names the day of new sentences
+(100%, shuffled 57%). The two-pole `ConceptProbe` does not use this module and is not changed by it.
+
+**A probe toward a target.** `TargetProbe.fit(reps, target)` fits the map once (at the layer that
+reads the target best on held-out items; among equally good layers, the one whose centroids fit
+the shape best) and then works like any probe:
+
+```python
+probe = TargetProbe.fit(read_texts(model, tokenizer, day_sentences, "assistant_last"),
+                        Target.cycle(day_names, ["Monday", "Tuesday", ..., "Sunday"]))
+probe.attach(model, tokenizer)
+s = probe.read(["The party is on Thursday"])    # s.position: 2.86 (steps from Monday), s.nearest: Thursday
+probe.score_tokens(["I will call you on Friday"])  # the same for every token
+probe.score(new_reps)                          # on representations already read
+probe.steering(1, layer=6)                     # rotate one step around the days' circle
+probe.toward(source="Monday", steps=1, layer=6)  # add the whole step from Monday's centroid to Tuesday's
+```
+
+Each activation gets a score that fits the target: for a cycle, its place on the circle in class
+steps (continuous), the nearest class, and how far it sits from the center (1 is on the circle); for
+an order or a number, the value; for categories, a score per class and the nearest one. The probe
+saves and loads (`save`, `TargetProbe.load`), with how well it read held-out items and, for a
+structured target, how well the centroids have its shape.
+
+It moves activations in two ways, at any layer. `steering(steps)` moves them along the shape: a
+rotation in the centroids' plane about the cycle's center (one step is one class), or a step along
+an order or a number's direction. `toward(...)` adds the whole difference between two classes'
+centroids, in every dimension, for any target with classes. They need not do the same: the days
+form a circle, but rotating within it did not change what Llama 3.2 3B (0 of 7) or Qwen 2.5 0.5B
+(at most 2 of 7) answered for "tomorrow", while the whole step did (Llama 7 of 7 at layers 4 to 12;
+Qwen 4 to 6 of 7 at layers 2 to 16, against at most 2 of 7 for a random step of the same length).
 
 **Several models.** There is no batch runner: load each model, read, train and evaluate, and
 compare at the same relative depth.
@@ -755,54 +810,31 @@ the session's `output_root` (`concept_probe.configure(output_root=...)`), unless
 probe without a folder gets one there the first time it saves scores, and `probe.save()` writes its
 current state (a new calibration, for instance) into its folder.
 
-## Behavioral evals and reports
+## Behavioral evals
 
-`run_scored_eval` / `run_multi_scored_eval` score prompts at several alphas and check
-correctness. Their analysis never pools correct and incorrect answers across alphas (steering
-moves both the scores and the accuracy, and each item recurs at every alpha):
+A behavioral eval is a steering evaluation with a measure of the task: give each prompt its item,
+and measure the completions with a function of the texts and their items.
 
-- per alpha: accuracy with 95% Wilson intervals, mean score, and correct vs incorrect scores;
-- across alphas: a logistic GEE of correctness on the score with alpha as a covariate, clustered
-  by item, with standard errors corrected for few items (`correctness_gee` in `stats.json`). The
-  coefficient is per SD of the score within an alpha: the SD across alphas would include the
-  steering shift, and the effect size would grow with the range of alphas run.
+```python
+items = [{"prompt": "What is 2 + 2? Answer after ANSWER:", "expected": "4"}, ...]
+ev = evaluate_steering(probe, [it["prompt"] for it in items], doses=[-0.2, 0.2], items=items,
+                       measures={"correct": exact_match(marker="ANSWER:")})
+ev.row(0.2)["effects"]["correct"]        # change in accuracy from dose 0, against random directions
+ev.relate(probe.concept.name, "correct")  # does the probe's score predict being right?
+```
 
-A correctness label is a bool (Python or numpy), 0/1, or None for an unlabelled row; anything
-else raises. An evaluator's fields are added to each row, but it cannot return the fields that
-come from the scoring run (`prompt`, `completion`, `alpha`, `score_mean`, `generation`, ...):
-that raises. Rows keep the raw and standardized means (`score_mean`, `score_mean_z`, or their
-`_by_probe` forms) and the generation settings. Prompts come from at most one of `prompt_builder`, `prompt_template` (formatted with
-the item's fields; a string item is `{"prompt": text}`) and `prompt_prefix`, which is always
-applied; without them the prompt is `item["prompt"]`. `aggregate_eval_batches` pools every
-subfolder with `<analysis_name>/per_sample.json` (or the `batch_dirs` given), refuses batches
-whose rows share an alpha but not the steering unit or the injected offset, and warns when an
-item appears more than once at an alpha: the accuracy intervals count rows as independent, while
-the correctness model clusters by item.
+`exact_match` compares the completion (or the first line after `marker`, or the last before it)
+with `item["expected"]` (a value or a list of accepted values), after stripping whitespace and a
+trailing period, as numbers when both read as numbers, case-sensitively unless
+`case_sensitive=False`. Under strong steering, format drift counts as a wrong answer, so read
+completions before taking a drop as the model knowing less. Any other check is a function
+`(texts, items) -> numbers`.
 
-`generate_multi_probe_report` shows one alpha at a time. Its correctness model has alpha as a
-covariate, cross-validation folds that keep all rows of an item together, and standard errors
-clustered by item. Next to each out-of-fold metric it shows what alpha alone predicts, since
-steering can drive accuracy by itself: the probe scores add only the difference. Items are
-identified by their prompt, so `aggregate_eval_batches` treats the same prompt in two batches as
-one item and different prompts that share an index as two. The report uses z scores when every
-scored item has them for every probe (0 = a probe's midpoint, so probes share an axis) and raw
-projections otherwise, and says which on its axes. Mean scores per alpha include unlabelled rows;
-correct vs incorrect means and the model use the labelled ones.
-
-The default evaluator compares the completion with `item["expected"]` (a value, or a list of
-accepted values); items whose `expected` is missing or null raise. With `marker`, it compares the
-first line after the marker (`marker_position = "after"`) or the last line before it
-(`"before"`); a completion without the marker is wrong, with `extracted` null. Answers match after
-stripping whitespace and a trailing period, as numbers when both read as numbers (`"4."` matches
-`4`), and case-sensitively (`simple_equality_evaluator(..., case_sensitive=False)` otherwise).
-Under strong steering, format drift counts as a wrong answer, so check `extracted` before reading
-accuracy as correctness. `marker` works in both `run_scored_eval` and `run_multi_scored_eval`; a
-`marker` together with your own `evaluator` raises, since it would not be used.
-
-`run_scored_eval` and `run_multi_scored_eval` return the scores (`results`, a `Scores`), one record
-per generation with the evaluator's verdict (`per_sample`), and where the analysis was written (it
-is written next to the saved scores, so not when they were not saved).
-`generate_multi_probe_report` takes what `run_multi_scored_eval` returned, or a batch folder.
+`relate(predictor, outcome)` fits a GEE of the outcome on the predictor (logistic for a 0/1
+outcome, linear otherwise), with the dose as a covariate and each prompt as a cluster (it recurs at
+every dose), with standard errors corrected for few clusters. The predictor is in SDs within a
+dose: across doses it would include the steering shift, and the effect would grow with the range of
+doses run.
 
 `multi_probe_score_prompts` runs one model for every probe, so the probes must come from the same
 model identity (the model, the dtype used, the quantization, the chat template and its date). The generation
@@ -813,11 +845,9 @@ their distribution come from its config. Each item has every probe's scores, key
 `scores.npz` has them as `scores_<i>` and `layers_<i>` in the order of `probe_names`. Warnings go
 to the run's log as well as the console.
 
-With `coherence_judge=` (any judge, see [Judges](#judges)) the eval runs rate each completion's
-coherence and the analysis adds accuracy by coherence; without it (the default) nothing leaves the
-machine. `rate_saved(folder, judge, rubric)` rates a saved batch's completions on any rubric and
-saves `<rubric>_rating.json`, one answer per generation by its index in the scores, with the judge
-and the date: they are labels from another model, not ground truth.
+`rate_saved(folder, judge, rubric)` rates a saved batch's completions on any rubric and saves
+`<rubric>_rating.json`, one answer per generation by its index in the scores, with the judge and
+the date: they are labels from another model, not ground truth.
 
 ## Judges
 
@@ -834,6 +864,7 @@ judge = APIJudge("anthropic", model="<a model id>")          # or "openai", "gem
 judge = APIJudge("ollama", model="llama3.1")                # a local Ollama server
 judge = APIJudge("openai-compatible", model="m", base_url="http://localhost:8000/v1")   # vLLM, LM Studio...
 judge = LocalJudge(judge_model, judge_tokenizer)            # a model loaded here
+judge = AgentJudge("tasks")                                 # an agent, a subagent or a person (see below)
 
 judge.rate(texts, positivity)        # the answers
 judge.score(texts, positivity)       # their numbers
@@ -850,6 +881,12 @@ judge.measure(COHERENCE)             # texts -> numbers, for evaluate_steering(m
   sampling, and nothing leaves the machine: `rate` takes the most probable answer and `score` the
   expected value. Use a model other than the one you study, so it does not share its
   representations, and write the answers as it would start its reply.
+- **An agent** (Claude Code, a subagent it starts, any program or a person): `AgentJudge` writes the
+  task to a folder (`TASK.md` with the question, the allowed answers and the exact format of the
+  answer; `items.jsonl` with the texts) and raises `AnswersPending`; once `answers.jsonl` is written
+  there, the same call reads it and checks it, reporting anything missing or not allowed. No API and
+  no model. In a steering evaluation, add the measure after the sweep:
+  `ev.add_measure("coherence", judge.measure(COHERENCE))`. The `delegating` guide has the details.
 
 ## Loading a trained probe
 
@@ -894,7 +931,9 @@ repo.
 ```text
 concept-probe/
   concept_probe/          # library package
-  docs/                   # guides (building_datasets.md)
+  concept_probe/guides/   # guides for people and agents (concept_probe.guide())
+  docs/                   # the design (DESIGN.md) and the list it answers (LIBRARY_ISSUES.md)
+  AGENTS.md               # where agents start
   examples/               # general examples only
   pyproject.toml
   README.md
@@ -936,8 +975,14 @@ from concept_probe import (
     learning_curve,
     confound_check,
     Eraser,
-    fit_classes,
-    fit_circle,
+    Target,
+    TargetProbe,
+    read_target,
+    target_shape,
+    AgentJudge,
+    critique_task,
+    exact_match,
+    guide,
     intervene,
     Add,
     Ablate,
@@ -945,9 +990,6 @@ from concept_probe import (
     Rotate,
     Edit,
     train_concept_from_json,
-    generate_multi_probe_report,
-    run_scored_eval,
-    run_multi_scored_eval,
 )
 ```
 
@@ -971,6 +1013,32 @@ GitHub Actions CI runs the same lightweight checks and also builds source and wh
 
 ### Unreleased
 
+- **Probes toward any target, and the shape of representations** (`structure.py`): `Target`
+  (categories, a number, an order, a cycle, a layout), `read_target` (centroid, linear, through the
+  shape, or any model with fit/predict; with a shuffled-target control) and `target_shape`
+  (representational similarity and Procrustes fit of the class centroids, with shuffled orders;
+  `plot`). They replace `fit_classes`, `fit_regression`, `centroid_subspace` and `fit_circle`. The
+  two-pole probe is not changed (the reference outputs are the same).
+- **`TargetProbe`**: a probe toward any target, fitted once, that scores new activations (`score`,
+  `read`, `score_tokens`: a place on a cycle, a value, the nearest class, how well it fits), saves
+  and loads, and moves activations along the shape (`steering`) or between classes (`toward`), at
+  any layer. `Rotate` takes a `center`.
+- **The audit checks nothing particular by default**: length, words, duplicates and variety;
+  `checks={name: text -> number}` (and `count_matches(regex)`) for anything else. The word groups
+  (negation, persons...) and the function-word list are gone; `surface_features` is `text_features`,
+  and `surface_baseline` takes `"words"` (with an optional `vocabulary`), `"length"`, a dict of
+  checks or a function.
+- **Agents as readers**: `AgentJudge` writes a rating task to a folder and reads the answers;
+  `critique_task` / `read_critique` (and `critique_dataset` for a judge) critique a dataset, and
+  `Critique.checks()` feeds the audit. Guides ship with the package (`concept_probe.guide()`), and
+  `AGENTS.md` points agents to them; `docs/building_datasets.md` became the `datasets` guide.
+- **Behavioral evals are steering evaluations**: `evaluate_steering(..., items=, measures=)` with
+  measures of the texts and their items (`exact_match`), `SteeringEvaluation.add_measure` (after the
+  sweep, e.g. from an agent), `SteeringEvaluation.load` and `relate` (the GEE of one measure on
+  another, with the dose as a covariate). They replace `run_scored_eval`, `run_multi_scored_eval`,
+  `simple_equality_evaluator`, `aggregate_eval_batches`, `rehydrate_batch_analysis`,
+  `rate_batch_coherence_safe`, `generate_multi_probe_report` and their modules.
+- The default coherence rule is documented as a heuristic.
 - **Judges on any dimension, from any provider**: a `Rubric` (question, allowed answers with their
   numbers) answered by an `APIJudge` (OpenAI, Anthropic, Gemini, OpenRouter, Groq, Ollama or any
   OpenAI-compatible server, through the standard library) or a `LocalJudge` (a model loaded here,

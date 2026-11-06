@@ -475,3 +475,33 @@ def plot_dose_response(evaluation: Any, out_path: str) -> bool:
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
     return True
+
+
+def plot_shape(shape: Any, out_path: str, layer: Optional[int] = None, *, title: Optional[str] = None) -> bool:
+    """The classes' centroids at ``layer`` (the best by default) in their own top directions, joined
+    in the target's order (and closed for a cycle), with each class's name; the title gives the fit
+    and its shuffled-order control."""
+    try:
+        import matplotlib.pyplot as plt
+    except Exception:
+        return False
+    layer = shape.best_layer if layer is None else int(layer)
+    C = np.asarray(shape.coords[layer])
+    names = [str(c) for c in shape.classes]
+    fig, ax = plt.subplots(1, 1, figsize=(5.2, 5.0) if C.shape[1] > 1 else (6.5, 2.2))
+    y = C[:, 1] if C.shape[1] > 1 else np.zeros(len(C))
+    order = list(range(len(C))) + ([0] if shape.target_kind == "cycle" else [])
+    ax.plot(C[order, 0], y[order], "-", color="#9a9a9a", linewidth=1.0, zorder=1)
+    ax.scatter(C[:, 0], y, color=STEER_COLOR, s=28, zorder=2)
+    for x0, y0, name in zip(C[:, 0], y, names):
+        ax.annotate(name, (x0, y0), textcoords="offset points", xytext=(5, 4), fontsize=8)
+    ax.set_xlabel("first direction of the centroids")
+    ax.set_ylabel("second direction" if C.shape[1] > 1 else "")
+    if C.shape[1] > 1:
+        ax.set_aspect("equal", adjustable="datalim")
+    ax.set_title(title or f"Class centroids at layer {layer}: fit {shape.fit[layer]:.2f} "
+                          f"(shuffled orders, p95 {shape.fit_null_p95[layer]:.2f})", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+    return True

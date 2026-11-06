@@ -1,29 +1,31 @@
 """Auditing a two-pole dataset before trusting a probe trained on it (layer 6d of docs/DESIGN.md).
 
 Model-free checks for differences between the poles other than the concept, and for how varied
-the texts are:
+the texts are. By default it looks at what any two-pole dataset can be checked for, in any
+language: length, and which words each pole uses. Anything else you suspect (negation, first
+person, a topic, exclamation marks...) is a **check**: a function ``text -> number``, compared
+between the poles like length; :func:`count_matches` builds one from a regular expression.
 
-- :func:`compare_poles`: per surface feature (length, punctuation, word groups such as negation or
-  first person), the poles' means, the standardized difference and its p;
-- :func:`surface_baseline`: a cross-validated classifier that sees only surface features, only
-  words, only function words, or any representation you give (embeddings): what a probe has to
-  beat to show it reads more than the surface;
-- :func:`distinctive_words`: the words that most separate the poles (weighted log-odds with an
-  informative prior), which should be concept words, not function words or repeated phrasings;
+- :func:`compare_poles`: per feature (length, and each check), the poles' means, the standardized
+  difference and its p;
+- :func:`surface_baseline`: a cross-validated classifier that sees only words, only length, only
+  your checks, or any representation you give (embeddings): what a probe has to beat to show it
+  reads more than the surface;
+- :func:`distinctive_words`: the words much more frequent in one pole than in the other (weighted
+  log-odds with an informative prior);
 - :func:`formulaicity` and :func:`diversity`: repeated openings, near duplicates, vocabulary and
   length spread, and how spread out the texts are in an embedding you give;
 - :func:`audit_dataset` runs them all and writes a report (saved by default).
 
-The word groups (:data:`WORD_GROUPS`) are English and Spanish lists, good enough to catch a skew;
-pass your own for other languages or concepts. The classifiers need scikit-learn
-(``pip install concept-probe[stats]``).
+The classifiers need scikit-learn (``pip install concept-probe[stats]``). For a reading of the texts
+by a model (differences, formulaic writing, mislabeled items), see :mod:`concept_probe.critique`.
 """
 import math
 import os
 import re
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -33,54 +35,37 @@ from .utils import ensure_dir, json_dump, now_tag
 
 WORD = re.compile(r"[^\W\d_]+(?:'[^\W\d_]+)?|\d+", re.UNICODE)
 
-#: Word groups that should not separate the poles of most concepts (English and Spanish).
-WORD_GROUPS: Dict[str, "re.Pattern[str]"] = {
-    "negation": re.compile(r"\b(not|no|never|nobody|none|nothing|nowhere|neither|nor|without|cannot|no one|"
-                           r"no longer|nunca|nadie|nada|ning[uú]n[oa]?|ni|sin|jam[aá]s|tampoco)\b|n't\b", re.I),
-    "first_person": re.compile(r"\b(i|me|my|mine|we|us|our|ours|i'm|i've|i'd|we're|we've|yo|me|mi|mis|nosotros|"
-                               r"nosotras|nuestro|nuestra)\b", re.I),
-    "second_person": re.compile(r"\b(you|your|yours|you're|you'll|you've|tú|tu|tus|vos|usted|ustedes)\b", re.I),
-    "third_person": re.compile(r"\b(he|she|they|him|her|them|his|their|he's|she's|they're|él|ella|ellos|ellas|"
-                               r"su|sus)\b", re.I),
-    "contrast": re.compile(r"\b(but|though|although|despite|however|yet|pero|aunque|sin embargo)\b", re.I),
-    "intensifier": re.compile(r"\b(so|very|really|totally|absolutely|completely|muy|tan|re|súper|totalmente)\b", re.I),
-    "future": re.compile(r"\b(will|won't|'ll|going to|tomorrow|next|mañana|próximo|próxima|va a|vamos a)\b", re.I),
-    "number": re.compile(r"\b\d+\b"),
-}
-
-FUNCTION_WORDS = sorted(set("""
-a an the and or but if of to in on at by for with from as into over under about after before since until
-while than then so too very just only even still again also already yet ever never not no nor is are was were
-be been being am do does did have has had will would shall should can could may might must it its this that
-these those there here what which who whom whose when where why how all any both each every some such more
-most other another own same i me my we us our you your he him his she her they them their one up down out
-el la los las un una unos unas y o pero si de del a al en con por para sin sobre entre desde hasta que como
-cuando donde quien cual muy más menos ya también no ni es son era fue ser estar está están hay me te se nos
-lo le les mi tu su sus este esta estos estas ese esa eso
-""".split()))
+Check = Callable[[str], float]
 
 
 def _words(text: str) -> List[str]:
     return [w.lower() for w in WORD.findall(str(text))]
 
 
-def surface_features(text: str, groups: Optional[Dict[str, Any]] = None,
-                     n_tokens: Optional[Callable[[str], int]] = None) -> Dict[str, float]:
-    """Surface statistics of one text, and how often each word group (``groups``, default
-    :data:`WORD_GROUPS`) occurs in it; ``n_tokens`` adds a token count (e.g. a tokenizer's)."""
+def count_matches(pattern: str, flags: int = re.IGNORECASE) -> Check:
+    """A check that counts the matches of a regular expression in each text (case-insensitive by
+    default), e.g. ``count_matches(r"\\b(not|no|never)\\b|n't\\b")`` for negation in English."""
+    rx = re.compile(pattern, flags)
+
+    def count(text: str) -> float:
+        return float(len(rx.findall(str(text))))
+
+    count.__name__ = f"count_matches({pattern!r})"
+    return count
+
+
+def text_features(text: str, checks: Optional[Dict[str, Check]] = None,
+                  n_tokens: Optional[Callable[[str], int]] = None) -> Dict[str, float]:
+    """A text's length in characters and words (and tokens, with ``n_tokens``, e.g. a tokenizer's
+    count), and the value of each check."""
     text = str(text)
-    words = _words(text)
-    feats: Dict[str, float] = {
-        "chars": len(text), "words": len(words),
-        "sentences": max(1, len(re.findall(r"[.!?]+(\s|$)", text))),
-        "exclamations": text.count("!"), "questions": text.count("?"), "commas": text.count(","),
-        "uppercase_ratio": sum(c.isupper() for c in text) / max(1, sum(c.isalpha() for c in text)),
-        "mean_word_len": float(np.mean([len(w) for w in words])) if words else 0.0,
-    }
-    for name, rx in (WORD_GROUPS if groups is None else groups).items():
-        feats[name] = len(re.findall(rx, text)) if isinstance(rx, str) else len(rx.findall(text))
+    feats: Dict[str, float] = {"chars": float(len(text)), "words": float(len(_words(text)))}
     if n_tokens is not None:
         feats["tokens"] = float(n_tokens(text))
+    for name, fn in (checks or {}).items():
+        if name in feats:
+            raise ValueError(f"a check cannot be called {name!r}; that name is a built-in feature")
+        feats[name] = float(fn(text))
     return feats
 
 
@@ -94,15 +79,16 @@ def _sign_test_p(n_plus: int, n_minus: int) -> float:
 
 
 def compare_poles(pos: Sequence[str], neg: Sequence[str], *, paired: bool = False,
-                  groups: Optional[Dict[str, Any]] = None, n_tokens: Optional[Callable[[str], int]] = None
+                  checks: Optional[Dict[str, Check]] = None, n_tokens: Optional[Callable[[str], int]] = None
                   ) -> List[Dict[str, Any]]:
-    """Per surface feature: each pole's mean, the difference in pooled SDs (``std_diff``) and its p
-    (a sign test on the pairs when ``paired``, Welch's t otherwise), sorted by ``|std_diff|``. A
-    feature the poles differ on is a cue a probe can learn instead of the concept."""
+    """Per feature (length, and each check): each pole's mean, the difference in pooled SDs
+    (``std_diff``; infinite when the feature does not vary within the poles but differs between
+    them) and its p (a sign test on the pairs when ``paired``, Welch's t otherwise), sorted by
+    ``|std_diff|``. A feature the poles differ on is a cue a probe can learn instead of the concept."""
     if paired and len(pos) != len(neg):
         raise ValueError("paired poles need the same number of texts")
-    fp = [surface_features(t, groups, n_tokens) for t in pos]
-    fn = [surface_features(t, groups, n_tokens) for t in neg]
+    fp = [text_features(t, checks, n_tokens) for t in pos]
+    fn = [text_features(t, checks, n_tokens) for t in neg]
     rows = []
     for k in fp[0]:
         a = np.array([f[k] for f in fp], dtype=np.float64)
@@ -123,13 +109,14 @@ def compare_poles(pos: Sequence[str], neg: Sequence[str], *, paired: bool = Fals
 
 
 # ------------------------------------------------------------------------------------ classifiers
-def _features(texts: Sequence[str], features: Union[str, Callable[[List[str]], Any]], vocabulary: List[str],
-              groups: Optional[Dict[str, Any]]) -> np.ndarray:
+def _features(texts: Sequence[str], features: Any, vocabulary: List[str]) -> np.ndarray:
+    if isinstance(features, dict):
+        return np.array([[float(fn(t)) for fn in features.values()] for t in texts], dtype=np.float64)
     if callable(features):
         return np.asarray(features(list(texts)), dtype=np.float64)
-    if features == "surface":
-        rows = [surface_features(t, groups) for t in texts]
-        return np.array([[r[k] for k in rows[0]] for r in rows], dtype=np.float64)
+    if features == "length":
+        rows = [text_features(t) for t in texts]
+        return np.array([[r["chars"], r["words"]] for r in rows], dtype=np.float64)
     index = {w: i for i, w in enumerate(vocabulary)}
     X = np.zeros((len(texts), len(vocabulary)))
     for i, t in enumerate(texts):
@@ -142,23 +129,25 @@ def _features(texts: Sequence[str], features: Union[str, Callable[[List[str]], A
 def surface_baseline(
     pos: Sequence[str],
     neg: Sequence[str],
-    features: Union[str, Callable[[List[str]], Any]] = "words",
+    features: Any = "words",
     *,
+    vocabulary: Optional[Sequence[str]] = None,
     paired: bool = False,
     folds: int = 8,
     C: float = 1.0,
-    groups: Optional[Dict[str, Any]] = None,
     seed: int = 0,
 ) -> Dict[str, Any]:
     """How well a classifier that sees only ``features`` tells the poles apart, cross-validated:
 
-    - ``"words"``: word counts (a bag of words); ``"function_words"``: counts of
-      :data:`FUNCTION_WORDS` only; ``"surface"``: :func:`surface_features`;
+    - ``"words"``: word counts (a bag of words), of every word or only of ``vocabulary`` (e.g. a
+      list of function words);
+    - ``"length"``: the length in characters and words;
+    - ``{name: check}``: your checks (functions ``text -> number``);
     - a function ``texts -> array (texts, dim)``: any representation, e.g. a sentence embedding.
 
     A logistic regression on standardized features (``C``), ``folds``-fold. With ``paired``, it
     learns from each pair which member is positive (the two members of a pair are never split
-    between training and test), so pair-level differences such as topic cancel out. Compare its
+    between training and test), so what the members of a pair share cancels out. Compare its
     ``accuracy`` with a probe's: a probe that does not beat the words did not need the model.
     """
     try:
@@ -171,14 +160,13 @@ def surface_baseline(
     pos, neg = [str(t) for t in pos], [str(t) for t in neg]
     if paired and len(pos) != len(neg):
         raise ValueError("paired poles need the same number of texts")
-    vocabulary: List[str] = []
+    words: List[str] = []
     if features == "words":
-        vocabulary = sorted({w for t in pos + neg for w in _words(t)})
-    elif features == "function_words":
-        vocabulary = list(FUNCTION_WORDS)
-    elif not callable(features) and features != "surface":
-        raise ValueError(f"features must be 'words', 'function_words', 'surface' or a function; got {features!r}")
-    P, N = _features(pos, features, vocabulary, groups), _features(neg, features, vocabulary, groups)
+        words = sorted({w.lower() for w in vocabulary}) if vocabulary is not None else \
+            sorted({w for t in pos + neg for w in _words(t)})
+    elif not (callable(features) or isinstance(features, dict) or features == "length"):
+        raise ValueError(f"features must be 'words', 'length', a dict of checks or a function; got {features!r}")
+    P, N = _features(pos, features, words), _features(neg, features, words)
     if paired:
         diff = P - N
         X = np.vstack([diff, -diff])
@@ -194,9 +182,11 @@ def surface_baseline(
         k = int(min(folds, len(P), len(N)))
         model = make_pipeline(StandardScaler(), LogisticRegression(C=C, max_iter=3000))
         scores = cross_val_score(model, X, y, cv=StratifiedKFold(k, shuffle=True, random_state=seed))
-    return {"features": features if isinstance(features, str) else getattr(features, "__name__", "a function"),
-            "accuracy": float(np.mean(scores)), "sd": float(np.std(scores)), "folds": k, "paired": bool(paired),
-            "chance": 0.5 if paired else float(max(len(P), len(N)) / (len(P) + len(N))), "n_features": int(X.shape[1])}
+    name = (features if isinstance(features, str) else "checks: " + ", ".join(features) if isinstance(features, dict)
+            else getattr(features, "__name__", "a function"))
+    return {"features": name, "accuracy": float(np.mean(scores)), "sd": float(np.std(scores)), "folds": k,
+            "paired": bool(paired), "chance": 0.5 if paired else float(max(len(P), len(N)) / (len(P) + len(N))),
+            "n_features": int(X.shape[1])}
 
 
 # ----------------------------------------------------------------------------- words and variety
@@ -288,19 +278,20 @@ class DatasetAudit:
     def markdown(self) -> str:
         lines = [f"# Audit: {self.name}", "", f"{self.n_pos} positive and {self.n_neg} negative texts"
                  + (", in pairs." if self.paired else "."), ""]
-        lines += ["## Classifiers that should stay near chance", "",
+        lines += ["## Classifiers that see only part of the texts", "",
                   "| features | accuracy | chance |", "|---|---|---|"]
         for name, b in self.baselines.items():
-            lines.append(f"| {name} | {b['accuracy']:.2f} ± {b['sd']:.2f} | {b['chance']:.2f} |")
-        lines += ["", "Words alone are expected to tell the poles apart (the concept is in the words); surface "
-                  "features and function words are not.", "",
-                  "## Surface features (largest differences first)", "",
+            lines.append(f"| {name} | {b['accuracy']:.2f} +/- {b['sd']:.2f} | {b['chance']:.2f} |")
+        lines += ["", "Words are expected to tell the poles apart (the concept is in the words): a probe that "
+                  "does not read better than them did not need the model. Length and your checks should "
+                  "stay near chance.", "",
+                  "## Features (largest differences first)", "",
                   "| feature | positive | negative | difference (SDs) | p |", "|---|---|---|---|---|"]
         for r in self.features[:12]:
             lines.append(f"| {r['feature']} | {r['mean_pos']:.2f} | {r['mean_neg']:.2f} | {r['std_diff']:+.2f} | "
                          f"{r['p']:.3g} |")
         for pole, label in (("pos", "positive"), ("neg", "negative")):
-            lines += ["", f"## Words that most mark the {label} pole", "",
+            lines += ["", f"## Words much more frequent in the {label} pole", "",
                       ", ".join(f"{w['word']} ({w['z']:+.1f})" for w in self.words[pole][:20])]
         f = self.formulaicity
         lines += ["", "## Variety", "",
@@ -308,7 +299,7 @@ class DatasetAudit:
                   f"{len(f['near_duplicates'])}.",
                   "- Most repeated openings: " + ", ".join(f"\"{o}\" ({c})" for o, c in f["top_openings"][:6]) + "."]
         for pole, d in self.diversity.items():
-            lines.append(f"- {pole}: type-token {d['type_token']:.2f}, {d['mean_words']:.1f} ± {d['length_sd']:.1f} "
+            lines.append(f"- {pole}: type-token {d['type_token']:.2f}, {d['mean_words']:.1f} +/- {d['length_sd']:.1f} "
                          "words" + (f", embedding dispersion {d['embedding_dispersion']:.2f}"
                                     if "embedding_dispersion" in d else "") + ".")
         lines += [""] + [f"- {n}" for n in self.notes]
@@ -329,35 +320,37 @@ def audit_dataset(
     *,
     paired: bool = False,
     name: str = "dataset",
+    checks: Optional[Dict[str, Check]] = None,
     ids: Optional[Sequence[str]] = None,
     embed: Optional[Callable[[List[str]], Any]] = None,
-    groups: Optional[Dict[str, Any]] = None,
     n_tokens: Optional[Callable[[str], int]] = None,
     folds: int = 8,
     save: Optional[bool] = None,
     out_dir: Optional[str] = None,
 ) -> DatasetAudit:
-    """Every check of this module on a two-pole dataset: the surface features, the classifiers on
-    surface features, function words and words (and on ``embed(texts)`` when given), the words that
-    mark each pole, formulaic writing and variety. Saved by default (``audit.json`` and
-    ``audit.md``) to ``out_dir`` or ``audits/<name>-<time>`` under the session's ``output_root``."""
+    """Every check of this module on a two-pole dataset: length and your ``checks`` compared
+    between the poles; classifiers that see only words, only length, only the checks (and only
+    ``embed(texts)`` when given); the words much more frequent in each pole; formulaic writing and
+    variety. Saved by default (``audit.json`` and ``audit.md``) to ``out_dir`` or
+    ``audits/<name>-<time>`` under the session's ``output_root``."""
     pos, neg = [str(t) for t in pos], [str(t) for t in neg]
-    baselines = {}
-    notes = []
-    for feats in ("surface", "function_words", "words"):
-        baselines[feats] = surface_baseline(pos, neg, feats, paired=paired, folds=folds, groups=groups)
+    baselines = {"words": surface_baseline(pos, neg, "words", paired=paired, folds=folds),
+                 "length": surface_baseline(pos, neg, "length", paired=paired, folds=folds)}
+    if checks:
+        baselines["checks"] = surface_baseline(pos, neg, dict(checks), paired=paired, folds=folds)
     if embed is not None:
         baselines["embeddings"] = surface_baseline(pos, neg, embed, paired=paired, folds=folds)
-    for feats in ("surface", "function_words"):
-        b = baselines[feats]
-        if b["accuracy"] > b["chance"] + 2 * max(b["sd"], 0.02):
-            notes.append(f"The {feats.replace('_', ' ')} classifier tells the poles apart ({b['accuracy']:.2f}): "
-                         "the poles differ in more than the concept.")
+    notes = []
+    for key in ("length", "checks"):
+        b = baselines.get(key)
+        if b and b["accuracy"] > b["chance"] + 2 * max(b["sd"], 0.02):
+            notes.append(f"The {key} classifier tells the poles apart ({b['accuracy']:.2f}): the poles differ in "
+                         "more than the concept.")
     if ids is None and paired:
         ids = [f"{i}:pos" for i in range(len(pos))] + [f"{i}:neg" for i in range(len(neg))]
     audit = DatasetAudit(
         name=name, n_pos=len(pos), n_neg=len(neg), paired=paired,
-        features=compare_poles(pos, neg, paired=paired, groups=groups, n_tokens=n_tokens),
+        features=compare_poles(pos, neg, paired=paired, checks=checks, n_tokens=n_tokens),
         baselines=baselines, words=distinctive_words(pos, neg),
         formulaicity=formulaicity(pos + neg, ids),
         diversity={"positive": diversity(pos, None if embed is None else embed(pos)),

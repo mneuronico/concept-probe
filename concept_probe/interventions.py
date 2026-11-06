@@ -417,16 +417,20 @@ class Patch(Intervention):
 class Rotate(Intervention):
     """Rotate the residual stream by ``angle`` radians in the plane of ``u`` and ``v`` (from ``u``
     toward ``v``), leaving the rest of it as it is. ``u`` and ``v`` per layer as in :class:`Add`;
-    they need not be orthogonal or unit vectors. Computed in at least float32."""
+    they need not be orthogonal or unit vectors. The rotation is about ``center`` (a point per
+    layer, as the vectors; by default the origin): for a cycle of classes, the centroids' center.
+    Computed in at least float32."""
 
     def __init__(self, u: VectorSpec, v: VectorSpec, angle: float, *, layers: Optional[Sequence[int]] = None,
-                 positions: PositionSpec = None, label: Optional[str] = None):
+                 center: Optional[VectorSpec] = None, positions: PositionSpec = None, label: Optional[str] = None):
         self._u = _per_layer(u, layers, "Rotate u")
         self._v = _per_layer(v, layers, "Rotate v")
+        self._center = None if center is None else _per_layer(center, layers, "Rotate center")
         self.angle = float(angle)
         self.positions = _normalize_positions(positions)
         self.label = label
         self._by_layer: Optional[Dict[int, torch.Tensor]] = None
+        self._centers: Dict[int, torch.Tensor] = {}
 
     def prepare(self, n_blocks: int) -> None:
         us, vs = _resolve(self._u, n_blocks, "Rotate u"), _resolve(self._v, n_blocks, "Rotate v")
@@ -434,6 +438,12 @@ class Rotate(Intervention):
             raise ValueError("Rotate: u and v must be given at the same layers")
         self._by_layer = {l: torch.as_tensor(_orthonormal_rows(np.stack([us[l], vs[l]])), dtype=torch.float64)
                           for l in us}
+        self._centers = {}
+        if self._center is not None:
+            centers = _resolve(self._center, n_blocks, "Rotate center")
+            if set(centers) != set(us):
+                raise ValueError("Rotate: center must be given at the same layers as u and v")
+            self._centers = {l: torch.as_tensor(c, dtype=torch.float64) for l, c in centers.items()}
 
     def layer_list(self, n_blocks: int) -> List[int]:
         if self._by_layer is None:
@@ -443,7 +453,8 @@ class Rotate(Intervention):
     def edit(self, layer: int, hidden: torch.Tensor, where: Where) -> torch.Tensor:
         h = _work(hidden)
         E = self._by_layer[layer].to(h.device, h.dtype)  # (2, dim): e1 along u, e2 in the plane, orthogonal to it
-        a, b = h @ E[0], h @ E[1]
+        rel = h - self._centers[layer].to(h.device, h.dtype) if layer in self._centers else h
+        a, b = rel @ E[0], rel @ E[1]
         c, s = math.cos(self.angle), math.sin(self.angle)
         new = h + ((a * c - b * s) - a)[..., None] * E[0] + ((a * s + b * c) - b)[..., None] * E[1]
         return _apply_masked(hidden, new.to(hidden.dtype), where.mask(self.positions))

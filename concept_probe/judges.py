@@ -14,6 +14,9 @@ ready made. A judge answers a rubric for many texts:
 - :class:`LocalJudge`: a model loaded here (transformers). It reads the probability of each answer
   after the question, with no sampling, and nothing leaves the machine; its score is the expected
   value of the answers' numbers.
+- :class:`AgentJudge`: whoever answers a task written to a folder, for example an agent (or a
+  subagent it delegates to) working with this library: no API and no model here. The task file
+  says what to do, how to read the input and exactly how to write the answer.
 
 Every judge has ``rate(texts, rubric)`` (the answers), ``score(texts, rubric)`` (their numbers) and
 ``measure(rubric)``, a function ``texts -> numbers`` to pass to
@@ -97,6 +100,10 @@ class Judge:
 
     def describe(self) -> Dict[str, Any]:
         raise NotImplementedError
+
+    def complete(self, system: str, user: str) -> str:
+        """A free-text reply to ``user`` after ``system`` (used by :mod:`concept_probe.critique`)."""
+        raise NotImplementedError(f"{type(self).__name__} does not write free text")
 
 
 # ------------------------------------------------------------------------------------- API judges
@@ -282,6 +289,119 @@ class LocalJudge(Judge):
         values = np.array(list(rubric.answers.values()), dtype=np.float64)
         return self.probabilities(texts, rubric) @ values
 
+    def complete(self, system: str, user: str, max_new_tokens: int = 1024) -> str:
+        """The model's greedy reply to ``user`` after ``system``."""
+        from .generation import generate
+
+        return generate(self.model, self.tokenizer, [user], system=system, max_new_tokens=max_new_tokens,
+                        save=False)[0].text
+
+
+# ----------------------------------------------------------------------------------- agent judges
+class AnswersPending(RuntimeError):
+    """The task was written and nobody has answered it yet: ``path`` is its folder."""
+
+    def __init__(self, path: str, message: str):
+        super().__init__(message)
+        self.path = path
+
+
+def _task_id(*parts: Any) -> str:
+    import hashlib
+
+    return hashlib.sha1(json.dumps(parts, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:10]
+
+
+class AgentJudge(Judge):
+    """A judge that is whoever answers a task written to a folder: an agent such as Claude Code
+    (or a subagent it delegates to), another program, or a person. No API, no model loaded here.
+
+    :meth:`rate` writes ``<folder>/<rubric name>-<id>/`` with ``TASK.md`` (what to do, how to read
+    the input, the exact format of the answer and where to save it) and ``items.jsonl`` (one text
+    per line, with its id), and raises :class:`AnswersPending` with that folder. Once
+    ``answers.jsonl`` is written there, calling :meth:`rate` again with the same texts reads it,
+    checks that every text has an allowed answer, and returns them. The id depends on the texts and
+    the rubric, so a different request never reads another's answers. :meth:`request` only writes.
+    """
+
+    def __init__(self, folder: str):
+        self.folder = str(folder)
+
+    def describe(self) -> Dict[str, Any]:
+        return {"judge": "agent", "folder": self.folder}
+
+    def task_dir(self, texts: Sequence[str], rubric: Rubric) -> Path:
+        return Path(self.folder) / f"{rubric.name}-{_task_id(rubric.to_dict(), [str(t) for t in texts])}"
+
+    def request(self, texts: Sequence[str], rubric: Rubric) -> str:
+        """Write the task (if it is not there yet) and return its folder."""
+        path = self.task_dir(texts, rubric)
+        path.mkdir(parents=True, exist_ok=True)
+        with open(path / "items.jsonl", "w", encoding="utf-8") as f:
+            for i, t in enumerate(texts):
+                f.write(json.dumps({"id": i, "text": str(t)}, ensure_ascii=False) + "\n")
+        answers = ", ".join(f'"{a}"' for a in rubric.answers)
+        guide = f"\n\n{rubric.guide}" if rubric.guide else ""
+        (path / "TASK.md").write_text(f"""# Rating task: {rubric.name}
+
+Rate each text of `items.jsonl` (in this folder) by answering this question about it:
+
+> {rubric.question}{guide}
+
+The only allowed answers are: {answers}.
+
+## Input
+
+`items.jsonl` has one JSON object per line: `{{"id": <integer>, "text": "<the text>"}}`. There are
+{len(texts)} texts, with ids 0 to {len(texts) - 1}.
+
+## What to write
+
+Write `answers.jsonl` in this folder: one JSON object per line, one line per text, exactly
+
+    {{"id": <the text's id>, "answer": <one of the allowed answers, as a string>}}
+
+Answer every id once. Judge each text on its own, from the text alone: do not compare texts, do not
+skip any, and do not add other fields or lines. If the work is split (for example among subagents),
+merge every part into this one file before you finish.
+
+When the file is written, the code that asked for the ratings reads it (calling it again with the
+same texts and rubric) and checks that every id has an allowed answer; anything missing or not
+allowed is reported, so it can be fixed in the file.
+""", encoding="utf-8")
+        return str(path)
+
+    def rate(self, texts: Sequence[str], rubric: Rubric) -> List[str]:
+        path = self.task_dir(texts, rubric)
+        answers_path = path / "answers.jsonl"
+        if not answers_path.exists():
+            self.request(texts, rubric)
+            raise AnswersPending(str(path), f"The ratings are a task for an agent (or anyone): follow {path / 'TASK.md'} "
+                                            f"and write {answers_path}; then call this again with the same texts.")
+        out: Dict[int, str] = {}
+        problems: List[str] = []
+        for n, line in enumerate(answers_path.read_text(encoding="utf-8").splitlines(), 1):
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+                i, answer = int(item["id"]), rubric.match(item["answer"])
+            except Exception:
+                problems.append(f"line {n} is not {{\"id\": <integer>, \"answer\": <answer>}}: {line[:80]!r}")
+                continue
+            if answer is None:
+                problems.append(f"id {i}: {item['answer']!r} is not an allowed answer")
+            elif not 0 <= i < len(texts):
+                problems.append(f"id {i} is not an id of the texts (0 to {len(texts) - 1})")
+            else:
+                out[i] = answer
+        missing = [i for i in range(len(texts)) if i not in out]
+        if missing:
+            problems.append(f"{len(missing)} ids have no answer (the first is {missing[0]})")
+        if problems:
+            raise ValueError(f"{answers_path} cannot be used: " + "; ".join(problems[:5]))
+        return [out[i] for i in range(len(texts))]
+
 
 # --------------------------------------------------------------------------------- saved batches
 def rate_saved(batch_dir: str, judge: Judge, rubric: Rubric = COHERENCE) -> List[Dict[str, Any]]:
@@ -302,4 +422,5 @@ def rate_saved(batch_dir: str, judge: Judge, rubric: Rubric = COHERENCE) -> List
     return out
 
 
-__all__ = ["Rubric", "COHERENCE", "Judge", "APIJudge", "LocalJudge", "PROVIDERS", "rate_saved"]
+__all__ = ["Rubric", "COHERENCE", "Judge", "APIJudge", "LocalJudge", "AgentJudge", "AnswersPending", "PROVIDERS",
+           "rate_saved"]

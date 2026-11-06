@@ -15,32 +15,23 @@ from .directions import Eraser, fit_directions, make_estimator, register_estimat
 from .linear_probe import Calibration
 from .evaluation import (EvalSet, ReadingEvaluation, confound_check, cross_reading, evaluate_reading,
                          label_shuffle_control, learning_curve, red_team)
-from .geometry import (CircleFit, ClassDirections, RegressionDirections, centroid_subspace, fit_circle,
-                       fit_classes, fit_regression)
+from .structure import Target, TargetProbe, TargetReading, TargetScores, TargetShape, read_target, target_shape
 from .datasets import (DatasetAudit, audit_dataset, compare_poles, distinctive_words, diversity,
-                       formulaicity, surface_baseline, surface_features)
+                       formulaicity, surface_baseline, text_features, count_matches)
 from .stats import accuracy, auroc, compare_scorers, random_directions_null
 from .modeling import ModelBundle, QUANTIZATION_LEVELS
 from .reading import EmptySpanError, Readout, Reps, read_encoded, read_texts
 from .record import Choice
 from .settings import configure
+from .guide import guide
 from .interventions import Ablate, Add, Compose, Edit, Intervention, Patch, Rotate, Where, intervene
 from .generation import AnswerLogprobs, Generation, Generations, TokenStep, answer_logprobs, generate
 from .scoring import ScoredItem, Scores
-from .steering_eval import CoherenceRule, SteeringEvaluation, evaluate_steering, repetition_rate
-from .judges import COHERENCE, APIJudge, Judge, LocalJudge, Rubric, rate_saved
+from .steering_eval import CoherenceRule, SteeringEvaluation, evaluate_steering, exact_match, repetition_rate
+from .judges import COHERENCE, AgentJudge, AnswersPending, APIJudge, Judge, LocalJudge, Rubric, rate_saved
+from .critique import Critique, critique_dataset, critique_task, read_critique
 from .console import ConsoleLogger
 from .concept_runner import train_concept_from_json
-from .reporting import generate_multi_probe_report
-from .eval_system import (
-    EvalRunResult,
-    aggregate_eval_batches,
-    rate_batch_coherence_safe,
-    rehydrate_batch_analysis,
-    run_multi_scored_eval,
-    run_scored_eval,
-    simple_equality_evaluator,
-)
 
 
 __all__ = [
@@ -69,18 +60,19 @@ __all__ = [
     "confound_check",
     "red_team",
     "Eraser",
-    "fit_classes",
-    "ClassDirections",
-    "fit_regression",
-    "RegressionDirections",
-    "centroid_subspace",
-    "fit_circle",
-    "CircleFit",
+    "Target",
+    "TargetProbe",
+    "TargetScores",
+    "TargetReading",
+    "TargetShape",
+    "read_target",
+    "target_shape",
     "audit_dataset",
     "DatasetAudit",
     "compare_poles",
     "surface_baseline",
-    "surface_features",
+    "text_features",
+    "count_matches",
     "distinctive_words",
     "formulaicity",
     "diversity",
@@ -100,6 +92,7 @@ __all__ = [
     "read_encoded",
     "Choice",
     "configure",
+    "guide",
     "multi_probe_score_prompts",
     "Intervention",
     "Add",
@@ -122,20 +115,19 @@ __all__ = [
     "SteeringEvaluation",
     "CoherenceRule",
     "repetition_rate",
+    "exact_match",
     "Rubric",
     "COHERENCE",
     "Judge",
     "APIJudge",
     "LocalJudge",
+    "AgentJudge",
+    "AnswersPending",
+    "Critique",
+    "critique_task",
+    "read_critique",
+    "critique_dataset",
     "rate_saved",
     "ConsoleLogger",
     "train_concept_from_json",
-    "EvalRunResult",
-    "run_scored_eval",
-    "run_multi_scored_eval",
-    "simple_equality_evaluator",
-    "rehydrate_batch_analysis",
-    "aggregate_eval_batches",
-    "rate_batch_coherence_safe",
-    "generate_multi_probe_report",
 ]

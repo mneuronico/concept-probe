@@ -63,7 +63,7 @@ include-package-data = true
 include = ["concept_probe*"]
 
 [tool.setuptools.package-data]
-concept_probe = ["defaults.json"]
+concept_probe = ["defaults.json", "guides/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -8,10 +8,7 @@ def test_public_api_surface_is_exposed():
         "ConceptSpec",
         "ConceptProbe",
         "ProbeWorkspace",
-        "EvalRunResult",
         "ConsoleLogger",
-        "aggregate_eval_batches",
-        "generate_multi_probe_report",
         "load_defaults",
         "multi_probe_score_prompts",
         "rate_saved",
@@ -19,15 +16,16 @@ def test_public_api_surface_is_exposed():
         "LocalJudge",
         "Rubric",
         "evaluate_steering",
+        "exact_match",
+        "SteeringEvaluation",
+        "AgentJudge",
+        "critique_task",
+        "read_target",
+        "target_shape",
         "intervene",
         "generate",
-        "rate_batch_coherence_safe",
-        "rehydrate_batch_analysis",
         "resolve_config",
-        "run_multi_scored_eval",
-        "run_scored_eval",
         "score_text_tokens",
-        "simple_equality_evaluator",
         "train_concept_from_json",
     }
 
@@ -77,3 +75,15 @@ def test_concept_spec_round_trip():
     assert concept.to_dict()["name"] == "calm_vs_urgent"
     assert concept.eval_pos_texts == ["steady"]
     assert concept.eval_neg_texts == ["rush"]
+
+
+def test_the_guides_ship_with_the_package():
+    listing = concept_probe.guide()
+    for name in ("workflow", "datasets", "steering", "delegating"):
+        assert f"- {name}:" in listing and concept_probe.guide(name).startswith("# ")
+    try:
+        concept_probe.guide("nope")
+    except ValueError as exc:
+        assert "workflow" in str(exc)
+    else:
+        raise AssertionError("an unknown guide should raise")

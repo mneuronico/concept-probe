@@ -129,3 +129,72 @@ def test_a_judge_is_one_more_measure(probe, monkeypatch):
     assert sum(sent) == len(ev.scores) == 3 * 3 and max(sent) == 4  # every completion, at most 4 per request
     assert [it.info["coherence"] for it in ev.scores][:3] == [1.0, 0.5, 0.0]
     assert ev.measures["coherence"] == "function of the texts"
+
+
+# ------------------------------------------------------------------ behavioral measures, added later
+def test_an_item_aware_measure_checks_answers():
+    from concept_probe import exact_match
+
+    correct = exact_match()
+    items = [{"expected": "42"}, {"expected": ["a", "b"]}, {"expected": 4}]
+    np.testing.assert_array_equal(correct(["42.", "b", " 4.0 "], items), [1.0, 1.0, 1.0])
+    with_marker = exact_match(marker="ANSWER:")
+    np.testing.assert_array_equal(with_marker(["Work\nANSWER: 42", "no marker 42"], items[:2]), [1.0, 0.0])
+    assert exact_match(case_sensitive=False)(["PARIS"], [{"expected": "paris"}])[0] == 1.0
+    with pytest.raises(ValueError, match="expected"):
+        correct(["x"], [{}])
+
+
+def test_measures_can_be_added_after_the_sweep_by_an_agent(probe, tmp_path):
+    from concept_probe import AgentJudge, AnswersPending, Rubric, SteeringEvaluation, exact_match
+
+    items = [{"expected": "pppp"}, {"expected": "zzzz"}]
+    ev = evaluate_steering(probe, QUESTIONS[:2], [3.0], items=items, n_random=1, max_new_tokens=4, save=True,
+                           out_dir=str(tmp_path / "sweep"), html=False, measures={"correct": exact_match()})
+    assert ev.measures["correct"] == "function of the texts" and "correct" in ev.row(3.0)["effects"]
+    judge = AgentJudge(str(tmp_path / "tasks"))
+    rubric = Rubric("has_p", "Does the text contain the letter p?", {"yes": 1.0, "no": 0.0})
+    with pytest.raises(AnswersPending) as pending:
+        ev.add_measure("has_p", judge.measure(rubric))
+    task = pending.value.path
+    assert "answers.jsonl" in open(f"{task}/TASK.md", encoding="utf-8").read()
+    rows = [json.loads(line) for line in open(f"{task}/items.jsonl", encoding="utf-8")]
+    with open(f"{task}/answers.jsonl", "w", encoding="utf-8") as f:  # what the agent writes
+        for r in rows:
+            f.write(json.dumps({"id": r["id"], "answer": "yes" if "p" in r["text"] else "no"}) + "\n")
+    ev.add_measure("has_p", judge.measure(rubric))
+    assert ev.row(3.0)["effects"]["has_p"]["change"] >= 0
+    reloaded = SteeringEvaluation.load(str(tmp_path / "sweep"))
+    assert set(reloaded.measures) == {"concept", "correct", "has_p"} and reloaded.items == items
+    assert reloaded.row(3.0)["effects"]["has_p"] == ev.row(3.0)["effects"]["has_p"]
+    with pytest.raises(ValueError, match="already"):
+        reloaded.add_measure("has_p", [0.0] * len(reloaded.scores))
+
+
+def _synthetic(doses, n_prompts=200, seed=0):
+    from concept_probe import Scores
+    from concept_probe.scoring import ScoredItem
+    from concept_probe.steering_eval import SteeringEvaluation
+
+    rng = np.random.default_rng(seed)
+    items = []
+    for p in range(n_prompts):
+        for d in doses:
+            score = rng.normal() + d  # steering shifts the score
+            right = float(rng.random() < 1 / (1 + np.exp(-(score - d))))
+            items.append(ScoredItem(p, "x", np.zeros(2, np.int64), ["a", "b"], (1, 2), {}, {}, {}, {}, {}, {},
+                                    {"dose": d, "control": None, "score": score, "correct": right,
+                                     "perplexity": 2.0, "repetition": 0.0, "n_tokens": 5}))
+    return SteeringEvaluation(Scores("generations", [], items), list(doses), {"score": "x", "correct": "x"}, [], {},
+                              {"n_random": 0}, rule=CoherenceRule())
+
+
+def test_relate_does_not_depend_on_the_range_of_doses():
+    pytest.importorskip("statsmodels")
+    narrow = _synthetic([0.0]).relate("score", "correct")
+    wide = _synthetic([-4.0, -2.0, 0.0, 2.0, 4.0]).relate("score", "correct")
+    assert narrow["odds_ratio_per_sd"] > 1.5
+    assert wide["odds_ratio_per_sd"] == pytest.approx(narrow["odds_ratio_per_sd"], rel=0.3)
+    assert "bias-reduced" in wide["model"] and wide["n_prompts"] == 200 and wide["ci95"][0] > 0
+    linear = _synthetic([0.0, 1.0]).relate("correct", "score")
+    assert linear["model"].startswith("linear") and "odds_ratio_per_sd" not in linear

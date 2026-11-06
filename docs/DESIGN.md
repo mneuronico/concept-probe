@@ -482,6 +482,31 @@ regresión, subespacios y ajuste circular; receta para correr varios modelos.
   de dentro de la evaluación; varias clases, regresión y círculo son funciones sobre arrays y no
   una clase de probe con calibraciones y guardado.*
 
+**Etapa 6b — Generalidad.** Pedida al revisar la etapa 6 (2026-11-05): que nada parezca hecho para un
+proyecto. *Hecha el 2026-11-05.* Geometría pasa a una maquinaria general (`structure.py`): un
+objetivo (categorías, número, orden, ciclo, lugares dados) y dos preguntas, si se puede leer
+(`read_target`, con mapas de centroide, lineal, a través de la forma o cualquier modelo) y si los
+centroides tienen su forma (`target_shape`), cada una con su control de objetivos mezclados; la
+probe de dos polos no se toca (los tests de referencia siguen iguales). Con las activaciones de M7
+(Llama 3.2 3B) reproduce lo hecho a mano: el ajuste afín del círculo de días y meses coincide capa
+por capa, leer a través del plano nombra el día de frases nuevas (100% en la capa 16, meses 92% en
+la 0) y las cuatro emociones se leen al 97.5% en la capa 11; leer la posición con un mapa lineal
+no prueba la forma (los días mezclados también se leen al 100%). La auditoría no chequea nada
+particular por defecto (largo, palabras, duplicados, variedad) y toma métricas propias. Agentes:
+un juez por encargo (`AgentJudge`) y la crítica del dataset escriben su tarea a una carpeta y leen
+la respuesta; las guías van en el paquete (`concept_probe.guide()`) y `AGENTS.md` las señala. Las
+evaluaciones de comportamiento pasan a ser evaluaciones del empuje con medidas por ítem
+(`exact_match`), medidas agregadas después y `relate`; `eval_system.py` y `reporting.py` se sacan.
+Después, a pedido: `TargetProbe`, una probe hacia cualquier objetivo que, como la de dos polos,
+puntúa activaciones nuevas (un lugar en el ciclo, un valor, la clase más cercana, cuánto se ajusta),
+lee textos enteros o token por token, se guarda y se carga, y empuja: a lo largo de la forma
+(`steering`: girar en el plano de los centroides alrededor del centro del ciclo) o de una clase a
+otra (`toward`: la diferencia completa entre centroides). En Qwen 2.5 0.5B, frases nuevas caen en
+su día (jueves en 2.86 pasos desde el lunes); girar un paso mueve la posición leída exactamente un
+día, pero no cambia la respuesta del modelo a "mañana" (como en M7 con Llama 3B), y el paso entero
+entre centroides sí (4 a 6 de 7 en las capas 2 a 16, contra 0 a 2 de 7 de un paso al azar del
+mismo largo).
+
 **Etapa 7 — Volver a correr lo representativo del workshop.** Los tests de referencia de cada etapa
 prueban la API de hoy con un modelo falso; esta etapa prueba todo junto con modelos de verdad. En
 probes-workshop, un script por experimento rehace su parte central con la librería nueva, sin usar

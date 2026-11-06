@@ -196,27 +196,3 @@ def test_multi_probe_steers_with_the_steering_probe_settings(tmp_path, monkeypat
     config = json.load(open(os.path.join(out.settings["run_dir"], "config.json")))
     assert config["steer_distribute"] is False and config["steer_probe"] == "b"
     assert out[0].info["steer_alpha_per_layer"] == {0: 1.0}
-
-
-# ------------------------------------------------------------- marker
-def test_the_multi_probe_eval_applies_the_marker(tmp_path, monkeypatch):
-    from concept_probe import run_multi_scored_eval
-
-    probe = _probe(tmp_path, monkeypatch, "a")
-    items = [{"prompt": "hi", "expected": "pp"}]
-    kwargs = dict(analyze=False, output_root=str(tmp_path / "m"))
-    assert run_multi_scored_eval([probe], items, **kwargs).per_sample[0]["correct"] is True
-    # the completion 'pp' has no ':', so with the marker it cannot match
-    assert run_multi_scored_eval([probe], items, marker=":", **kwargs).per_sample[0]["correct"] is False
-
-
-def test_a_marker_with_a_custom_evaluator_raises():
-    from concept_probe import run_multi_scored_eval, run_scored_eval
-
-    fake = SimpleNamespace(console=None, concept=SimpleNamespace(name="x"))
-    custom = lambda completion, item: {"correct": True}  # noqa: E731
-    with pytest.raises(ValueError, match="marker"):
-        run_scored_eval(fake, [{"prompt": "hi"}], evaluator=custom, marker=":")
-    with pytest.raises(ValueError, match="marker"):
-        run_multi_scored_eval([fake], [{"prompt": "hi"}], evaluator=custom, marker=":")
-
