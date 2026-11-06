@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 (unreleased)
+## 0.2.0 (2026-11-06)
 
 A redesign. The library is now a set of layers, each usable alone, instead of one configuration-driven
 pipeline. Code written for 0.1.0 does not run unchanged, and runs saved by 0.1.0 do not load: fit
