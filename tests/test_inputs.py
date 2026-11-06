@@ -4,7 +4,6 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-import torch
 
 from concept_probe import Calibration, ReadContext, preview_input
 from concept_probe.config import ConceptSpec, resolve_config
@@ -42,7 +41,7 @@ def test_preview_of_a_user_turn_and_of_a_generation_prompt():
     assert preview_input(tok, "ppx", role="user")["input_text"] == "^<u>ppx|"
     assert preview_input(tok, "ppx", role="user", system="S")["input_text"] == "^<s>S|<u>ppx|"
     gen = preview_input(tok, "ppx", generation=True)
-    assert gen["input_text"] == "^<u>ppx|<a>" and gen["text_span"] is None
+    assert gen["input_text"] == "^<u>ppx|<a>" and gen["span_text"] == "ppx"  # the text, inside the prompt
 
 
 def test_a_template_that_strips_the_text_warns_once():

@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 
-from concept_probe import (Ablate, Add, Compose, Edit, Encoded, Patch, Rotate, intervene, read_encoded,
+from concept_probe import (Ablate, Add, Compose, Edit, Encoded, Patch, Rotate, generate, intervene, read_encoded,
                            read_texts)
 from concept_probe.modeling import get_transformer_layers
 from fakes import CharChatTok
@@ -138,6 +138,33 @@ def test_patch_writes_donor_activations_at_the_positions_and_later_layers_follow
     assert not np.allclose(patched[-1, 2], receiver_clean[-1, 2])
     with pytest.raises(ValueError, match="rows"):
         Patch(1, [0, 1], donor[0, 1])
+
+
+def test_a_patch_with_one_donor_per_prompt_equals_patching_each_prompt_alone():
+    from concept_probe import answer_logprobs
+
+    model, tok = TinyCausalLM(), CharChatTok()
+    prompts, answers = ["nn x", "pp z", "xz n"], ["p", "n"]
+    rng = np.random.default_rng(0)
+    last = rng.normal(size=(3, 1, 16)).astype(np.float32)  # each prompt's own value at its last position
+    together = answer_logprobs(model, tok, prompts, answers, intervention=Patch(1, [-1], last), save=False)
+    for i, p in enumerate(prompts):
+        alone = answer_logprobs(model, tok, [p], answers, intervention=Patch(1, [-1], last[i]), save=False)
+        np.testing.assert_allclose(together.logprobs[i], alone.logprobs[0], atol=1e-9)
+    # each prompt its own positions too
+    own = [[-1], [-2, -1], [-3]]
+    values = [rng.normal(size=(len(p), 16)).astype(np.float32) for p in own]
+    together = answer_logprobs(model, tok, prompts, answers, intervention=Patch(1, own, values), save=False)
+    for i, p in enumerate(prompts):
+        alone = answer_logprobs(model, tok, [p], answers, intervention=Patch(1, own[i], values[i]), save=False)
+        np.testing.assert_allclose(together.logprobs[i], alone.logprobs[0], atol=1e-9)
+    gens = generate(model, tok, prompts, max_new_tokens=2, intervention=Patch(1, [-1], last), save=False)
+    assert len(gens) == 3
+    with pytest.raises(RuntimeError, match="which input"):  # a direct call does not say which input a row is
+        with intervene(model, Patch(1, [-1], last)):
+            _stream(model, ["nn x"])
+    with intervene(model, Patch(1, [-1], last), items=[2]):
+        _stream(model, ["nn x"])
 
 
 # ----------------------------------------------------------------------------------------- rotate

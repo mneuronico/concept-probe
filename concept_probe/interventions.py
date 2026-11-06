@@ -72,16 +72,19 @@ class Where:
     """Where the columns of the current forward pass sit in their rows.
 
     ``positions[r, c]`` is the position of column ``c`` in row ``r``'s own sequence (padding
-    excluded), and ``prompt_lens[r]`` the length of that row's prompt. :class:`Edit` functions get
-    one, to edit only some positions with :meth:`mask`.
+    excluded), ``prompt_lens[r]`` the length of that row's prompt, and ``items[r]`` which input row
+    ``r`` is (the prompt's index, as given to :func:`concept_probe.generate` or
+    :func:`concept_probe.answer_logprobs`; None when the caller did not say). :class:`Edit`
+    functions get one, to edit only some positions with :meth:`mask`.
     """
 
     def __init__(self, positions: torch.Tensor, prompt_lens: torch.Tensor, *, generating: bool = False,
-                 fresh: bool = True):
+                 fresh: bool = True, items: Optional[torch.Tensor] = None):
         self.positions = positions
         self.prompt_lens = prompt_lens
         self.generating = generating
         self.fresh = fresh
+        self.items = items
 
     def resolve(self, position: int) -> torch.Tensor:
         """Each row's position for ``position`` (negative ones count back from the end of the prompt)."""
@@ -374,24 +377,56 @@ class Patch(Intervention):
     """Overwrite the residual stream of ``layer`` at ``positions`` with ``values`` (activation patching).
 
     ``values`` has one row per position (or is one vector, for one position), for example a donor's
-    activations from :func:`concept_probe.read_texts` with ``readout="tokens"``. Positions follow
-    the module's rules (negative ones count back from the end of the prompt); outside a generation,
-    a position past the end of an input raises.
+    activations from :func:`concept_probe.read_texts` with ``readout="tokens"``; every row of a batch
+    gets them. Positions follow the module's rules (negative ones count back from the end of the
+    prompt); outside a generation, a position past the end of an input raises.
+
+    One donor per input: ``values`` with a leading axis of inputs, ``(inputs, positions, dim)``,
+    gives input ``i`` its own ``values[i]`` at the same ``positions``; or ``positions`` as one list
+    per input, with ``values`` a list of ``(len(positions[i]), dim)`` arrays, gives each input its
+    own positions too. An input is a prompt, numbered as given to :func:`concept_probe.generate` or
+    :func:`concept_probe.answer_logprobs`, which say which input each row of their batches is; a
+    direct ``model(...)`` call under :func:`concept_probe.intervene` says it with ``items=``.
     """
 
-    def __init__(self, layer: int, positions: Union[int, Sequence[int]], values: Any, *, label: Optional[str] = None):
+    def __init__(self, layer: int, positions: Any, values: Any, *, label: Optional[str] = None):
         self._layer = int(layer)
+        self.label = label
+        self.layer: Optional[int] = None
+        per_position_lists = (isinstance(positions, (list, tuple)) and len(positions) > 0
+                              and all(isinstance(p, (list, tuple)) for p in positions))
+        self.per_input: Optional[List[Tuple[Tuple[int, ...], torch.Tensor]]] = None
+        if per_position_lists:
+            if not isinstance(values, (list, tuple)) or len(values) != len(positions):
+                raise ValueError("with one list of positions per input, values is a list with one array per input")
+            self.per_input = [self._entry(p, v) for p, v in zip(positions, values)]
+            self.positions = None
+            return
         self.positions = _normalize_positions(positions)
         if not isinstance(self.positions, tuple):
-            raise ValueError("Patch positions must be an int or a list of ints, one per row of values")
+            raise ValueError("Patch positions must be an int or a list of ints, one per row of values "
+                             "(or one list per input)")
         vals = _as_array(values)
+        if vals.ndim == 3:
+            self.per_input = [self._entry(self.positions, v) for v in vals]
+            return
         if vals.ndim == 1:
             vals = vals[None, :]
         if vals.shape[0] != len(self.positions):
             raise ValueError(f"values has {vals.shape[0]} rows but {len(self.positions)} positions are given")
         self._values = torch.as_tensor(vals)
-        self.label = label
-        self.layer: Optional[int] = None
+
+    @staticmethod
+    def _entry(positions: Any, values: Any) -> Tuple[Tuple[int, ...], torch.Tensor]:
+        pos = _normalize_positions(list(positions) if isinstance(positions, (list, tuple)) else positions)
+        if not isinstance(pos, tuple):
+            raise ValueError("Patch positions per input must be ints")
+        vals = _as_array(values)
+        if vals.ndim == 1:
+            vals = vals[None, :]
+        if vals.shape[0] != len(pos):
+            raise ValueError(f"an input's values have {vals.shape[0]} rows for {len(pos)} positions")
+        return pos, torch.as_tensor(vals)
 
     def prepare(self, n_blocks: int) -> None:
         self.layer = resolve_layer_index(self._layer, n_blocks, "Patch layer")
@@ -402,16 +437,38 @@ class Patch(Intervention):
         return [self.layer]
 
     def edit(self, layer: int, hidden: torch.Tensor, where: Where) -> torch.Tensor:
-        out = hidden
-        vals = self._values.to(device=hidden.device, dtype=hidden.dtype)
-        for j, p in enumerate(self.positions):
-            mask = where.mask((p,))
-            out = torch.where(mask.to(hidden.device)[..., None], vals[j], out)
+        if self.per_input is None:
+            out = hidden
+            vals = self._values.to(device=hidden.device, dtype=hidden.dtype)
+            for j, p in enumerate(self.positions):
+                mask = where.mask((p,))
+                out = torch.where(mask.to(hidden.device)[..., None], vals[j], out)
+            return out
+        if where.items is None:
+            raise RuntimeError("Patch with one donor per input needs to know which input each row is: run it "
+                               "through generate or answer_logprobs, or call intervene(..., items=[...]).")
+        out = hidden.clone()
+        cols = where.positions.to(hidden.device)
+        for r, item in enumerate(where.items.tolist()):
+            if not 0 <= int(item) < len(self.per_input):
+                raise IndexError(f"Patch has values for {len(self.per_input)} inputs; row {r} is input {item}")
+            pos, vals = self.per_input[int(item)]
+            vals = vals.to(device=hidden.device, dtype=hidden.dtype)
+            for j, p in enumerate(pos):
+                at = int(where.resolve(p)[r])
+                if not where.generating and where.fresh and at >= int(where.prompt_lens[r]):
+                    raise IndexError(f"position {p} is past the end of input {item} ({int(where.prompt_lens[r])} tokens)")
+                hit = cols[r] == at
+                out[r] = torch.where(hit[:, None], vals[j], out[r])
         return out
 
     def describe(self) -> Dict[str, Any]:
-        return {"type": "patch", "label": self.label, "layers": [self._layer if self.layer is None else self.layer],
-                "positions": list(self.positions)}
+        out = {"type": "patch", "label": self.label, "layers": [self._layer if self.layer is None else self.layer]}
+        if self.per_input is None:
+            out["positions"] = list(self.positions)
+        else:
+            out.update(inputs=len(self.per_input), positions=[list(p) for p, _ in self.per_input])
+        return out
 
 
 class Rotate(Intervention):
@@ -555,7 +612,8 @@ def _past_length(kwargs: Dict[str, Any]) -> int:
 
 
 def _where_from_call(args: Tuple[Any, ...], kwargs: Dict[str, Any], prompt_lens: Optional[torch.Tensor],
-                     latched: List[Optional[torch.Tensor]], generating: bool) -> Where:
+                     latched: List[Optional[torch.Tensor]], generating: bool,
+                     items: Optional[torch.Tensor] = None) -> Where:
     """Positions of the columns of one forward call, from its attention mask (or cache position)."""
     x = _first_tensor(args, kwargs)
     if x is None:
@@ -584,19 +642,23 @@ def _where_from_call(args: Tuple[Any, ...], kwargs: Dict[str, Any], prompt_lens:
         lens = latched[0]
     else:
         lens = prompt_lens
-    return Where(positions.to(torch.long), lens.to(torch.long), generating=generating, fresh=fresh)
+    if items is not None and int(items.shape[0]) != batch:
+        raise ValueError(f"intervene was told {int(items.shape[0])} items for a batch of {batch} rows")
+    return Where(positions.to(torch.long), lens.to(torch.long), generating=generating, fresh=fresh, items=items)
 
 
 class _Applied:
     """The hooks of one intervention on one model (see :func:`intervene`)."""
 
-    def __init__(self, model: torch.nn.Module, intervention: Intervention, prompt_lens: Optional[Sequence[int]]):
+    def __init__(self, model: torch.nn.Module, intervention: Intervention, prompt_lens: Optional[Sequence[int]],
+                 items: Optional[Sequence[int]] = None):
         if not isinstance(intervention, Intervention):
             raise TypeError(f"intervene needs an Intervention (Add, Ablate, Patch, Rotate, Edit or a sum of them); "
                             f"got {type(intervention).__name__}")
         self.model = model
         self.intervention = intervention
         self.prompt_lens = None if prompt_lens is None else torch.as_tensor(list(prompt_lens), dtype=torch.long)
+        self.items = None if items is None else torch.as_tensor(list(items), dtype=torch.long)
         self.handles: List[Any] = []
         self.where: Optional[Where] = None
         self._latched: List[Optional[torch.Tensor]] = [None]
@@ -609,7 +671,8 @@ class _Applied:
         layers = self.intervention.layer_list(n)
 
         def pre(module, args, kwargs):
-            self.where = _where_from_call(args, kwargs, self.prompt_lens, self._latched, self.prompt_lens is not None)
+            self.where = _where_from_call(args, kwargs, self.prompt_lens, self._latched, self.prompt_lens is not None,
+                                          self.items)
 
         self.handles.append(self.model.register_forward_pre_hook(pre, with_kwargs=True))
         for li in layers:
@@ -639,17 +702,18 @@ class _Applied:
             active.remove(self)
 
 
-def intervene(model: torch.nn.Module, intervention: Intervention, *, prompt_lens: Optional[Sequence[int]] = None
-              ) -> _Applied:
+def intervene(model: torch.nn.Module, intervention: Intervention, *, prompt_lens: Optional[Sequence[int]] = None,
+              items: Optional[Sequence[int]] = None) -> _Applied:
     """Apply ``intervention`` to ``model`` while the ``with`` block runs.
 
     ``prompt_lens`` (one per row) says where each row's prompt ends, for negative positions and
     ``"prompt"``/``"generated"``; :func:`concept_probe.generate` and
     :func:`concept_probe.answer_logprobs` pass it. Without it, the prompt is the input of the last
     forward call that started a sequence (no cache): right for a plain forward pass and for
-    ``model.generate`` with a cache.
+    ``model.generate`` with a cache. ``items`` (one per row) says which input each row is, for a
+    :class:`Patch` with one donor per input; generate and answer_logprobs pass it too.
     """
-    return _Applied(model, intervention, prompt_lens)
+    return _Applied(model, intervention, prompt_lens, items)
 
 
 class _Recording:

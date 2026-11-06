@@ -114,7 +114,7 @@ READ_MODES = (
     "assistant_tokens",
     "sequence_tokens",
 )
-SPANS = ("text", "sequence")
+SPANS = ("text", "sequence", "input")
 AGGREGATES = ("mean", "last", "first", "max", "tokens")
 
 
@@ -127,8 +127,10 @@ class EmptySpanError(ValueError):
 class Readout:
     """Which tokens of an item to read, and how to reduce them to one vector per layer.
 
-    ``span``: ``"text"``, the item's own tokens (a text, or a generated completion), or
-    ``"sequence"``, from the start of the input to the end of the item (template tokens included).
+    ``span``: ``"text"``, the item's own tokens (a text, or a generated completion);
+    ``"sequence"``, from the start of the input to the end of the item (template tokens included);
+    or ``"input"``, the whole input, template tokens after the item too (for a prompt read with
+    ``generation=True``, its last token is the one that predicts the reply).
     Within it, optionally, ``last_k`` (the last k tokens), ``position`` (one token, counted from the
     start of the text; negative from its end) or ``substring`` (the tokens that cover that substring
     of the text, its ``occurrence``-th appearance; a list gives one substring per item).
@@ -176,7 +178,7 @@ class Readout:
     def name(self) -> str:
         """The :data:`READ_MODES` name of this readout, or a description of it."""
         prefix = "assistant" if self.span == "text" else "sequence"
-        if self.position is None and self.substring is None:
+        if self.span != "input" and self.position is None and self.substring is None:
             if self.last_k is not None and self.agg == "mean":
                 return f"{prefix}_last_k_mean"
             if self.last_k is None:
@@ -202,7 +204,9 @@ class Readout:
         """Positions of the tokens to reduce, in an input of ``total`` tokens whose item's own
         tokens are ``[start, end)``. Raises :class:`EmptySpanError` when there are none."""
         end = total if end is None else min(int(end), total)
-        if self.span == "sequence":
+        if self.span == "input":
+            lo, hi = 0, total
+        elif self.span == "sequence":
             lo, hi = 0, end
         else:
             if start is None:
@@ -622,7 +626,7 @@ def read_encoded(
     model,
     tokenizer,
     encodings: Sequence[Encoded],
-    readout: Union[str, Readout] = "assistant_all_mean",
+    readout: Union[str, Readout, Sequence[Union[str, Readout]]] = "assistant_all_mean",
     *,
     last_k: int = 12,
     layers: Optional[Sequence[Union[int, str]]] = None,
@@ -631,24 +635,25 @@ def read_encoded(
     cache_dtype: str = "float32",
     skip_empty: bool = False,
     console: Optional[bool] = None,
-) -> Reps:
+) -> Union[Reps, Dict[str, Reps]]:
     """Read already-encoded inputs (see :class:`concept_probe.inputs.Encoded`), such as generated
-    completions given by their token ids, with one ``readout``. See :func:`read_texts`."""
-    reps = _read(model, tokenizer, encodings, [Readout.parse(readout, last_k)], layers=layers,
-                 batch_size=batch_size, cache=cache, cache_dtype=cache_dtype, skip_empty=skip_empty)[0]
-    announce(reps.choices, console=console)
-    return reps
+    completions given by their token ids, with one ``readout`` or several. See :func:`read_texts`."""
+    names, readouts = _readouts(readout, last_k)
+    out = _read(model, tokenizer, encodings, readouts, layers=layers, batch_size=batch_size, cache=cache,
+                cache_dtype=cache_dtype, skip_empty=skip_empty)
+    return _one_or_many(names, out, console)
 
 
 def read_texts(
     model,
     tokenizer,
     texts: Sequence[PromptLike],
-    readout: Union[str, Readout] = "assistant_all_mean",
+    readout: Union[str, Readout, Sequence[Union[str, Readout]]] = "assistant_all_mean",
     *,
     role: str = "raw",
     system: Optional[str] = None,
     prompt: Optional[str] = None,
+    generation: bool = False,
     last_k: int = 12,
     layers: Optional[Sequence[Union[int, str]]] = None,
     batch_size: int = 16,
@@ -656,16 +661,20 @@ def read_texts(
     cache_dtype: str = "float32",
     skip_empty: bool = False,
     console: Optional[bool] = None,
-) -> Reps:
+) -> Union[Reps, Dict[str, Reps]]:
     """Read texts with ``model`` and return their representations (layer 1 of docs/DESIGN.md).
 
     Each text is encoded as training encodes texts (``role``, ``system``, ``prompt``; see
-    :func:`concept_probe.inputs.encode_text` and :func:`preview_input`), the inputs go through the
+    :func:`concept_probe.inputs.encode_text` and :func:`preview_input`), or, with
+    ``generation=True``, as a prompt to generate from, exactly as :func:`concept_probe.generate` and
+    :func:`concept_probe.answer_logprobs` feed it (a user turn and the assistant header; the
+    ``Readout("input", ...)`` reaches the token that predicts the reply). The inputs go through the
     model ``batch_size`` at a time, and ``readout`` (a :data:`READ_MODES` name or a
     :class:`Readout`) reduces each text's tokens at every layer in ``layers`` (default: every block;
-    add ``"embeddings"`` for the embedding output). Batching changes the order of floating-point
-    operations, so in half precision the results can differ from ``batch_size=1`` in the last
-    digits.
+    add ``"embeddings"`` for the embedding output). A list of readouts reads them all from the same
+    forward passes and returns ``{name: Reps}`` (the names as given, or each :class:`Readout`'s
+    ``name``). Batching changes the order of floating-point operations, so in half precision the
+    results can differ from ``batch_size=1`` in the last digits.
 
     Reading saves what it reads by default (decision D4): ``cache=None`` uses the session's cache
     (``<output_root>/rep_cache``, on while the session saves), a path uses that directory, and
@@ -673,13 +682,30 @@ def read_texts(
     readout. Automatic choices (where the cache is, a float16 fallback) are announced and listed in
     the result's ``choices``.
     """
-    encodings = [encode_text(tokenizer, t, system, role=role, prompt=prompt, warn_prefix=f"texts[{i}]")
-                 for i, t in enumerate(texts)]
-    reps = _read(model, tokenizer, encodings, [Readout.parse(readout, last_k)], layers=layers,
-                 batch_size=batch_size, cache=cache, cache_dtype=cache_dtype, skip_empty=skip_empty,
-                 label="texts")[0]
-    announce(reps.choices, console=console)
-    return reps
+    encodings = [encode_text(tokenizer, t, system, role=role, prompt=prompt, generation=generation,
+                             warn_prefix=f"texts[{i}]") for i, t in enumerate(texts)]
+    names, readouts = _readouts(readout, last_k)
+    out = _read(model, tokenizer, encodings, readouts, layers=layers, batch_size=batch_size, cache=cache,
+                cache_dtype=cache_dtype, skip_empty=skip_empty, label="texts")
+    return _one_or_many(names, out, console)
+
+
+def _readouts(readout: Any, last_k: int) -> Tuple[Optional[List[str]], List[Readout]]:
+    """``(names, readouts)``: names is None for a single readout, else one per readout of a list."""
+    if isinstance(readout, (str, Readout)):
+        return None, [Readout.parse(readout, last_k)]
+    parsed = [Readout.parse(r, last_k) for r in readout]
+    if not parsed:
+        raise ValueError("readout is an empty list; give a readout or several.")
+    names = [r if isinstance(r, str) else p.name for r, p in zip(readout, parsed)]
+    if len(set(names)) != len(names):
+        raise ValueError(f"the readouts need distinct names; got {names}")
+    return names, parsed
+
+
+def _one_or_many(names: Optional[List[str]], out: List[Reps], console: Optional[bool]) -> Union[Reps, Dict[str, Reps]]:
+    announce(out[0].choices, console=console)  # one read: the same choices for every readout
+    return out[0] if names is None else dict(zip(names, out))
 
 
 @torch.no_grad()

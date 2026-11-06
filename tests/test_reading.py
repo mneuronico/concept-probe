@@ -89,6 +89,33 @@ def test_max_first_and_tokens_readouts():
     np.testing.assert_allclose(tokens.data[:5], own.transpose(1, 0, 2), rtol=1e-6)
 
 
+def test_several_readouts_come_from_one_read():
+    model, tok = TinyCausalLM(), CharChatTok()
+    texts = ["pp xn", "z", "nn px"]
+    both = read_texts(model, tok, texts, ["assistant_all_mean", Readout("text", "last")], cache=False)
+    assert list(both) == ["assistant_all_mean", "assistant_last"]
+    for name, reps in both.items():
+        np.testing.assert_allclose(reps.data, read_texts(model, tok, texts, name, cache=False).data, rtol=1e-6)
+    with pytest.raises(ValueError, match="distinct"):
+        read_texts(model, tok, texts, ["assistant_last", Readout("text", "last")], cache=False)
+
+
+def test_a_prompt_is_read_as_generation_feeds_it():
+    from concept_probe import generate
+
+    model, tok = TinyCausalLM(), CharChatTok()
+    enc = encode_text(tok, "ppx", generation=True)
+    assert tok.decode(enc.input_ids.tolist()) == "^<u>ppx|<a>"
+    assert tok.decode(enc.input_ids[enc.start:enc.end].tolist()) == "ppx"
+    whole = read_texts(model, tok, ["ppx"], Readout("input", "tokens"), generation=True, cache=False)
+    assert whole.positions.tolist() == list(range(len(enc.input_ids)))  # up to the token that predicts the reply
+    assert Readout("input", "last").name == "input:last"
+    gens = generate(model, tok, ["ppx"], max_new_tokens=1, save=False)
+    assert gens[0].token_ids[:gens[0].prompt_len].tolist() == enc.input_ids.tolist()
+    with pytest.raises(ValueError, match="do not apply"):
+        encode_text(tok, "ppx", role="assistant", prompt="q", generation=True)
+
+
 def test_position_readouts_count_within_the_text():
     model, tok = TinyCausalLM(), CharChatTok()
     enc, hs = _hidden(model, tok, "ab pn", role="user", system="s")

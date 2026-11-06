@@ -196,11 +196,12 @@ def message_spans(
 
 
 def _user_text_location(
-    tokenizer, text: "PromptLike", system: Optional[str], input_ids: torch.Tensor
+    tokenizer, text: "PromptLike", system: Optional[str], input_ids: torch.Tensor, generation: bool = False
 ) -> Optional[Dict[str, Any]]:
     """Where a user-role text (for a message list, its last message) sits in its encoding from
-    :func:`_encode_for_read`: see :func:`_locate_message`. Without a chat template the text
-    follows position 0 (the attention sink: the BOS, or else its first token, left out)."""
+    :func:`_encode_for_read` (or, with ``generation``, as a prompt to generate from): see
+    :func:`_locate_message`. Without a chat template the text follows position 0 (the attention
+    sink: the BOS, or else its first token, left out)."""
     total = int(input_ids.shape[-1])
     if not _has_chat_template(tokenizer):
         flat = text if isinstance(text, str) else _prompt_to_text(text)
@@ -214,10 +215,10 @@ def _user_text_location(
             offsets = offsets[start - shift:end - shift]
         return {"span": (start, end), "text": flat, "trimmed": False, "offsets": offsets}
     messages, _ = _normalize_messages(text, system)
-    found = _rendered_offsets(tokenizer, messages, False, input_ids[0].tolist())
+    found = _rendered_offsets(tokenizer, messages, generation, input_ids[0].tolist())
     if found is None:
         return None
-    return _locate_message(tokenizer, messages, len(messages) - 1, False, *found)
+    return _locate_message(tokenizer, messages, len(messages) - 1, generation, *found)
 
 
 def _user_text_span(
@@ -279,6 +280,7 @@ def encode_text(
     *,
     role: str = "raw",
     prompt: Optional[str] = None,
+    generation: bool = False,
     warn: Optional[Callable[[str], None]] = None,
     warn_prefix: str = "read",
 ) -> Encoded:
@@ -294,12 +296,24 @@ def encode_text(
       readouts still work then).
     - ``role="assistant"``: the text as the model's own reply: ``system`` if set, an optional user
       turn ``prompt``, the assistant header, then the text, with no end-of-turn token after it.
+
+    ``generation=True`` encodes the text as a prompt to generate from, exactly as
+    :func:`concept_probe.generate` and :func:`concept_probe.answer_logprobs` feed it: a user turn
+    (after ``system``) and the assistant header the reply would follow. The span is still the
+    text's own tokens; the last token of the input is the one that predicts the reply's first.
     """
     if role not in TEXT_ROLES:
         raise ValueError(f"training.train_text_role must be one of {TEXT_ROLES}; got {role!r}")
-    if role == "user":
-        ids = _encode_for_read(tokenizer, text, system, warn=warn, warn_prefix=warn_prefix)
-        loc = _user_text_location(tokenizer, text, system, ids)
+    if generation:
+        if role == "assistant" or prompt is not None:
+            raise ValueError(f"{warn_prefix}: generation=True reads the text as a prompt to generate from (a user "
+                             "turn and the assistant header); role='assistant' and prompt= do not apply.")
+        messages, _ = _normalize_messages(text, system, warn=warn, warn_prefix=warn_prefix)
+        ids = apply_chat(tokenizer, messages, add_generation_prompt=True)
+    if role == "user" or generation:
+        if not generation:
+            ids = _encode_for_read(tokenizer, text, system, warn=warn, warn_prefix=warn_prefix)
+        loc = _user_text_location(tokenizer, text, system, ids, generation=generation)
         if loc is None:
             if warn is not None:
                 warn(f"{warn_prefix}: could not locate the text's own tokens in the chat-formatted input.")
@@ -438,16 +452,16 @@ def preview_input(
     turn (after ``system`` if set) and the assistant header; ``role`` and ``prompt`` are ignored.
 
     Returns ``input_text`` (decoded with every special and template token), ``input_ids``,
-    ``tokens``, ``text_span`` / ``span_text`` (the tokens the ``assistant_*`` readouts pool over;
-    None for generation prompts), and ``message_spans``: for each message of the chat (the system
+    ``tokens``, ``text_span`` / ``span_text`` (the tokens the ``assistant_*`` readouts pool over),
+    and ``message_spans``: for each message of the chat (the system
     prompt, the user turns, the reply being read), its ``role``, its token ``span`` (None where it
     cannot be located) and the ``text`` of that span. A raw text has no messages.
     """
     spans: List[Dict[str, Any]] = []
     if generation:
         messages, _ = _normalize_messages(text, system)
-        ids = apply_chat(tokenizer, messages, add_generation_prompt=True)
-        start = end = None
+        enc = encode_text(tokenizer, text, system, generation=True)
+        ids, start, end = enc.input_ids.unsqueeze(0), enc.start, enc.end
         located = message_spans(tokenizer, messages, True, ids[0].tolist())
         spans = [{"role": m["role"], "span": sp} for m, sp in zip(messages, located)]
     else:

@@ -266,18 +266,25 @@ read_texts(model, tokenizer, texts, Readout(substring="river"))     # the tokens
 read_texts(model, tokenizer, texts, Readout(substring=words))       # one word per text
 read_texts(model, tokenizer, texts, "assistant_tokens")             # every token is a row
 read_texts(model, tokenizer, texts, layers=["embeddings", 0, -1])   # the embedding output too
+read_texts(model, tokenizer, texts, ["assistant_all_mean", "assistant_last"])  # {name: reps}, one pass
+read_texts(model, tokenizer, prompts, Readout("input", "last"), generation=True)  # what generate sees
 ```
 
-Texts are encoded as everywhere else (`role`, `system`, `prompt`). A `Readout` takes the text's
-own tokens (`span="text"`) or the input up to the end of the text (`span="sequence"`), narrows
+Texts are encoded as everywhere else (`role`, `system`, `prompt`), or, with `generation=True`, as
+prompts to generate from, exactly as `generate` and `answer_logprobs` feed them. A `Readout` takes
+the text's own tokens (`span="text"`), the input up to the end of the text (`span="sequence"`) or
+the whole input (`span="input"`: for a prompt read with `generation=True`, its last token is the
+one that predicts the reply), narrows
 them to the last `last_k`, one `position` or a `substring`, and reduces them with `agg`
 (`"mean"`, `"max"`, `"first"`, `"last"`, or `"tokens"`, which keeps every token as a row, with
 `reps.items` and `reps.positions` saying where each row comes from). The readout names of the
 config (`assistant_all_mean`, `assistant_max`, `assistant_tokens`, ...) are shorthands for these.
 A text without the position or substring raises `EmptySpanError` naming it, or, with
 `skip_empty=True`, is listed in `reps.skipped`. Training takes the pooled readouts; training on
-every token as a sample is not supported yet. `read_encoded` reads inputs already tokenized, such
-as generated completions, without tokenizing them again.
+every token as a sample is not supported yet. A list of readouts reads them all from the same
+forward passes and returns them by name (six readouts of 1078 texts with Llama 3.2 3B: 20 s together,
+108 s one by one). `read_encoded` reads inputs already tokenized, such as generated completions,
+without tokenizing them again.
 
 Inputs go through the model `batch_size` at a time (default 16; `readout.batch_size` in the
 config, which training uses). Batching is several times faster, and in half precision it changes
@@ -703,6 +710,7 @@ Add({12: v}, alpha=4.0)                       # steer: add 4 v at layer 12 (a di
 Ablate(directions, layers=[10, 11, 12])       # project the direction out (several rows: a subspace)
 Ablate({12: v}, value=0.5)                    # set the stream's coordinate along v to 0.5
 Patch(12, positions=[-1], values=donor)       # overwrite the last prompt token with a donor's activation
+Patch(12, [-1], donors)                       # donors (prompts, 1, dim): each prompt its own donor
 Rotate(u, w, angle=np.pi / 4, layers=[12])    # rotate in the plane of u and w
 Edit(my_function, layers=[12])                # anything: my_function(layer, hidden, where) -> hidden
 Add({12: v}, 4.0) + Ablate({20: u})           # several, in order
@@ -716,7 +724,9 @@ without padding, so an intervention means the same in a batch padded on either s
 generating with a cache; negative positions count back from the end of the prompt, and
 `"prompt"` / `"generated"` select those parts (`None`, the default, is every position).
 `probe.steering(alpha, unit)` builds the `Add` a probe steers with, and `generate`,
-`answer_logprobs` and `score_prompts` take any intervention. Reading under an intervention reports
+`answer_logprobs` and `score_prompts` take any intervention; they tell it which prompt each row of
+a batch is, so a `Patch` with one donor per prompt (or one list of positions per prompt) patches a
+whole set of pairs in one call. Reading under an intervention reports
 the stream after the edit at an edited layer (what the next block receives; Hugging Face's
 `output_hidden_states` records it before) and neither reads nor fills the representations cache.
 
@@ -1013,6 +1023,15 @@ GitHub Actions CI runs the same lightweight checks and also builds source and wh
 
 ### Unreleased
 
+- **Reading several readouts at once, prompts as generation sees them, and one donor per prompt**
+  (also found re-running the workshop): `read_texts` and `read_encoded` take a list of readouts and
+  return `{name: Reps}` from the same forward passes; `read_texts(..., generation=True)` (and
+  `encode_text`) encode prompts exactly as `generate` and `answer_logprobs` do, and
+  `Readout(span="input")` reads the whole input, up to the token that predicts the reply;
+  `preview_input(generation=True)` now gives the text's span too. `Patch` takes one donor per prompt
+  (values with a leading axis of prompts, or one list of positions per prompt); `generate` and
+  `answer_logprobs` tell interventions which prompt each row is (`Where.items`, and `items=` in
+  `intervene` for a direct call).
 - **Fixed (found re-running the workshop with this version):**
   - in float32 on a GPU, reading in batches could read one text wrong at every layer, silently
     (Gemma 3 1B: the longest text of a padded batch, through PyTorch's memory-efficient attention

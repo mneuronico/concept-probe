@@ -395,7 +395,7 @@ def generate(
             input_ids[j, width - plens[j]:] = t.to(torch.long)
             attn[j, width - plens[j]:] = 1
         rows = list(range(start, start + len(chunk)))
-        applied = _Nothing() if intervention is None else intervene(model, intervention, prompt_lens=plens)
+        applied = _Nothing() if intervention is None else intervene(model, intervention, prompt_lens=plens, items=rows)
         watcher = _Nothing() if on_token is None else _Watcher(model, scorers, on_token, rows, eos_ids)
         keeper = _Nothing() if keep_logits is None else _LogitKeeper(model, keep_logits)
         sampling = {"do_sample": False, "temperature": None, "top_p": None, "top_k": None} if greedy else             {"do_sample": True, "temperature": temperature, "top_p": top_p}
@@ -474,7 +474,8 @@ def _forward_accepts(model, name: str) -> bool:
 
 @torch.no_grad()
 def _continuation_logprobs(model, pairs: Sequence[Tuple[torch.Tensor, torch.Tensor]], *, pad: int, batch_size: int = 16,
-                           intervention: Optional[Intervention] = None) -> List[np.ndarray]:
+                           intervention: Optional[Intervention] = None,
+                           items: Optional[Sequence[int]] = None) -> List[np.ndarray]:
     """For each ``(prompt ids, continuation ids)``, the log-probability of every continuation token
     given what comes before it, ``batch_size`` pairs per forward pass (right padding, the logits of
     the continuation's positions only when the model can keep just those). ``intervention`` is
@@ -496,7 +497,9 @@ def _continuation_logprobs(model, pairs: Sequence[Tuple[torch.Tensor, torch.Tens
             attn[j, :lens[j]] = 1
         lo, hi = min(plens) - 1, max(lens) - 1  # the positions whose logits predict continuation tokens
         kwargs: Dict[str, Any] = {"logits_to_keep": torch.arange(lo, hi, device=model.device)} if keep_arg else {}
-        applied = _Nothing() if intervention is None else intervene(model, intervention, prompt_lens=plens)
+        row_items = None if items is None else [int(items[r]) for r in rows]
+        applied = _Nothing() if intervention is None else intervene(model, intervention, prompt_lens=plens,
+                                                                     items=row_items)
         with applied, safe_attention(model):
             logits = model(input_ids=input_ids.to(model.device), attention_mask=attn.to(model.device),
                            use_cache=False, **kwargs).logits
@@ -559,7 +562,8 @@ def answer_logprobs(
             answer_tokens[i].append(_decode_tokens(tokenizer, ans))
             pairs.append((i, a, ids.to(torch.long), torch.tensor(ans, dtype=torch.long)))
     per_token = _continuation_logprobs(model, [(p, ans) for _, _, p, ans in pairs], pad=_pad_id(tokenizer),
-                                       batch_size=batch_size, intervention=intervention)
+                                       batch_size=batch_size, intervention=intervention,
+                                       items=[i for i, _, _, _ in pairs])
     logprobs = np.zeros((len(prompts), k))
     n_tokens = np.zeros((len(prompts), k), dtype=np.int64)
     for (i, a, _, ans), lp in zip(pairs, per_token):
