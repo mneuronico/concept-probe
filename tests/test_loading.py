@@ -88,11 +88,17 @@ def test_the_default_dtype_is_auto_and_none_means_auto():
 
 # ---------------------------------------------------------------------------------- quantization
 def test_named_levels_build_their_configs():
+    pytest.importorskip("bitsandbytes")  # an optional extra: concept-probe[quantization]
     cfg, _ = resolve_quantization("nf4", torch.float16)
     assert cfg.load_in_4bit and cfg.bnb_4bit_quant_type == "nf4" and cfg.bnb_4bit_compute_dtype == torch.float16
     cfg, _ = resolve_quantization("int8", torch.float16)
     assert cfg.load_in_8bit
     assert resolve_quantization(None, torch.float16) == (None, [])
+
+
+def test_a_level_whose_package_is_missing_says_what_to_install():
+    with pytest.raises(ImportError, match="needs no_such_package; install it"):
+        modeling._require("no_such_package", "quantization='x'")
 
 
 def test_hqq_levels_patch_the_quantizer_once_and_say_so():
