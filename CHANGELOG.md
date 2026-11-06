@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 (unreleased)
+## 0.3.0 (2026-11-06)
 
 - **A tutorial notebook** (`examples/tutorial.ipynb`, with an Open in Colab link in the README) that
   goes through probing and steering a concept step by step, on Llama 3.2 1B on Colab's free GPU.
